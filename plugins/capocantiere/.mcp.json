@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "gemini-delegate": {
+      "command": "sh",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/server/run.sh"]
+    }
+  }
+}

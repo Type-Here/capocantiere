@@ -1,0 +1,195 @@
+[
+  {
+    "name": "gemini_delegate",
+    "description": "Delegate a well-defined implementation task to Gemini (Antigravity CLI). The work happens in an isolated git worktree on a dedicated branch: the main repo is NOT touched until you call gemini_apply. Asynchronous: returns a job_id immediately (you can launch several in parallel on independent parts). Use gemini_jobs to wait for / view the diff. Ideal for: boilerplate, tests, mechanical refactors, repetitive migrations, documentation, small features with a clear spec. Do NOT use it for architectural decisions or hard bugs.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "task": {
+          "type": "string",
+          "description": "Complete, self-contained spec: what to do, where, constraints. Gemini cannot see your conversation."
+        },
+        "title": {
+          "type": "string",
+          "description": "Short job title (optional)"
+        },
+        "files": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Relevant files/folders (paths relative to the repo)"
+        },
+        "context": {
+          "type": "string",
+          "description": "Useful context: conventions, APIs to use, existing examples to imitate"
+        },
+        "acceptance": {
+          "type": "string",
+          "description": "Verifiable acceptance criteria"
+        },
+        "test_command": {
+          "type": "string",
+          "description": "Command Gemini must run to verify its work (e.g. 'npm test -- auth')"
+        },
+        "include_uncommitted": {
+          "type": "boolean",
+          "description": "Start from the current state including uncommitted changes (default true). Untracked files are not included."
+        },
+        "model": {
+          "type": "string",
+          "description": "agy model slug (see `agy models`). Defaults to config."
+        },
+        "effort": {
+          "type": "string",
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        },
+        "timeout_minutes": {
+          "type": "number"
+        },
+        "wait_seconds": {
+          "type": "number",
+          "description": "If > 0, wait up to N seconds (max 600) and return the result directly"
+        },
+        "force": {
+          "type": "boolean",
+          "description": "Ignore the daily budget"
+        },
+        "repo_dir": {
+          "type": "string",
+          "description": "Repo directory (default: current project)"
+        }
+      },
+      "required": [
+        "task"
+      ]
+    }
+  },
+  {
+    "name": "gemini_analyze",
+    "description": "Ask Gemini (~1M token context) to read and analyze code in READ-ONLY mode and return a dense summary with path:line references. Use it to save your own context: exploring large codebases, huge files, logs, finding where something is implemented, mapping dependencies, preliminary reviews. Synchronous.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "question": {
+          "type": "string",
+          "description": "What you want to know, as specifically as possible"
+        },
+        "paths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Files/folders to focus on"
+        },
+        "max_words": {
+          "type": "number",
+          "description": "Maximum response length in words (default 600)"
+        },
+        "model": {
+          "type": "string"
+        },
+        "effort": {
+          "type": "string",
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        },
+        "timeout_minutes": {
+          "type": "number"
+        },
+        "force": {
+          "type": "boolean"
+        },
+        "repo_dir": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "question"
+      ]
+    }
+  },
+  {
+    "name": "gemini_jobs",
+    "description": "Status of delegated jobs. Without job_id: list of the repo's jobs. With job_id: details including Gemini's response and the diff. wait_seconds waits for the jobs (or the given one) to finish.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "job_id": {
+          "type": "string"
+        },
+        "wait_seconds": {
+          "type": "number",
+          "description": "Wait up to N seconds (max 600) for the job / all active jobs to finish"
+        },
+        "include_diff": {
+          "type": "boolean",
+          "description": "Include the diff in the details (default true)"
+        },
+        "max_diff_chars": {
+          "type": "number",
+          "description": "Default 15000"
+        },
+        "all_repos": {
+          "type": "boolean"
+        },
+        "repo_dir": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  {
+    "name": "gemini_apply",
+    "description": "Apply a completed job's changes (after reviewing them) to the main repo's working tree, then remove the job's worktree and branch. The changes stay UNCOMMITTED so you can touch them up and test them.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "job_id": {
+          "type": "string"
+        },
+        "keep_worktree": {
+          "type": "boolean",
+          "description": "Do not delete the worktree/branch (default false)"
+        }
+      },
+      "required": [
+        "job_id"
+      ]
+    }
+  },
+  {
+    "name": "gemini_discard",
+    "description": "Discard a job (stopping it if running) and delete its worktree and branch.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "job_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "job_id"
+      ]
+    }
+  },
+  {
+    "name": "gemini_usage",
+    "description": "Gemini usage over the last 24h against the configured budget, active jobs, configuration, and a check that agy is installed.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {}
+    }
+  }
+]

@@ -1,0 +1,16 @@
+{
+  "name": "capocantiere",
+  "version": "1.0.0",
+  "description": "Claude (Opus) acts as manager and delegates implementation and analysis tasks to Gemini via Antigravity CLI (agy), using a Google AI Pro subscription. Isolated git worktrees, parallel jobs, controlled review and apply, quota management.",
+  "author": {
+    "name": "Type-Here"
+  },
+  "keywords": [
+    "gemini",
+    "antigravity",
+    "agy",
+    "delegation",
+    "multi-agent"
+  ],
+  "license": "MIT"
+}
