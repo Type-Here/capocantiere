@@ -486,7 +486,7 @@ function jobDetail(j, { includeDiff = true, maxDiffChars = 15000 } = {}) {
     `branch: ${j.branch}   worktree: ${j.worktree}`,
     `base: ${j.baseLabel} (${j.base?.slice(0, 10)})`,
   ];
-  if (j.durationSeconds != null) lines.push(`duration: ${j.durationSeconds}s, turns: ${j.turns ?? "?"}`);
+  if (j.durationSeconds != null) lines.push(`duration: ${Math.round(j.durationSeconds)}s, turns: ${j.turns ?? "?"}`);
   if (j.error) lines.push("", "ERROR:", truncate(j.error, 2500));
   if (j.softDenied?.length) lines.push("", "ACTIONS DENIED TO agy (soft-deny):", ...j.softDenied);
   if (j.response) lines.push("", "GEMINI'S RESPONSE:", truncate(j.response, 4000));
@@ -558,7 +558,7 @@ async function callTool(name, a = {}) {
       if (before !== after)
         out.push("⚠️ WARNING: the repo state changed during the analysis. Check `git status` / `git diff`.");
       out.push(truncate(res.response || "(no response)", 16000));
-      out.push(`\n[gemini_analyze: ${res.durationSeconds}s, turns ${res.turns}, tokens ${res.usage?.total_tokens ?? "?"}]`);
+      out.push(`\n[gemini_analyze: ${Math.round(res.durationSeconds)}s, turns ${res.turns}, tokens ${res.usage?.total_tokens ?? "?"}]`);
       return { text: out.join("\n\n"), isError: !res.ok && !res.response };
     }
 

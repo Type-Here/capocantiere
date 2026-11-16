@@ -116,7 +116,7 @@ Example:
 - The budget counts `agy` runs, not the model's internal requests (each run makes several). Keep it conservative and raise it if it holds up.
 - The `agy` JSON format is the one documented as of November 2026; if Google changes it, the server still shows the raw output.
 
-## Perché "Capocantiere"
+## Why "Capocantiere"
 
 Il nome viene da una conversazione con Claude, nel browser:
 

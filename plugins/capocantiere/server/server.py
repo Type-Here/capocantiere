@@ -597,7 +597,7 @@ def job_detail(j, include_diff=True, max_diff_chars=15000):
     ]
     if j.get("durationSeconds") is not None:
         turns = j.get("turns")
-        lines.append("duration: %ss, turns: %s" % (j["durationSeconds"], "?" if turns is None else turns))
+        lines.append("duration: %ss, turns: %s" % (round(j["durationSeconds"]), "?" if turns is None else turns))
     if j.get("error"):
         lines += ["", "ERROR:", truncate(j["error"], 2500)]
     if j.get("softDenied"):
@@ -688,7 +688,7 @@ def call_tool(name, a):
             out.append("⚠️ WARNING: the repo state changed during the analysis. Check `git status` / `git diff`.")
         out.append(truncate(res["response"] or "(no response)", 16000))
         total = (res["usage"] or {}).get("total_tokens")
-        out.append("\n[gemini_analyze: %ss, turns %s, tokens %s]" % (res["durationSeconds"], res["turns"], "?" if total is None else total))
+        out.append("\n[gemini_analyze: %ss, turns %s, tokens %s]" % (round(res["durationSeconds"]), res["turns"], "?" if total is None else total))
         return {"text": "\n\n".join(out), "isError": not res["ok"] and not res["response"]}
 
     if name == "gemini_jobs":
