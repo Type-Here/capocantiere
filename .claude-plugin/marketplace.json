@@ -1,0 +1,14 @@
+{
+  "name": "capocantiere-local",
+  "description": "Local marketplace: a plugin for using Gemini (Antigravity CLI) as Claude Code's worker.",
+  "owner": {
+    "name": "Type-Here"
+  },
+  "plugins": [
+    {
+      "name": "capocantiere",
+      "source": "./plugins/capocantiere",
+      "description": "Opus as manager, Gemini (agy) as worker."
+    }
+  ]
+}
