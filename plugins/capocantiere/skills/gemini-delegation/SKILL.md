@@ -1,15 +1,23 @@
 ---
 name: gemini-delegation
-description: How to act as a manager and delegate work to Gemini (Antigravity CLI) with the gemini_delegate, gemini_analyze, gemini_jobs, gemini_apply, gemini_discard and gemini_usage tools. Use it whenever a task contains mechanical or easily specified work (boilerplate, tests, repetitive refactors, migrations, documentation, small features), when you need to explore large codebases or files, or when the user asks to use Gemini.
+description: How to delegate work to Gemini (Antigravity CLI) with the gemini_delegate, gemini_analyze, gemini_jobs, gemini_apply, gemini_discard, gemini_usage and gemini_models tools, and how to review the result. Use it when a task contains mechanical, easily specified work (boilerplate, tests, repetitive refactors, migrations, documentation, small features) that is worth handing off, when you need to explore large codebases or files, or when the user (or CLAUDE.md) asks to use Gemini.
 ---
 
-# Delegating to Gemini: you are the manager
+# Delegating to Gemini
 
-You have access to Gemini through the user's Google subscription. Your context and the Claude quota are the precious resource. Gemini runs are cheap but have a daily budget and less reliable quality. So you think, specify, verify and decide; Gemini executes.
+Gemini is available as an extra worker through the user's Google subscription. It is **one option**, next to doing the work yourself or handing it to a Claude subagent: pick whichever fits each piece of work best.
 
-## What to delegate and what to keep
+**Who decides.** The user's instructions come first, whether they are in the conversation or in CLAUDE.md: if they say to use Gemini more, less, only for some kinds of work, or not at all, follow them. Without instructions, use your own judgment:
 
-| Delegate to Gemini | Keep for yourself |
+- delegate to Gemini when the task is easy to specify and verify, and handing it off saves your context or Claude quota;
+- do it yourself when it's quicker than writing the spec, or it needs the conversation's context;
+- use a Claude subagent (e.g. Sonnet) when the task is worth delegating but needs more judgment or reliability than Gemini usually gives.
+
+Gemini runs are cheap but have a daily budget and less reliable quality. Whoever does the work, you stay responsible for the review and the final result.
+
+## Good fits for Gemini
+
+| Good fit for Gemini | Better done by you (or a Claude subagent) |
 |---|---|
 | Boilerplate, scaffolding, CRUD, DTOs, types | Architecture and design decisions |
 | Writing tests for existing code | Debugging non-trivial or non-reproducible bugs |
@@ -53,13 +61,28 @@ acceptance: "New tests in users.test.ts for the 3 invalid cases and one valid ca
 test_command: "npm test -- users"
 ```
 
+## Choosing the model
+
+You don't have to pass `model`: by default analyses use the **fast** group and implementation jobs the **standard** group (the user can change this with `/capocantiere:models`). The models are grouped by capability:
+
+| Group | Use it for |
+|---|---|
+| `fast` | `gemini_analyze`, simple mechanical tasks (renames, docstrings, formatting) |
+| `standard` | the usual implementation jobs (default) |
+| `strong` | tasks with more logic, or a retry after a job failed on `standard` |
+| `frontier` | only the hardest delegated tasks; slower and heavier on quota |
+
+- Pass a **group** as `model` (e.g. `model: "strong"`) rather than a slug: the server picks the best model of that group available on this account, so you never need to know the exact names.
+- Use an exact slug only if it appears in `gemini_models`; never invent one. A group can be empty on some accounts (e.g. no `strong` model): the error lists what is available.
+- `effort` is optional. For models whose slug carries a level (`-low`, `-medium`, `-high`) it picks that variant of the same model.
+- Escalate one step at a time: `standard` → `strong` → do it yourself. Don't jump to `frontier` for routine work.
+
 ## Quota and failures
 
 - Before a big piece of work (many jobs), check `gemini_usage`.
 - If a job fails because of **quota/rate limit**, don't insist: do the work yourself and tell the user.
 - If it fails for other reasons, read the error: it's often a wrong `test_command` or an ambiguous spec. One retry, then do it yourself.
 - If `agy` isn't installed, tell the user once and work normally.
-- The `model`/`effort` fields are optional: use a higher effort only for more complex tasks.
 
 ## Technical notes
 

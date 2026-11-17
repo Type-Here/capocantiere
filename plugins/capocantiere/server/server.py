@@ -306,6 +306,7 @@ def run_agy(cwd, prompt, model, effort, timeout_min, skip_permissions, kind, job
     record_usage({
         "kind": kind,
         "job": job_id,
+        "model": model or None,
         "ok": ok,
         "quota": quota,
         "turns": envl.get("num_turns") or 0,
@@ -337,6 +338,233 @@ def run_agy(cwd, prompt, model, effort, timeout_min, skip_permissions, kind, job
     }
 
 
+# ---------------------------------------------------------------- models
+#
+# The model list comes from `agy models`, which only shows what the user's account can use,
+# so new models (or a plan upgrade) are picked up without updating the plugin. Slugs are
+# sorted into capability groups by the rules in model-groups.json.
+
+with open(os.path.join(HERE, "model-groups.json"), encoding="utf-8") as _f:
+    MODEL_RULES = json.load(_f)
+GROUP_IDS = [g["id"] for g in MODEL_RULES["groups"]]
+OTHER_GROUP = {"id": "other", "description": "Not classified. Never chosen automatically, only when requested by slug or group."}
+MODELS_FILE = os.path.join(CONFIG["stateDir"], "models.json")
+SETTINGS_FILE = os.path.join(CONFIG["stateDir"], "settings.json")
+MODELS_TTL_MS = 6 * 3600_000
+LEVELS = ("low", "medium", "high", "xhigh", "max")
+LEVEL_RE = re.compile(r"-(%s)$" % "|".join(LEVELS))
+MODEL_ERROR_RE = re.compile(
+    r"not recognized as a known model|model.{0,80}(not available|unavailable|not allowed|not supported|not entitled|permission denied)",
+    re.I,
+)
+MODELS_LOCK = threading.Lock()
+
+
+def read_json(path, default):
+    try:
+        with open(path, encoding="utf-8") as f:
+            v = json.load(f)
+        return v if isinstance(v, dict) else default
+    except (OSError, ValueError):
+        return default
+
+
+def write_json(path, data):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def parse_models(stdout):
+    """`agy models` prints one "slug<TAB>Display name" line per model."""
+    out = []
+    for line in stdout.split("\n"):
+        if "\t" not in line:
+            continue
+        slug, name = line.split("\t", 1)
+        if slug.strip():
+            out.append({"slug": slug.strip(), "name": name.strip() or slug.strip()})
+    return out
+
+
+def model_cache(refresh=False):
+    """The cached model list, re-read from `agy models` when stale. Never raises."""
+    with MODELS_LOCK:
+        cache = read_json(MODELS_FILE, {})
+        if refresh or not cache.get("models") or now_ms() - (cache.get("fetchedAt") or 0) > MODELS_TTL_MS:
+            r = run(CONFIG["agyBin"], ["models"], timeout_ms=30_000)
+            models = parse_models(r["stdout"]) if r["code"] == 0 else []
+            if models:
+                # an explicit refresh also forgets models marked unavailable
+                cache = {"fetchedAt": now_ms(), "models": models,
+                         "unavailable": {} if refresh else cache.get("unavailable") or {}}
+                write_json(MODELS_FILE, cache)
+            else:
+                cache = dict(cache, fetchError=(r["stderr"] or r["stdout"]).strip()[:500] or "`agy models` failed")
+        return cache
+
+
+def mark_unavailable(slug):
+    with MODELS_LOCK:
+        cache = read_json(MODELS_FILE, {})
+        cache.setdefault("unavailable", {})[slug] = iso_now()
+        write_json(MODELS_FILE, cache)
+
+
+def glob_re(pattern):
+    return re.compile("^" + ".*".join(re.escape(x) for x in pattern.split("*")) + "$", re.I)
+
+
+def group_of(slug):
+    for g in MODEL_RULES["groups"]:
+        for i, pat in enumerate(g["match"]):
+            if re.search(pat, slug, re.I):
+                return g["id"], i
+    return "other", 0
+
+
+def version_key(name):
+    """Newest first: "Gemini 3.8 Flash" -> (-3, -8, 0, 0)."""
+    m = re.search(r"\d+(?:\.\d+)*", name)
+    parts = [int(x) for x in m.group().split(".")][:4] if m else []
+    return tuple(-x for x in parts + [0] * (4 - len(parts)))
+
+
+def catalog(cache, settings):
+    """Usable models by group, best first, plus the ones excluded by settings."""
+    unavailable = cache.get("unavailable") or {}
+    excl = [glob_re(p) for p in settings.get("exclude") or []]
+    groups = {gid: [] for gid in GROUP_IDS + ["other"]}
+    excluded = []
+    for m in cache.get("models") or []:
+        if m["slug"] in unavailable:
+            continue
+        if any(rx.match(m["slug"]) for rx in excl):
+            excluded.append(m)
+            continue
+        gid, idx = group_of(m["slug"])
+        groups[gid].append(dict(m, rank=(idx,) + version_key(m["name"])))
+    for lst in groups.values():
+        lst.sort(key=lambda m: m["rank"])
+    return {"groups": groups, "excluded": excluded}
+
+
+def groups_hint(cat):
+    parts = ["%s: %s" % (g, ", ".join(m["slug"] for m in ms)) for g, ms in cat["groups"].items() if ms]
+    return "Available — " + ("; ".join(parts) or "none") + ". See gemini_models."
+
+
+def resolve_model(role, requested=None, effort=None):
+    """Pick model and effort for a run. role is "analyze" or "implement".
+
+    Precedence: requested (tool argument) > environment variable > settings > automatic.
+    Each of them may be a slug or a group id; a group follows new models automatically.
+    Returns (model, effort, source); model "" means agy's default.
+    """
+    cache = model_cache()
+    settings = read_json(SETTINGS_FILE, {})
+    cat = catalog(cache, settings)
+    known = {m["slug"] for m in cache.get("models") or []}
+    env_model = (CONFIG["analyzeModel"] or CONFIG["model"]) if role == "analyze" else CONFIG["model"]
+    choice = source = None
+    for value, src in ((requested, "requested"), (env_model, "env"), (settings.get(role), "settings")):
+        if value and value != "auto":
+            choice, source = value, src
+            break
+    if choice is None:
+        model, source = "", "agy default"
+        for gid in MODEL_RULES["defaults"][role]:
+            if cat["groups"][gid]:
+                model, source = cat["groups"][gid][0]["slug"], "auto, group " + gid
+                break
+    elif choice in cat["groups"]:
+        if not cat["groups"][choice]:
+            raise RuntimeError('No model available in group "%s". %s' % (choice, groups_hint(cat)))
+        model, source = cat["groups"][choice][0]["slug"], "%s, group %s" % (source, choice)
+    elif not known or choice in known:
+        model = choice  # list unknown (agy models failed): pass it through and let agy decide
+    else:
+        raise RuntimeError('Unknown model "%s". %s' % (choice, groups_hint(cat)))
+
+    effort = effort or CONFIG["effort"]
+    if effort and model and LEVEL_RE.search(model):
+        # the level is part of the slug and agy rejects --effort with it:
+        # pick the variant of the same model closest to the requested level
+        base = LEVEL_RE.sub("", model)
+        want = LEVELS.index(effort) if effort in LEVELS else None
+        variants = [lv for lv in LEVELS if "%s-%s" % (base, lv) in known]
+        if want is not None and variants:
+            model = "%s-%s" % (base, min(variants, key=lambda lv: (abs(LEVELS.index(lv) - want), -LEVELS.index(lv))))
+        effort = ""
+    return model, effort, source
+
+
+def models_report(cache):
+    if not cache.get("models"):
+        return "Could not read the model list (%s). Runs will use agy's default model." % (
+            cache.get("fetchError") or "no output from `agy models`")
+    settings = read_json(SETTINGS_FILE, {})
+    cat = catalog(cache, settings)
+    when = datetime.fromtimestamp(cache["fetchedAt"] / 1000).strftime("%Y-%m-%d %H:%M")
+    lines = ["Models this account can use through agy (read %s):" % when]
+    width = max(len(m["slug"]) for m in cache["models"])
+    for g in MODEL_RULES["groups"] + [OTHER_GROUP]:
+        ms = cat["groups"][g["id"]]
+        if g is OTHER_GROUP and not ms:
+            continue
+        lines += ["", "%s — %s" % (g["id"], g["description"])]
+        if not ms:
+            lines.append("    (none available)")
+        for i, m in enumerate(ms):
+            lines.append("  %s %s  %s" % ("*" if i == 0 else " ", m["slug"].ljust(width), m["name"]))
+    lines += ["", "* = the model used when that group is requested."]
+    if cat["excluded"]:
+        lines.append("Excluded by settings: " + ", ".join(m["slug"] for m in cat["excluded"]))
+    if cache.get("unavailable"):
+        lines.append("Marked unavailable after failing for this account (a refresh clears this): "
+                     + ", ".join(sorted(cache["unavailable"])))
+    lines += ["", "In use:"]
+    for role in ("analyze", "implement"):
+        try:
+            model, _, source = resolve_model(role)
+            lines.append("  %-9s → %s (%s)" % (role, model or "agy default", source))
+        except Exception as e:
+            lines.append("  %-9s → ERROR: %s" % (role, e))
+    lines.append("Settings file: %s (exclude: %s)" % (SETTINGS_FILE, ", ".join(settings.get("exclude") or []) or "none"))
+    return "\n".join(lines)
+
+
+def models_in_use():
+    parts = []
+    for role in ("analyze", "implement"):
+        try:
+            model, _, source = resolve_model(role)
+            parts.append("%s → %s (%s)" % (role, model or "agy default", source))
+        except Exception as e:
+            parts.append("%s → ERROR: %s" % (role, e))
+    return "; ".join(parts)
+
+
+def update_model_settings(a):
+    settings = read_json(SETTINGS_FILE, {})
+    cache = model_cache()
+    known = {m["slug"] for m in cache.get("models") or []}
+    for role in ("analyze", "implement"):
+        if role not in a:
+            continue
+        v = (a[role] or "").strip()
+        if not v or v == "auto":
+            settings.pop(role, None)
+        elif v in GROUP_IDS or v == "other" or not known or v in known:
+            settings[role] = v
+        else:
+            raise RuntimeError('Unknown model or group "%s". Groups: %s.' % (v, ", ".join(GROUP_IDS + ["other"])))
+    if "exclude" in a:
+        settings["exclude"] = [str(x) for x in a["exclude"] or [] if str(x).strip()]
+    write_json(SETTINGS_FILE, settings)
+
+
 # ---------------------------------------------------------------- prompts
 
 
@@ -349,6 +577,7 @@ def implement_prompt(job):
         "- Do ONLY what the task asks. No unrequested refactors, no new dependencies unless explicitly requested.",
         "- Follow the style and conventions of the existing code.",
         "- Write code comments and documentation in the language already used in the repository.",
+        "- Before finishing, delete any temporary files or build artifacts you created that are not part of the task (e.g. __pycache__, .pytest_cache, coverage reports).",
         "- If something is ambiguous, choose the most conservative interpretation and flag it in NOTES.",
         "- When you are done, run: %s and fix any errors you introduced." % test_command
         if test_command
@@ -450,6 +679,7 @@ def _execute_wrapper(job):
 def create_job(args):
     repo = repo_root(args.get("repo_dir"))
     usage = budget_check(args.get("force"))
+    model, effort, model_source = resolve_model("implement", args.get("model"), args.get("effort"))
     jid = new_id()
     branch = "gemini/" + jid
     worktree = os.path.join(CONFIG["worktreeDir"], "%s-%s" % (os.path.basename(repo), jid))
@@ -478,8 +708,9 @@ def create_job(args):
         "context": args.get("context") or "",
         "acceptance": args.get("acceptance") or "",
         "testCommand": args.get("test_command") or "",
-        "model": args.get("model") or CONFIG["model"],
-        "effort": args.get("effort") or CONFIG["effort"],
+        "model": model,
+        "modelSource": model_source,
+        "effort": effort,
         "timeoutMin": args.get("timeout_minutes") or CONFIG["taskTimeoutMin"],
         "createdAt": iso_now(),
     }
@@ -530,6 +761,7 @@ def execute_job(job):
         job["error"] = res["error"] or "agy exited with status %s" % res["status"]
         if res["quota"]:
             job["error"] = "QUOTA EXHAUSTED / Gemini rate limit.\n" + job["error"]
+        job["error"] += unavailable_note(job["model"], res["error"])
     else:
         job["status"] = "done" if job.get("filesChanged", 0) > 0 else "no_changes"
     save_job(job)
@@ -541,10 +773,22 @@ def execute_job(job):
             pass
 
 
+def unavailable_note(model, error):
+    """If agy rejected the model for this account, remember it so the next runs pick another."""
+    if not model or not MODEL_ERROR_RE.search(error or ""):
+        return ""
+    mark_unavailable(model)
+    return "\nModel %s has been marked unavailable; the next runs will pick another one (gemini_models refresh=true clears this)." % model
+
+
+# Build artifacts that never belong in a job's diff, even if the repo has no .gitignore for them.
+JUNK_PATHSPECS = [":(exclude,glob)" + p for p in ['**/__pycache__/**', '**/*.py[co]', '**/.pytest_cache/**', '**/.mypy_cache/**', '**/.ruff_cache/**', '**/node_modules/**', '**/.DS_Store']]
+
+
 def collect_changes(job):
     if not os.path.exists(job["worktree"]):
         return
-    git(job["worktree"], "add", "-A")
+    git(job["worktree"], "add", "-A", "--", ".", *JUNK_PATHSPECS)
     staged = run("git", ["diff", "--cached", "--quiet"], cwd=job["worktree"])
     if staged["code"] == 1:
         git(
@@ -594,6 +838,9 @@ def job_detail(j, include_diff=True, max_diff_chars=15000):
         "status: %s%s" % (j["status"], " (agy: %s)" % j["agyStatus"] if j.get("agyStatus") else ""),
         "branch: %s   worktree: %s" % (j["branch"], j["worktree"]),
         "base: %s (%s)" % (j.get("baseLabel"), (j.get("base") or "")[:10]),
+        "model: %s%s%s" % (j.get("model") or "agy default",
+                           " (%s)" % j["modelSource"] if j.get("modelSource") else "",
+                           ", effort " + j["effort"] if j.get("effort") else ""),
     ]
     if j.get("durationSeconds") is not None:
         turns = j.get("turns")
@@ -654,6 +901,7 @@ def call_tool(name, a):
                 return job_detail(job)
         return "\n".join([
             "Job %s started (%s). Branch %s, base: %s." % (job["id"], job["status"], job["branch"], job["baseLabel"]),
+            "Model: %s (%s)." % (job["model"] or "agy default", job["modelSource"]),
             "Active jobs: %d/%s running, %d queued." % (running_count(), CONFIG["maxParallel"], len(queue)),
             "24h usage (including running jobs): %d/%s." % (usage["committed"] + 1, CONFIG["dailyBudget"]),
             'Use gemini_jobs with job_id="%s" and wait_seconds to wait for the result.' % job["id"],
@@ -662,6 +910,7 @@ def call_tool(name, a):
     if name == "gemini_analyze":
         repo = repo_root(a.get("repo_dir"))
         budget_check(a.get("force"))
+        model, effort, model_source = resolve_model("analyze", a.get("model"), a.get("effort"))
 
         def snapshot():
             s = run("git", ["status", "--porcelain=v1", "-uall"], cwd=repo)
@@ -672,8 +921,8 @@ def call_tool(name, a):
         res = run_agy(
             cwd=repo,
             prompt=analyze_prompt(a.get("question") or "", a.get("paths"), a.get("max_words") or 600),
-            model=a.get("model") or CONFIG["analyzeModel"] or CONFIG["model"],
-            effort=a.get("effort") or CONFIG["effort"],
+            model=model,
+            effort=effort,
             timeout_min=a.get("timeout_minutes") or CONFIG["analyzeTimeoutMin"],
             skip_permissions=False,  # in the main repo: no auto-approval
             kind="analyze",
@@ -683,12 +932,14 @@ def call_tool(name, a):
         if res["notFound"]:
             raise RuntimeError('Command "%s" not found. Install Antigravity CLI and run `agy` once to log in.' % CONFIG["agyBin"])
         if not res["ok"]:
-            out.append("ERROR (%s)%s:\n%s" % (res["status"], " — QUOTA/RATE LIMIT" if res["quota"] else "", truncate(res["error"], 2000)))
+            out.append("ERROR (%s)%s:\n%s%s" % (res["status"], " — QUOTA/RATE LIMIT" if res["quota"] else "",
+                                                truncate(res["error"], 2000), unavailable_note(model, res["error"])))
         if before != after:
             out.append("⚠️ WARNING: the repo state changed during the analysis. Check `git status` / `git diff`.")
         out.append(truncate(res["response"] or "(no response)", 16000))
         total = (res["usage"] or {}).get("total_tokens")
-        out.append("\n[gemini_analyze: %ss, turns %s, tokens %s]" % (round(res["durationSeconds"]), res["turns"], "?" if total is None else total))
+        out.append("\n[gemini_analyze: %s (%s), %ss, turns %s, tokens %s]" % (
+            model or "agy default", model_source, round(res["durationSeconds"]), res["turns"], "?" if total is None else total))
         return {"text": "\n\n".join(out), "isError": not res["ok"] and not res["response"]}
 
     if name == "gemini_jobs":
@@ -781,9 +1032,8 @@ def call_tool(name, a):
             "Last 24h: %d/%s runs, %d turns, %d tokens, %d failed, %d quota errors"
             % (u["runs"], CONFIG["dailyBudget"], u["turns"], u["total_tokens"], u["failures"], u["quota_errors"]),
             "Active jobs: %d (max parallel %s); to review: %d" % (len(active), CONFIG["maxParallel"], len(review)),
-            "Config: model=%s analyze_model=%s effort=%s sandbox=%s skip_permissions_in_worktree=%s timeout_task=%sm" % (
-                CONFIG["model"] or "(default agy)",
-                CONFIG["analyzeModel"] or "(=model)",
+            "Models: %s. Full list and settings: gemini_models." % models_in_use(),
+            "Config: effort=%s sandbox=%s skip_permissions_in_worktree=%s timeout_task=%sm" % (
                 CONFIG["effort"] or "(default)",
                 js(CONFIG["sandbox"]),
                 js(CONFIG["skipPermissionsInWorktree"]),
@@ -791,6 +1041,12 @@ def call_tool(name, a):
             ),
             "State: " + CONFIG["stateDir"],
         ])
+
+    if name == "gemini_models":
+        cache = model_cache(bool(a.get("refresh")))
+        if any(k in a for k in ("analyze", "implement", "exclude")):
+            update_model_settings(a)
+        return models_report(cache)
 
     raise RuntimeError("unknown tool: %s" % name)
 
@@ -810,6 +1066,7 @@ def session_summary():
         "[gemini-delegate] Delegation to Gemini available (MCP tools gemini_*). 24h budget: %s/%s runs left" % (left, CONFIG["dailyBudget"])
         + (", WARNING: %d recent quota errors" % u["quota_errors"] if u["quota_errors"] else "") + "."
     )
+    lines.append("[gemini-delegate] Models: %s. Full list: gemini_models." % models_in_use())
     try:
         repo = repo_root()
     except Exception:

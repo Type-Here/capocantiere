@@ -38,7 +38,7 @@
         },
         "model": {
           "type": "string",
-          "description": "agy model slug (see `agy models`). Defaults to config."
+          "description": "Model to use: a group (fast, standard, strong, frontier) or an exact slug from gemini_models. A group always picks the best model of that group available on this account. Omit it to use the configured default."
         },
         "effort": {
           "type": "string",
@@ -48,7 +48,8 @@
             "high",
             "xhigh",
             "max"
-          ]
+          ],
+          "description": "Reasoning effort. For models whose slug ends with a level (e.g. -low, -high), the matching variant of the same model is picked instead."
         },
         "timeout_minutes": {
           "type": "number"
@@ -93,7 +94,8 @@
           "description": "Maximum response length in words (default 600)"
         },
         "model": {
-          "type": "string"
+          "type": "string",
+          "description": "Model to use: a group (fast, standard, strong, frontier) or an exact slug from gemini_models. A group always picks the best model of that group available on this account. Omit it to use the configured default."
         },
         "effort": {
           "type": "string",
@@ -103,7 +105,8 @@
             "high",
             "xhigh",
             "max"
-          ]
+          ],
+          "description": "Reasoning effort. For models whose slug ends with a level (e.g. -low, -high), the matching variant of the same model is picked instead."
         },
         "timeout_minutes": {
           "type": "number"
@@ -190,6 +193,34 @@
     "inputSchema": {
       "type": "object",
       "properties": {}
+    }
+  },
+  {
+    "name": "gemini_models",
+    "description": "List the models this account can use through agy, grouped by capability (fast, standard, strong, frontier, other), and show which model is used by default for analysis and for implementation. With analyze/implement/exclude it also changes those defaults (saved across sessions). The list is re-read from `agy models` every few hours, so new models appear on their own. Does not use the daily budget.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "refresh": {
+          "type": "boolean",
+          "description": "Re-read `agy models` now. Also forgets models marked unavailable after a failed run."
+        },
+        "analyze": {
+          "type": "string",
+          "description": "Default model for gemini_analyze: a group (follows new models automatically), an exact slug (pinned), or \"auto\" to go back to the automatic choice."
+        },
+        "implement": {
+          "type": "string",
+          "description": "Default model for gemini_delegate: a group, an exact slug, or \"auto\"."
+        },
+        "exclude": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Slug patterns (* wildcard) never chosen through a group or by default, e.g. [\"claude-*\"]. Replaces the current list; [] clears it."
+        }
+      }
     }
   }
 ]

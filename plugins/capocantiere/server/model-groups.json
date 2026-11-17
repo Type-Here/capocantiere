@@ -1,0 +1,29 @@
+{
+  "_comment": "Classifies the slugs returned by `agy models` into capability groups. Groups are checked in order and the first matching pattern wins (case-insensitive regex). Inside a group, models matching an earlier pattern are preferred, then the newest version (read from the display name). Slugs that match nothing go to 'other' and are never chosen automatically. 'defaults' lists, per role, the groups to try in order when nothing is configured. Shared by server.py and server.mjs.",
+  "groups": [
+    {
+      "id": "fast",
+      "description": "Quick and cheap. Exploring and analyzing code, simple mechanical tasks.",
+      "match": ["^gemini-.*flash.*-medium$", "^gemini-.*flash.*-low$", "^gemini-.*flash-lite"]
+    },
+    {
+      "id": "standard",
+      "description": "Default for implementation: boilerplate, tests, refactors, small features.",
+      "match": ["^gemini-.*flash.*-high$", "^gemini-.*flash"]
+    },
+    {
+      "id": "strong",
+      "description": "Tasks with more logic, or a retry after a job failed on a lower group.",
+      "match": ["^gemini-.*-pro.*-high$", "^gemini-.*-pro", "sonnet"]
+    },
+    {
+      "id": "frontier",
+      "description": "Top models. Only for the hardest delegated tasks: slower and heavier on quota.",
+      "match": ["^gemini-.*-ultra", "deep-?think", "opus"]
+    }
+  ],
+  "defaults": {
+    "analyze": ["fast", "standard", "strong"],
+    "implement": ["standard", "strong", "fast"]
+  }
+}

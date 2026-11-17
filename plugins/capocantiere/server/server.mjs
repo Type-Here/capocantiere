@@ -220,6 +220,7 @@ async function runAgy({ cwd, prompt, model, effort, timeoutMin, skipPermissions,
   recordUsage({
     kind,
     job: jobId,
+    model: model || undefined,
     ok,
     quota,
     turns: envl?.num_turns || 0,
@@ -247,6 +248,238 @@ async function runAgy({ cwd, prompt, model, effort, timeoutMin, skipPermissions,
   };
 }
 
+// ---------------------------------------------------------------- models
+//
+// The model list comes from `agy models`, which only shows what the user's account can use,
+// so new models (or a plan upgrade) are picked up without updating the plugin. Slugs are
+// sorted into capability groups by the rules in model-groups.json.
+
+const MODEL_RULES = JSON.parse(fs.readFileSync(new URL("./model-groups.json", import.meta.url), "utf8"));
+const GROUP_IDS = MODEL_RULES.groups.map((g) => g.id);
+const OTHER_GROUP = { id: "other", description: "Not classified. Never chosen automatically, only when requested by slug or group." };
+const MODELS_FILE = path.join(CONFIG.stateDir, "models.json");
+const SETTINGS_FILE = path.join(CONFIG.stateDir, "settings.json");
+const MODELS_TTL_MS = 6 * 3600_000;
+const LEVELS = ["low", "medium", "high", "xhigh", "max"];
+const LEVEL_RE = new RegExp(`-(${LEVELS.join("|")})$`);
+const MODEL_ERROR_RE =
+  /not recognized as a known model|model.{0,80}(not available|unavailable|not allowed|not supported|not entitled|permission denied)/i;
+
+function readJson(file, dflt) {
+  try {
+    const v = JSON.parse(fs.readFileSync(file, "utf8"));
+    return v && typeof v === "object" && !Array.isArray(v) ? v : dflt;
+  } catch {
+    return dflt;
+  }
+}
+
+function writeJson(file, data) {
+  const tmp = file + ".tmp";
+  fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
+  fs.renameSync(tmp, file);
+}
+
+// `agy models` prints one "slug<TAB>Display name" line per model.
+function parseModels(stdout) {
+  const out = [];
+  for (const line of stdout.split("\n")) {
+    const i = line.indexOf("\t");
+    if (i < 0) continue;
+    const slug = line.slice(0, i).trim();
+    if (slug) out.push({ slug, name: line.slice(i + 1).trim() || slug });
+  }
+  return out;
+}
+
+// The cached model list, re-read from `agy models` when stale. Never throws.
+let modelFetch = null;
+async function modelCache(refresh = false) {
+  const cache = readJson(MODELS_FILE, {});
+  if (!refresh && cache.models?.length && Date.now() - (cache.fetchedAt || 0) <= MODELS_TTL_MS) return cache;
+  if (!modelFetch) {
+    modelFetch = (async () => {
+      const r = await run(CONFIG.agyBin, ["models"], { timeoutMs: 30_000 });
+      const models = r.code === 0 ? parseModels(r.stdout) : [];
+      const current = readJson(MODELS_FILE, {});
+      if (models.length) {
+        // an explicit refresh also forgets models marked unavailable
+        const fresh = { fetchedAt: Date.now(), models, unavailable: refresh ? {} : current.unavailable || {} };
+        writeJson(MODELS_FILE, fresh);
+        return fresh;
+      }
+      return { ...current, fetchError: (r.stderr || r.stdout).trim().slice(0, 500) || "`agy models` failed" };
+    })().finally(() => { modelFetch = null; });
+  }
+  return modelFetch;
+}
+
+function markUnavailable(slug) {
+  const cache = readJson(MODELS_FILE, {});
+  cache.unavailable = { ...(cache.unavailable || {}), [slug]: new Date().toISOString() };
+  writeJson(MODELS_FILE, cache);
+}
+
+const globRe = (p) => new RegExp("^" + p.split("*").map((x) => x.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join(".*") + "$", "i");
+
+function groupOf(slug) {
+  for (const g of MODEL_RULES.groups)
+    for (let i = 0; i < g.match.length; i++) if (new RegExp(g.match[i], "i").test(slug)) return [g.id, i];
+  return ["other", 0];
+}
+
+// Newest first: "Gemini 3.8 Flash" -> [-3, -8, 0, 0].
+function versionKey(name) {
+  const m = name.match(/\d+(?:\.\d+)*/);
+  const parts = m ? m[0].split(".").slice(0, 4).map(Number) : [];
+  while (parts.length < 4) parts.push(0);
+  return parts.map((x) => -x);
+}
+
+function compareRank(a, b) {
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return a[i] - b[i];
+  return 0;
+}
+
+// Usable models by group, best first, plus the ones excluded by settings.
+function catalog(cache, settings) {
+  const unavailable = cache.unavailable || {};
+  const excl = (settings.exclude || []).map(globRe);
+  const groups = Object.fromEntries([...GROUP_IDS, "other"].map((g) => [g, []]));
+  const excluded = [];
+  for (const m of cache.models || []) {
+    if (unavailable[m.slug]) continue;
+    if (excl.some((rx) => rx.test(m.slug))) { excluded.push(m); continue; }
+    const [gid, idx] = groupOf(m.slug);
+    groups[gid].push({ ...m, rank: [idx, ...versionKey(m.name)] });
+  }
+  for (const list of Object.values(groups)) list.sort((x, y) => compareRank(x.rank, y.rank));
+  return { groups, excluded };
+}
+
+function groupsHint(cat) {
+  const parts = Object.entries(cat.groups).filter(([, ms]) => ms.length).map(([g, ms]) => `${g}: ${ms.map((m) => m.slug).join(", ")}`);
+  return `Available — ${parts.join("; ") || "none"}. See gemini_models.`;
+}
+
+// Pick model and effort for a run. role is "analyze" or "implement".
+// Precedence: requested (tool argument) > environment variable > settings > automatic.
+// Each of them may be a slug or a group id; a group follows new models automatically.
+// Returns { model, effort, source }; model "" means agy's default.
+async function resolveModel(role, requested, effort) {
+  const cache = await modelCache();
+  const settings = readJson(SETTINGS_FILE, {});
+  const cat = catalog(cache, settings);
+  const known = new Set((cache.models || []).map((m) => m.slug));
+  const envModel = role === "analyze" ? CONFIG.analyzeModel || CONFIG.model : CONFIG.model;
+  let choice = null;
+  let source = null;
+  for (const [value, src] of [[requested, "requested"], [envModel, "env"], [settings[role], "settings"]]) {
+    if (value && value !== "auto") { choice = value; source = src; break; }
+  }
+  let model;
+  if (choice === null) {
+    model = "";
+    source = "agy default";
+    for (const gid of MODEL_RULES.defaults[role]) {
+      if (cat.groups[gid].length) { model = cat.groups[gid][0].slug; source = `auto, group ${gid}`; break; }
+    }
+  } else if (Object.hasOwn(cat.groups, choice)) {
+    if (!cat.groups[choice].length) throw new Error(`No model available in group "${choice}". ${groupsHint(cat)}`);
+    model = cat.groups[choice][0].slug;
+    source = `${source}, group ${choice}`;
+  } else if (!known.size || known.has(choice)) {
+    model = choice; // list unknown (agy models failed): pass it through and let agy decide
+  } else {
+    throw new Error(`Unknown model "${choice}". ${groupsHint(cat)}`);
+  }
+
+  effort = effort || CONFIG.effort;
+  if (effort && model && LEVEL_RE.test(model)) {
+    // the level is part of the slug and agy rejects --effort with it:
+    // pick the variant of the same model closest to the requested level
+    const base = model.replace(LEVEL_RE, "");
+    const want = LEVELS.indexOf(effort);
+    const variants = LEVELS.filter((lv) => known.has(`${base}-${lv}`));
+    if (want >= 0 && variants.length) {
+      const dist = (lv) => [Math.abs(LEVELS.indexOf(lv) - want), -LEVELS.indexOf(lv)];
+      variants.sort((x, y) => compareRank(dist(x), dist(y)));
+      model = `${base}-${variants[0]}`;
+    }
+    effort = "";
+  }
+  return { model, effort, source };
+}
+
+async function modelsReport(cache) {
+  if (!cache.models?.length)
+    return `Could not read the model list (${cache.fetchError || "no output from `agy models`"}). Runs will use agy's default model.`;
+  const settings = readJson(SETTINGS_FILE, {});
+  const cat = catalog(cache, settings);
+  const d = new Date(cache.fetchedAt);
+  const p = (x) => String(x).padStart(2, "0");
+  const when = `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+  const lines = [`Models this account can use through agy (read ${when}):`];
+  const width = Math.max(...cache.models.map((m) => m.slug.length));
+  for (const g of [...MODEL_RULES.groups, OTHER_GROUP]) {
+    const ms = cat.groups[g.id];
+    if (g === OTHER_GROUP && !ms.length) continue;
+    lines.push("", `${g.id} — ${g.description}`);
+    if (!ms.length) lines.push("    (none available)");
+    ms.forEach((m, i) => lines.push(`  ${i === 0 ? "*" : " "} ${m.slug.padEnd(width)}  ${m.name}`));
+  }
+  lines.push("", "* = the model used when that group is requested.");
+  if (cat.excluded.length) lines.push(`Excluded by settings: ${cat.excluded.map((m) => m.slug).join(", ")}`);
+  if (Object.keys(cache.unavailable || {}).length)
+    lines.push(`Marked unavailable after failing for this account (a refresh clears this): ${Object.keys(cache.unavailable).sort().join(", ")}`);
+  lines.push("", "In use:");
+  for (const role of ["analyze", "implement"]) {
+    try {
+      const r = await resolveModel(role);
+      lines.push(`  ${role.padEnd(9)} → ${r.model || "agy default"} (${r.source})`);
+    } catch (e) {
+      lines.push(`  ${role.padEnd(9)} → ERROR: ${e.message}`);
+    }
+  }
+  lines.push(`Settings file: ${SETTINGS_FILE} (exclude: ${(settings.exclude || []).join(", ") || "none"})`);
+  return lines.join("\n");
+}
+
+async function modelsInUse() {
+  const parts = [];
+  for (const role of ["analyze", "implement"]) {
+    try {
+      const r = await resolveModel(role);
+      parts.push(`${role} → ${r.model || "agy default"} (${r.source})`);
+    } catch (e) {
+      parts.push(`${role} → ERROR: ${e.message}`);
+    }
+  }
+  return parts.join("; ");
+}
+
+async function updateModelSettings(a) {
+  const settings = readJson(SETTINGS_FILE, {});
+  const cache = await modelCache();
+  const known = new Set((cache.models || []).map((m) => m.slug));
+  for (const role of ["analyze", "implement"]) {
+    if (!(role in a)) continue;
+    const v = (a[role] || "").trim();
+    if (!v || v === "auto") delete settings[role];
+    else if (GROUP_IDS.includes(v) || v === "other" || !known.size || known.has(v)) settings[role] = v;
+    else throw new Error(`Unknown model or group "${v}". Groups: ${[...GROUP_IDS, "other"].join(", ")}.`);
+  }
+  if ("exclude" in a) settings.exclude = (a.exclude || []).map(String).filter((x) => x.trim());
+  writeJson(SETTINGS_FILE, settings);
+}
+
+// If agy rejected the model for this account, remember it so the next runs pick another.
+function unavailableNote(model, error) {
+  if (!model || !MODEL_ERROR_RE.test(error || "")) return "";
+  markUnavailable(model);
+  return `\nModel ${model} has been marked unavailable; the next runs will pick another one (gemini_models refresh=true clears this).`;
+}
+
 // ---------------------------------------------------------------- prompts
 
 function implementPrompt({ task, files, context, acceptance, testCommand }) {
@@ -257,6 +490,7 @@ function implementPrompt({ task, files, context, acceptance, testCommand }) {
     "- Do ONLY what the task asks. No unrequested refactors, no new dependencies unless explicitly requested.",
     "- Follow the style and conventions of the existing code.",
     "- Write code comments and documentation in the language already used in the repository.",
+    "- Before finishing, delete any temporary files or build artifacts you created that are not part of the task (e.g. __pycache__, .pytest_cache, coverage reports).",
     "- If something is ambiguous, choose the most conservative interpretation and flag it in NOTES.",
     testCommand
       ? `- When you are done, run: ${testCommand} and fix any errors you introduced.`
@@ -341,6 +575,7 @@ function pump() {
 async function createJob(args) {
   const repo = await repoRoot(args.repo_dir);
   const usage = budgetCheck(args.force);
+  const resolved = await resolveModel("implement", args.model, args.effort);
   const id = newId();
   const branch = `gemini/${id}`;
   const worktree = path.join(CONFIG.worktreeDir, `${path.basename(repo)}-${id}`);
@@ -372,8 +607,9 @@ async function createJob(args) {
     context: args.context || "",
     acceptance: args.acceptance || "",
     testCommand: args.test_command || "",
-    model: args.model || CONFIG.model,
-    effort: args.effort || CONFIG.effort,
+    model: resolved.model,
+    modelSource: resolved.source,
+    effort: resolved.effort,
     timeoutMin: args.timeout_minutes || CONFIG.taskTimeoutMin,
     createdAt: new Date().toISOString(),
   };
@@ -421,11 +657,12 @@ async function executeJob(job) {
 
   if (res.notFound) {
     job.status = "failed";
-    job.error = `Comando "${CONFIG.agyBin}" not found. Install Antigravity CLI and run \`agy\` once to log in.`;
+    job.error = `Command "${CONFIG.agyBin}" not found. Install Antigravity CLI and run \`agy\` once to log in.`;
   } else if (!res.ok) {
     job.status = "failed";
     job.error = res.error || `agy exited with status ${res.status}`;
     if (res.quota) job.error = "QUOTA EXHAUSTED / Gemini rate limit.\n" + job.error;
+    job.error += unavailableNote(job.model, res.error);
   } else {
     job.status = job.filesChanged > 0 ? "done" : "no_changes";
   }
@@ -434,9 +671,12 @@ async function executeJob(job) {
   if (!job.filesChanged) await removeWorktree(job).catch(() => {});
 }
 
+// Build artifacts that never belong in a job's diff, even if the repo has no .gitignore for them.
+const JUNK_PATHSPECS = ["**/__pycache__/**", "**/*.py[co]", "**/.pytest_cache/**", "**/.mypy_cache/**", "**/.ruff_cache/**", "**/node_modules/**", "**/.DS_Store"].map((p) => ":(exclude,glob)" + p);
+
 async function collectChanges(job) {
   if (!fs.existsSync(job.worktree)) return;
-  await git(job.worktree, "add", "-A");
+  await git(job.worktree, "add", "-A", "--", ".", ...JUNK_PATHSPECS);
   const staged = await run("git", ["diff", "--cached", "--quiet"], { cwd: job.worktree });
   if (staged.code === 1) {
     await git(
@@ -485,6 +725,7 @@ function jobDetail(j, { includeDiff = true, maxDiffChars = 15000 } = {}) {
     `status: ${j.status}${j.agyStatus ? ` (agy: ${j.agyStatus})` : ""}`,
     `branch: ${j.branch}   worktree: ${j.worktree}`,
     `base: ${j.baseLabel} (${j.base?.slice(0, 10)})`,
+    `model: ${j.model || "agy default"}${j.modelSource ? ` (${j.modelSource})` : ""}${j.effort ? `, effort ${j.effort}` : ""}`,
   ];
   if (j.durationSeconds != null) lines.push(`duration: ${Math.round(j.durationSeconds)}s, turns: ${j.turns ?? "?"}`);
   if (j.error) lines.push("", "ERROR:", truncate(j.error, 2500));
@@ -526,6 +767,7 @@ async function callTool(name, a = {}) {
       }
       return [
         `Job ${job.id} started (${job.status}). Branch ${job.branch}, base: ${job.baseLabel}.`,
+        `Model: ${job.model || "agy default"} (${job.modelSource}).`,
         `Active jobs: ${runningCount()}/${CONFIG.maxParallel} running, ${queue.length} queued.`,
         `24h usage (including running jobs): ${usage.committed + 1}/${CONFIG.dailyBudget}.`,
         `Use gemini_jobs with job_id="${job.id}" and wait_seconds to wait for the result.`,
@@ -535,6 +777,7 @@ async function callTool(name, a = {}) {
     case "gemini_analyze": {
       const repo = await repoRoot(a.repo_dir);
       budgetCheck(a.force);
+      const resolved = await resolveModel("analyze", a.model, a.effort);
       const snapshot = async () => {
         const s = await run("git", ["status", "--porcelain=v1", "-uall"], { cwd: repo });
         const d = await run("git", ["diff"], { cwd: repo });
@@ -545,20 +788,21 @@ async function callTool(name, a = {}) {
       const res = await runAgy({
         cwd: repo,
         prompt: analyzePrompt({ question: a.question, paths: a.paths, maxWords: a.max_words || 600 }),
-        model: a.model || CONFIG.analyzeModel || CONFIG.model,
-        effort: a.effort || CONFIG.effort,
+        model: resolved.model,
+        effort: resolved.effort,
         timeoutMin,
         skipPermissions: false, // in the main repo: no auto-approval
         kind: "analyze",
       });
       const after = await snapshot();
       const out = [];
-      if (res.notFound) throw new Error(`Comando "${CONFIG.agyBin}" not found. Install Antigravity CLI and run \`agy\` once to log in.`);
-      if (!res.ok) out.push(`ERROR (${res.status})${res.quota ? " — QUOTA/RATE LIMIT" : ""}:\n${truncate(res.error, 2000)}`);
+      if (res.notFound) throw new Error(`Command "${CONFIG.agyBin}" not found. Install Antigravity CLI and run \`agy\` once to log in.`);
+      if (!res.ok)
+        out.push(`ERROR (${res.status})${res.quota ? " — QUOTA/RATE LIMIT" : ""}:\n${truncate(res.error, 2000)}${unavailableNote(resolved.model, res.error)}`);
       if (before !== after)
         out.push("⚠️ WARNING: the repo state changed during the analysis. Check `git status` / `git diff`.");
       out.push(truncate(res.response || "(no response)", 16000));
-      out.push(`\n[gemini_analyze: ${Math.round(res.durationSeconds)}s, turns ${res.turns}, tokens ${res.usage?.total_tokens ?? "?"}]`);
+      out.push(`\n[gemini_analyze: ${resolved.model || "agy default"} (${resolved.source}), ${Math.round(res.durationSeconds)}s, turns ${res.turns}, tokens ${res.usage?.total_tokens ?? "?"}]`);
       return { text: out.join("\n\n"), isError: !res.ok && !res.response };
     }
 
@@ -637,10 +881,16 @@ async function callTool(name, a = {}) {
         `agy: ${agy} (${CONFIG.agyBin})`,
         `Last 24h: ${u.runs}/${CONFIG.dailyBudget} runs, ${u.turns} turns, ${u.total_tokens} tokens, ${u.failures} failed, ${u.quota_errors} quota errors`,
         `Active jobs: ${active.length} (max parallel ${CONFIG.maxParallel}); to review: ${review.length}`,
-        `Config: model=${CONFIG.model || "(default agy)"} analyze_model=${CONFIG.analyzeModel || "(=model)"} effort=${CONFIG.effort || "(default)"} sandbox=${CONFIG.sandbox} skip_permissions_in_worktree=${CONFIG.skipPermissionsInWorktree} timeout_task=${CONFIG.taskTimeoutMin}m`,
+        `Models: ${await modelsInUse()}. Full list and settings: gemini_models.`,
+        `Config: effort=${CONFIG.effort || "(default)"} sandbox=${CONFIG.sandbox} skip_permissions_in_worktree=${CONFIG.skipPermissionsInWorktree} timeout_task=${CONFIG.taskTimeoutMin}m`,
         `State: ${CONFIG.stateDir}`,
       ].join("\n");
     }
+  }
+  if (name === "gemini_models") {
+    const cache = await modelCache(!!a.refresh);
+    if (["analyze", "implement", "exclude"].some((k) => k in a)) await updateModelSettings(a);
+    return modelsReport(cache);
   }
   throw new Error(`unknown tool: ${name}`);
 }
@@ -660,6 +910,7 @@ async function sessionSummary() {
     `[gemini-delegate] Delegation to Gemini available (MCP tools gemini_*). 24h budget: ${left}/${CONFIG.dailyBudget} runs left` +
       (u.quota_errors ? `, WARNING: ${u.quota_errors} recent quota errors` : "") + "."
   );
+  lines.push(`[gemini-delegate] Models: ${await modelsInUse()}. Full list: gemini_models.`);
   let repo = null;
   try { repo = await repoRoot(); } catch {}
   if (repo) {

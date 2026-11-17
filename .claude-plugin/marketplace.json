@@ -8,7 +8,7 @@
     {
       "name": "capocantiere",
       "source": "./plugins/capocantiere",
-      "description": "Opus as manager, Gemini (agy) as worker."
+      "description": "Claude as manager, Gemini (agy) as worker."
     }
   ]
 }
