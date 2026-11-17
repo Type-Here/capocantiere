@@ -565,6 +565,79 @@ def update_model_settings(a):
     write_json(SETTINGS_FILE, settings)
 
 
+# ---------------------------------------------------------------- delegation mode
+#
+# How much Claude should delegate: off | manual | auto | prefer (rules in modes.json).
+# A global default plus per-repo overrides, saved in settings.json. Only "off" is enforced here;
+# the others are instructions given to Claude at session start.
+
+with open(os.path.join(HERE, "modes.json"), encoding="utf-8") as _f:
+    MODE_RULES = json.load(_f)
+MODES = list(MODE_RULES["modes"])
+
+
+def delegation_mode(repo):
+    """Effective mode for a repo: returns (mode, where it comes from)."""
+    s = read_json(SETTINGS_FILE, {})
+    m = (s.get("repoModes") or {}).get(repo) if repo else None
+    if m in MODES:
+        return m, "set for this repo"
+    if s.get("mode") in MODES:
+        return s["mode"], "global setting"
+    return MODE_RULES["default"], "default"
+
+
+def ensure_enabled(repo):
+    mode, source = delegation_mode(repo)
+    if mode == "off":
+        raise RuntimeError("Gemini delegation is off (%s). Do the work without Gemini; "
+                           "the user can change this with /capocantiere:mode." % source)
+
+
+def mode_line(repo):
+    mode, source = delegation_mode(repo)
+    return "Delegation mode: %s (%s). %s" % (mode, source, MODE_RULES["modes"][mode]["instruction"])
+
+
+def set_mode(a):
+    mode = (a.get("mode") or "").strip()
+    scope = a.get("scope") or "repo"
+    if mode not in MODES + ["inherit"]:
+        raise RuntimeError("Unknown mode \"%s\". Modes: %s, or inherit." % (mode, ", ".join(MODES)))
+    s = read_json(SETTINGS_FILE, {})
+    if scope == "global":
+        if mode == "inherit":
+            s.pop("mode", None)
+        else:
+            s["mode"] = mode
+    elif scope == "repo":
+        repo = repo_root(a.get("repo_dir"))
+        overrides = s.get("repoModes") or {}
+        if mode == "inherit":
+            overrides.pop(repo, None)
+        else:
+            overrides[repo] = mode
+        s["repoModes"] = overrides
+    else:
+        raise RuntimeError('scope must be "repo" or "global"')
+    write_json(SETTINGS_FILE, s)
+
+
+def mode_report(repo):
+    s = read_json(SETTINGS_FILE, {})
+    mode, source = delegation_mode(repo)
+    lines = [
+        "Delegation mode%s: %s (%s)" % (" for " + repo if repo else "", mode, source),
+        "Global default: %s" % (s.get("mode") or MODE_RULES["default"] + " (built-in)"),
+    ]
+    overrides = s.get("repoModes") or {}
+    if overrides:
+        lines.append("Per-repo settings: " + "; ".join("%s → %s" % (r, m) for r, m in sorted(overrides.items())))
+    lines += ["", "Modes:"] + ["  %-7s %s" % (m, MODE_RULES["modes"][m]["description"]) for m in MODES]
+    lines += ["", "Now: " + MODE_RULES["modes"][mode]["instruction"]]
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------- prompts
 
 
@@ -678,6 +751,7 @@ def _execute_wrapper(job):
 
 def create_job(args):
     repo = repo_root(args.get("repo_dir"))
+    ensure_enabled(repo)
     usage = budget_check(args.get("force"))
     model, effort, model_source = resolve_model("implement", args.get("model"), args.get("effort"))
     jid = new_id()
@@ -909,6 +983,7 @@ def call_tool(name, a):
 
     if name == "gemini_analyze":
         repo = repo_root(a.get("repo_dir"))
+        ensure_enabled(repo)
         budget_check(a.get("force"))
         model, effort, model_source = resolve_model("analyze", a.get("model"), a.get("effort"))
 
@@ -1032,6 +1107,7 @@ def call_tool(name, a):
             "Last 24h: %d/%s runs, %d turns, %d tokens, %d failed, %d quota errors"
             % (u["runs"], CONFIG["dailyBudget"], u["turns"], u["total_tokens"], u["failures"], u["quota_errors"]),
             "Active jobs: %d (max parallel %s); to review: %d" % (len(active), CONFIG["maxParallel"], len(review)),
+            mode_line(current_repo()),
             "Models: %s. Full list and settings: gemini_models." % models_in_use(),
             "Config: effort=%s sandbox=%s skip_permissions_in_worktree=%s timeout_task=%sm" % (
                 CONFIG["effort"] or "(default)",
@@ -1041,6 +1117,15 @@ def call_tool(name, a):
             ),
             "State: " + CONFIG["stateDir"],
         ])
+
+    if name == "gemini_mode":
+        if a.get("mode"):
+            set_mode(a)
+        try:
+            repo = repo_root(a.get("repo_dir"))
+        except Exception:
+            repo = None
+        return mode_report(repo)
 
     if name == "gemini_models":
         cache = model_cache(bool(a.get("refresh")))
@@ -1054,7 +1139,17 @@ def call_tool(name, a):
 # ---------------------------------------------------------------- session summary (for the SessionStart hook)
 
 
+def current_repo():
+    try:
+        return repo_root()
+    except Exception:
+        return None
+
+
 def session_summary():
+    repo = current_repo()
+    if delegation_mode(repo)[0] == "off":
+        return "[gemini-delegate] " + mode_line(repo)
     v = run(CONFIG["agyBin"], ["--version"])
     if not_found(v):
         return ("[gemini-delegate] agy not found: delegation to Gemini is unavailable in this session "
@@ -1066,11 +1161,8 @@ def session_summary():
         "[gemini-delegate] Delegation to Gemini available (MCP tools gemini_*). 24h budget: %s/%s runs left" % (left, CONFIG["dailyBudget"])
         + (", WARNING: %d recent quota errors" % u["quota_errors"] if u["quota_errors"] else "") + "."
     )
+    lines.append("[gemini-delegate] " + mode_line(repo))
     lines.append("[gemini-delegate] Models: %s. Full list: gemini_models." % models_in_use())
-    try:
-        repo = repo_root()
-    except Exception:
-        repo = None
     if repo:
         pending = [
             j for j in jobs.values()

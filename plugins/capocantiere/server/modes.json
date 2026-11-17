@@ -1,0 +1,22 @@
+{
+  "_comment": "Delegation modes. 'instruction' is what Claude is told at session start; only 'off' is enforced by the server (gemini_delegate and gemini_analyze refuse). Shared by server.py and server.mjs.",
+  "default": "auto",
+  "modes": {
+    "off": {
+      "description": "Gemini disabled: the delegation tools refuse to run. For repos whose code must not be sent to Google.",
+      "instruction": "Gemini delegation is OFF here: gemini_delegate and gemini_analyze will refuse. Work as usual without them."
+    },
+    "manual": {
+      "description": "Delegate only when the user asks (in the conversation, with a /capocantiere command, or in CLAUDE.md).",
+      "instruction": "Delegate to Gemini only when the user explicitly asks for it (in the conversation, with a /capocantiere command, or in CLAUDE.md). Otherwise work as usual."
+    },
+    "auto": {
+      "description": "Claude decides case by case whether Gemini, itself or a Claude subagent fits best.",
+      "instruction": "Delegate to Gemini when it clearly fits (see the gemini-delegation skill); otherwise do the work yourself or use a Claude subagent. Explicit user instructions and CLAUDE.md take precedence."
+    },
+    "prefer": {
+      "description": "Delegate everything that makes sense to delegate; Claude keeps design, delicate parts, review and verification.",
+      "instruction": "Actively look for work to delegate to Gemini (gemini_delegate for code, gemini_analyze for exploring) and keep design, delicate parts, review and verification for yourself. Explicit user instructions and CLAUDE.md take precedence."
+    }
+  }
+}

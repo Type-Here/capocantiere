@@ -1,6 +1,6 @@
 ---
 name: gemini-delegation
-description: How to delegate work to Gemini (Antigravity CLI) with the gemini_delegate, gemini_analyze, gemini_jobs, gemini_apply, gemini_discard, gemini_usage and gemini_models tools, and how to review the result. Use it when a task contains mechanical, easily specified work (boilerplate, tests, repetitive refactors, migrations, documentation, small features) that is worth handing off, when you need to explore large codebases or files, or when the user (or CLAUDE.md) asks to use Gemini.
+description: How to delegate work to Gemini (Antigravity CLI) with the gemini_delegate, gemini_analyze, gemini_jobs, gemini_apply, gemini_discard, gemini_usage, gemini_models and gemini_mode tools, and how to review the result. Use it when a task contains mechanical, easily specified work (boilerplate, tests, repetitive refactors, migrations, documentation, small features) that is worth handing off, when you need to explore large codebases or files, or when the user (or CLAUDE.md) asks to use Gemini.
 ---
 
 # Delegating to Gemini
@@ -14,6 +14,17 @@ Gemini is available as an extra worker through the user's Google subscription. I
 - use a Claude subagent (e.g. Sonnet) when the task is worth delegating but needs more judgment or reliability than Gemini usually gives.
 
 Gemini runs are cheap but have a daily budget and less reliable quality. Whoever does the work, you stay responsible for the review and the final result.
+
+## Delegation mode
+
+The user can set how much you delegate, globally or per repo. The current mode is in the session-start message (or call `gemini_mode`):
+
+- `off`: Gemini is disabled for this repo (the tools refuse). Don't try to use it.
+- `manual`: delegate only when the user explicitly asks.
+- `auto` (default): use your judgment as described here.
+- `prefer`: actively look for work to delegate; keep design, delicate parts, review and verification.
+
+Explicit instructions in the conversation or in CLAUDE.md take precedence over the mode, except `off`, which is a hard block. Change the mode with `gemini_mode` only when the user asks.
 
 ## Good fits for Gemini
 

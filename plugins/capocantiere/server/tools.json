@@ -222,5 +222,37 @@
         }
       }
     }
+  },
+  {
+    "name": "gemini_mode",
+    "description": "Show or change the delegation mode, i.e. how much you should delegate to Gemini: off (tools disabled), manual (only when the user asks), auto (your judgment, the default), prefer (delegate whatever makes sense). There is a global default plus per-repo settings. Without arguments it shows the current mode for this repo. Change it only when the user asks.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": [
+            "off",
+            "manual",
+            "auto",
+            "prefer",
+            "inherit"
+          ],
+          "description": "New mode. \"inherit\" removes this repo's setting (or, with scope global, goes back to the built-in default)."
+        },
+        "scope": {
+          "type": "string",
+          "enum": [
+            "repo",
+            "global"
+          ],
+          "description": "Where to save it: this repo only (default) or the global default."
+        },
+        "repo_dir": {
+          "type": "string",
+          "description": "Repo directory (default: current project)"
+        }
+      }
+    }
   }
 ]

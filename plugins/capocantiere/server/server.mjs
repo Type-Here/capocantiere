@@ -480,6 +480,73 @@ function unavailableNote(model, error) {
   return `\nModel ${model} has been marked unavailable; the next runs will pick another one (gemini_models refresh=true clears this).`;
 }
 
+// ---------------------------------------------------------------- delegation mode
+//
+// How much Claude should delegate: off | manual | auto | prefer (rules in modes.json).
+// A global default plus per-repo overrides, saved in settings.json. Only "off" is enforced here;
+// the others are instructions given to Claude at session start.
+
+const MODE_RULES = JSON.parse(fs.readFileSync(new URL("./modes.json", import.meta.url), "utf8"));
+const MODES = Object.keys(MODE_RULES.modes);
+
+// Effective mode for a repo: { mode, source }.
+function delegationMode(repo) {
+  const s = readJson(SETTINGS_FILE, {});
+  const m = repo ? (s.repoModes || {})[repo] : undefined;
+  if (MODES.includes(m)) return { mode: m, source: "set for this repo" };
+  if (MODES.includes(s.mode)) return { mode: s.mode, source: "global setting" };
+  return { mode: MODE_RULES.default, source: "default" };
+}
+
+function ensureEnabled(repo) {
+  const { mode, source } = delegationMode(repo);
+  if (mode === "off")
+    throw new Error(`Gemini delegation is off (${source}). Do the work without Gemini; the user can change this with /capocantiere:mode.`);
+}
+
+function modeLine(repo) {
+  const { mode, source } = delegationMode(repo);
+  return `Delegation mode: ${mode} (${source}). ${MODE_RULES.modes[mode].instruction}`;
+}
+
+async function setMode(a) {
+  const mode = (a.mode || "").trim();
+  const scope = a.scope || "repo";
+  if (![...MODES, "inherit"].includes(mode)) throw new Error(`Unknown mode "${mode}". Modes: ${MODES.join(", ")}, or inherit.`);
+  const s = readJson(SETTINGS_FILE, {});
+  if (scope === "global") {
+    if (mode === "inherit") delete s.mode;
+    else s.mode = mode;
+  } else if (scope === "repo") {
+    const repo = await repoRoot(a.repo_dir);
+    const overrides = s.repoModes || {};
+    if (mode === "inherit") delete overrides[repo];
+    else overrides[repo] = mode;
+    s.repoModes = overrides;
+  } else {
+    throw new Error('scope must be "repo" or "global"');
+  }
+  writeJson(SETTINGS_FILE, s);
+}
+
+function modeReport(repo) {
+  const s = readJson(SETTINGS_FILE, {});
+  const { mode, source } = delegationMode(repo);
+  const lines = [
+    `Delegation mode${repo ? " for " + repo : ""}: ${mode} (${source})`,
+    `Global default: ${s.mode || MODE_RULES.default + " (built-in)"}`,
+  ];
+  const overrides = Object.entries(s.repoModes || {}).sort(([x], [y]) => x.localeCompare(y));
+  if (overrides.length) lines.push(`Per-repo settings: ${overrides.map(([r, m]) => `${r} → ${m}`).join("; ")}`);
+  lines.push("", "Modes:", ...MODES.map((m) => `  ${m.padEnd(7)} ${MODE_RULES.modes[m].description}`));
+  lines.push("", `Now: ${MODE_RULES.modes[mode].instruction}`);
+  return lines.join("\n");
+}
+
+async function currentRepo() {
+  try { return await repoRoot(); } catch { return null; }
+}
+
 // ---------------------------------------------------------------- prompts
 
 function implementPrompt({ task, files, context, acceptance, testCommand }) {
@@ -574,6 +641,7 @@ function pump() {
 
 async function createJob(args) {
   const repo = await repoRoot(args.repo_dir);
+  ensureEnabled(repo);
   const usage = budgetCheck(args.force);
   const resolved = await resolveModel("implement", args.model, args.effort);
   const id = newId();
@@ -776,6 +844,7 @@ async function callTool(name, a = {}) {
 
     case "gemini_analyze": {
       const repo = await repoRoot(a.repo_dir);
+      ensureEnabled(repo);
       budgetCheck(a.force);
       const resolved = await resolveModel("analyze", a.model, a.effort);
       const snapshot = async () => {
@@ -881,11 +950,18 @@ async function callTool(name, a = {}) {
         `agy: ${agy} (${CONFIG.agyBin})`,
         `Last 24h: ${u.runs}/${CONFIG.dailyBudget} runs, ${u.turns} turns, ${u.total_tokens} tokens, ${u.failures} failed, ${u.quota_errors} quota errors`,
         `Active jobs: ${active.length} (max parallel ${CONFIG.maxParallel}); to review: ${review.length}`,
+        modeLine(await currentRepo()),
         `Models: ${await modelsInUse()}. Full list and settings: gemini_models.`,
         `Config: effort=${CONFIG.effort || "(default)"} sandbox=${CONFIG.sandbox} skip_permissions_in_worktree=${CONFIG.skipPermissionsInWorktree} timeout_task=${CONFIG.taskTimeoutMin}m`,
         `State: ${CONFIG.stateDir}`,
       ].join("\n");
     }
+  }
+  if (name === "gemini_mode") {
+    if (a.mode) await setMode(a);
+    let repo = null;
+    try { repo = await repoRoot(a.repo_dir); } catch {}
+    return modeReport(repo);
   }
   if (name === "gemini_models") {
     const cache = await modelCache(!!a.refresh);
@@ -898,6 +974,8 @@ async function callTool(name, a = {}) {
 // ---------------------------------------------------------------- session summary (for the SessionStart hook)
 
 async function sessionSummary() {
+  const repo = await currentRepo();
+  if (delegationMode(repo).mode === "off") return `[gemini-delegate] ${modeLine(repo)}`;
   const v = await run(CONFIG.agyBin, ["--version"]);
   const lines = [];
   if (v.error?.code === "ENOENT") {
@@ -910,9 +988,8 @@ async function sessionSummary() {
     `[gemini-delegate] Delegation to Gemini available (MCP tools gemini_*). 24h budget: ${left}/${CONFIG.dailyBudget} runs left` +
       (u.quota_errors ? `, WARNING: ${u.quota_errors} recent quota errors` : "") + "."
   );
+  lines.push(`[gemini-delegate] ${modeLine(repo)}`);
   lines.push(`[gemini-delegate] Models: ${await modelsInUse()}. Full list: gemini_models.`);
-  let repo = null;
-  try { repo = await repoRoot(); } catch {}
   if (repo) {
     const pending = [...jobs.values()].filter((j) => j.repo === repo && (j.status === "interrupted" || (["done", "failed"].includes(j.status) && j.filesChanged > 0)));
     if (pending.length)

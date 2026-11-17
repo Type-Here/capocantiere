@@ -6,11 +6,11 @@ A Claude Code plugin. Claude plans, specifies, reviews and decides; **Gemini**, 
 
 | Component | Purpose |
 |---|---|
-| **MCP server `gemini-delegate`** (Python or Node, zero dependencies) | The tools `gemini_delegate`, `gemini_analyze`, `gemini_jobs`, `gemini_apply`, `gemini_discard`, `gemini_usage`, `gemini_models` |
+| **MCP server `gemini-delegate`** (Python or Node, zero dependencies) | The tools `gemini_delegate`, `gemini_analyze`, `gemini_jobs`, `gemini_apply`, `gemini_discard`, `gemini_usage`, `gemini_models`, `gemini_mode` |
 | **Skill `gemini-delegation`** | Teaches Claude *when* to delegate, how to write a task for Gemini and how to review the result. Claude loads it on its own when needed |
 | **Agent `gemini-reviewer`** (Sonnet) | First-pass review of large diffs, to save the manager's context |
 | **SessionStart hook** | At the start of each session, tells Claude whether `agy` is available, how much budget is left and whether there are open jobs from previous sessions |
-| **Commands** | `/capocantiere:manager`, `/capocantiere:delegate`, `/capocantiere:analyze`, `/capocantiere:status`, `/capocantiere:review`, `/capocantiere:models` |
+| **Commands** | `/capocantiere:manager`, `/capocantiere:delegate`, `/capocantiere:analyze`, `/capocantiere:status`, `/capocantiere:review`, `/capocantiere:models`, `/capocantiere:mode` |
 
 ### How a job works
 
@@ -62,6 +62,7 @@ In a session inside a git repo: `/capocantiere:status`.
 - `/capocantiere:delegate add the missing tests for src/billing` → plan, parallel delegation, review, apply, verify.
 - `/capocantiere:analyze how does the authentication flow work?` → Gemini reads, Claude only receives the summary.
 - `/capocantiere:review` → reviews and applies/discards all completed jobs.
+- `/capocantiere:mode` → shows or changes how much Claude delegates (see [Delegation mode](#delegation-mode)).
 - `/capocantiere:models` → shows the models your account can use and lets you choose which ones to use (see [Models](#models)).
 
 Even without the commands, Claude can use the tools and the skill on its own when it finds them useful.
@@ -71,6 +72,21 @@ Even without the commands, Claude can use the tools and the skill on its own whe
 The manager is whatever model your Claude Code session runs (Opus, Sonnet, Fable…): nothing in the plugin depends on a specific one. Only the `gemini-reviewer` agent is pinned to Sonnet, to keep reviews cheap.
 
 The plugin doesn't change Claude's normal behavior much. Gemini is one more option, next to doing the work itself or using a Claude subagent, and Claude picks per task. Your instructions win: write in `CLAUDE.md` how much you want Gemini used (e.g. "delegate tests and docs to Gemini", or "never use Gemini in this repo") and Claude follows it. `/capocantiere:manager` is the explicit opt-in to delegate as much as possible for a session.
+
+### Delegation mode
+
+For a lasting setting, use `/capocantiere:mode`. There is a global default and you can override it per repo:
+
+| Mode | Behavior | Enforced by |
+|---|---|---|
+| `off` | Gemini disabled, e.g. for repos whose code must not be sent to Google | the server: the delegation tools refuse to run |
+| `manual` | delegate only when you ask (in chat, with a command, or in `CLAUDE.md`) | instruction to Claude |
+| `auto` *(default)* | Claude decides case by case | instruction to Claude |
+| `prefer` | delegate everything that makes sense, like a permanent `/capocantiere:manager` | instruction to Claude |
+
+Examples: `/capocantiere:mode off` (this repo), `/capocantiere:mode prefer global`, `/capocantiere:mode inherit` (this repo goes back to the global default).
+
+The mode is given to Claude at the start of every session. Explicit instructions in chat or in `CLAUDE.md` take precedence over it, except `off`, which is a hard block. `manual`, `auto` and `prefer` are instructions to the model: they work well, but unlike `off` they aren't enforced by code.
 
 ## Models
 
@@ -138,7 +154,7 @@ Example:
 
 ## Where files go
 
-- State, jobs, patches, usage log, model list (`models.json`) and model settings (`settings.json`): `~/.local/state/gemini-delegate/`
+- State, jobs, patches, usage log, model list (`models.json`), model and mode settings (`settings.json`): `~/.local/state/gemini-delegate/`
 - Temporary worktrees: `~/.cache/gemini-delegate/worktrees/` (removed after apply/discard)
 
 ## Known limitations
