@@ -136,15 +136,20 @@ def candidate_order(requested, fallback):
     return [first] + (rest if fallback else [])
 
 
-def arms_of(w, role, tier, model, effort, events):
-    """The worker's candidate arms for this run: dicts with worker, model, effort, source, arm."""
+def arms_of(w, role, tier, model, effort, events, strict=False):
+    """The worker's candidate arms for this run: dicts with worker, model, effort, source, arm.
+
+    strict (the worker was asked for by name): a model it rejects is an error, and a tier it doesn't
+    list falls back to its usual model instead of leaving it out.
+    """
     out = []
-    for req in w.arm_models(role, tier, model):
+    reqs = w.arm_models(role, tier, model) or (w.arm_models(role, None, model) if strict else [])
+    for req in reqs:
         try:
             m, e, src = w.resolve_model(role, req, effort)
         except Exception:
-            if model:
-                raise  # an explicit model the worker rejects is the caller's mistake
+            if strict:
+                raise
             continue
         out.append({"worker": w.id, "model": m, "effort": e, "source": src,
                     "arm": "%s:%s" % (w.id, scores.learned_model(w.id, m, events))})
@@ -172,7 +177,8 @@ def plan(role, kind=None, tier=None, requested=None, model=None, effort=None, fa
             if not w.enabled and wid != explicit:
                 continue
             # a model given with no worker means the first one's model: names differ between CLIs
-            cands += arms_of(w, role, tier, model if (i == 0 or not explicit) else None, effort, events)[:1]
+            cands += arms_of(w, role, tier, model if (i == 0 or not explicit) else None, effort, events,
+                             strict=(i == 0 and bool(explicit)))[:1]
         how = ("requested" if requested else "session default") if explicit else "configured order"
         return cands, how
     for wid in cfg["order"]:
