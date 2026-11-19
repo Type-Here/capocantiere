@@ -19,7 +19,7 @@ sc = _fake.scenario(prompt, "agy")
 cwd = os.getcwd()
 _fake.log("agy", argv + ["ENV:AGY_ADC_AUTH=%s" % os.environ.get("AGY_ADC_AUTH", ""),
                          "ENV:GEMINI_API_KEY=%s" % ("set" if os.environ.get("GEMINI_API_KEY") else "")], cwd, sc)
-code, out, err = _fake.act("agy", sc, cwd, "--dangerously-skip-permissions" in argv)
+code, out, err = _fake.act("agy", sc, cwd, "--dangerously-skip-permissions" in argv, prompt)
 print(json.dumps({"status": "SUCCESS" if code == 0 else "ERROR", "response": out, "error": err.strip() or None,
                   "num_turns": 3, "usage": {"total_tokens": 500}}))
 sys.stderr.write(err)

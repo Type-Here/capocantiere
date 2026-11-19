@@ -34,7 +34,7 @@
         },
         "include_uncommitted": {
           "type": "boolean",
-          "description": "Start from the current state including uncommitted changes (default true). Untracked files are not included."
+          "description": "Start from the current state including uncommitted changes and untracked files not ignored by .gitignore (default true). Untracked files over 5 MB are left out."
         },
         "worker": {
           "type": "string",
@@ -201,6 +201,34 @@
       },
       "required": [
         "job_id"
+      ]
+    }
+  },
+  {
+    "name": "blame",
+    "description": "Which worker and model wrote a file's lines: matches each line by content against the jobs applied in this repo, so it survives commits, rebases and moved lines; a line edited after the apply counts as not from a worker. Returns compact line ranges with job id, worker/model, date and task title. Use it when a bug lands in code a worker may have written, then reread that job's task.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "File path, relative to the repo root (or absolute)"
+        },
+        "start": {
+          "type": "integer",
+          "description": "First line (1-based, default 1)"
+        },
+        "end": {
+          "type": "integer",
+          "description": "Last line, inclusive (default: end of file)"
+        },
+        "repo_dir": {
+          "type": "string",
+          "description": "Repo path (default: the project directory)"
+        }
+      },
+      "required": [
+        "path"
       ]
     }
   },

@@ -177,7 +177,10 @@ class E2E(unittest.TestCase):
 
     def test_tools_list(self):
         names = [t["name"] for t in self.server.request("tools/list", {})["tools"]]
-        self.assertEqual(names, ["delegate", "analyze", "jobs", "apply", "discard", "workers", "mode", "models"])
+        expected = ["delegate", "analyze", "jobs", "apply", "discard", "blame", "workers", "mode", "models"]
+        if RUNTIME == "node":
+            expected.remove("blame")  # the Node server is frozen: Python-only tools are not listed
+        self.assertEqual(names, expected)
 
     def test_workers_report(self):
         text = self.server.ok("workers")
@@ -406,6 +409,186 @@ class E2E(unittest.TestCase):
         time.sleep(1)
         self.assertIn("discarded", self.server.ok("discard", {"job_id": jid}))
         self.assertEqual(self.branches(), "")
+
+    # ------------------------------------------------------------ attribution (blame)
+
+    APP = "function add(a, b) {\n  return a + b;\n}\n\nfunction mul(a, b) {\n  return a * b;\n}\n"
+
+    @staticmethod
+    def write_task(files):
+        """A task for the FAKE:write scenario: the worker writes these whole files."""
+        return "FAKE:write\n" + "".join("FILE:%s\n<<<\n%s>>>\n" % (p, c) for p, c in files.items())
+
+    def write_file(self, rel, text):
+        with open(os.path.join(self.repo, rel), "w") as f:
+            f.write(text)
+
+    def records(self):
+        path = os.path.join(self.repo, ".git", "capocantiere", "attribution.jsonl")
+        if not os.path.exists(path):
+            return []
+        with open(path) as f:
+            return [json.loads(l) for l in f if l.strip()]
+
+    def apply_job(self, files, worker="copilot", title="write code"):
+        jid, text = self.delegate(self.write_task(files), worker=worker, fallback=False, title=title)
+        self.assertIn("status: done", text)
+        self.server.ok("apply", {"job_id": jid})
+        return jid
+
+    def blame(self, path, **kw):
+        if RUNTIME == "node":
+            self.skipTest("blame is Python-only")
+        return self.server.ok("blame", dict(path=path, **kw))
+
+    def test_effective_model(self):
+        jid, text = self.delegate("add a file", worker="copilot", fallback=False)
+        self.assertIn("ran as fake-model", text)  # Copilot's usage file: modelMetrics
+        jid, text = self.delegate("add a file", worker="vibe", fallback=False)
+        self.assertIn("ran as devstral-fake-2512", text)  # vibe's export.json: config.active_model -> models
+
+    def test_apply_records_an_agent_trace(self):
+        if RUNTIME == "node":
+            self.skipTest("attribution is Python-only")
+        jid = self.apply_job({"src/app.js": self.APP})
+        recs = self.records()
+        self.assertEqual(len(recs), 1)
+        r = recs[0]
+        self.assertEqual(r["version"], "0.1.0")
+        self.assertEqual(r["tool"]["name"], "capocantiere")
+        self.assertEqual(set(r), {"version", "id", "timestamp", "tool", "files", "metadata"})
+        f = r["files"][0]
+        self.assertEqual(f["path"], "src/app.js")
+        conv = f["conversations"][0]
+        self.assertEqual(conv["contributor"], {"type": "ai", "model_id": "copilot/fake-model"})
+        # one run of added lines, trimmed of the trailing "}": lines 1-6
+        self.assertEqual([(x["start_line"], x["end_line"]) for x in conv["ranges"]], [(1, 6)])
+        self.assertTrue(conv["ranges"][0]["content_hash"].startswith("sha1:"))
+        meta = r["metadata"]["dev.capocantiere"]
+        self.assertEqual((meta["job"], meta["worker"], meta["model"], meta["title"]), (jid, "copilot", "fake-model", "write code"))
+        self.assertEqual(len(meta["fingerprints"]["src/app.js"]), 4)  # "}" and the blank line are trivial
+        self.assertEqual(len(meta["patch_sha256"]), 64)
+        # the record lives in the repo's .git, never in the working tree
+        st = subprocess.run(["git", "status", "--porcelain"], cwd=self.repo, capture_output=True, text=True).stdout
+        self.assertNotIn("capocantiere", st)
+
+    def test_discard_records_nothing(self):
+        jid, _ = self.delegate(self.write_task({"src/app.js": self.APP}), worker="copilot", fallback=False)
+        self.server.ok("discard", {"job_id": jid})
+        self.assertEqual(self.records(), [])
+
+    def test_blame_after_apply(self):
+        jid = self.apply_job({"src/app.js": self.APP})
+        text = self.blame("src/app.js")
+        self.assertIn("src/app.js:1-7  7/7 lines from workers", text)
+        self.assertIn('  1-7  %s copilot/fake-model ' % jid, text)
+        self.assertIn('"write code"', text)
+        self.assertEqual(len(text.split("\n")), 2)
+        text = self.blame("main.txt")
+        self.assertIn("0/1 lines from workers (no applied job ever touched this file)", text)
+        self.assertIn("  1-1  not from a worker", text)
+
+    def commit(self, msg="work"):
+        git = lambda *a: subprocess.run(["git", *a], cwd=self.repo, check=True, capture_output=True)
+        git("add", ".")
+        git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", msg)
+
+    def test_blame_after_commit_moves_and_edits(self):
+        jid = self.apply_job({"src/app.js": self.APP})
+        self.commit()
+        # by hand: a header, the functions swapped, one line edited, a new function
+        self.write_file("src/app.js", "// header written by hand\n"
+                                      "function mul(a, b) {\n  return a * b;\n}\n\n"
+                                      "function add(a, b) {\n  return a + b + 0;\n}\n"
+                                      "function sub(a, b) { return a - b; }\n")
+        text = self.blame("src/app.js")
+        self.assertIn("src/app.js:1-9  5/9 lines from workers", text)
+        lines = text.split("\n")[1:]
+        self.assertEqual(lines[0], "  1-1  not from a worker")
+        self.assertTrue(lines[1].startswith("  2-6  %s copilot/fake-model" % jid), lines[1])
+        self.assertEqual(lines[2], "  7-9  not from a worker")
+        # a sub-range
+        self.assertEqual(self.blame("src/app.js", start=7, end=8).split("\n")[1:], ["  7-8  not from a worker"])
+
+    def test_blame_two_jobs_on_one_file(self):
+        first = self.apply_job({"src/app.js": self.APP}, worker="copilot", title="add and mul")
+        # no commit in between: the file the first job created is untracked, and the second job still sees it
+        more = self.APP + "\nfunction sub(a, b) {\n  return a - b;\n}\n"
+        second = self.apply_job({"src/app.js": more}, worker="vibe", title="sub")
+        text = self.blame(os.path.join(self.repo, "src", "app.js"))  # an absolute path works too
+        lines = text.split("\n")[1:]
+        self.assertTrue(lines[0].startswith("  1-8  %s copilot/fake-model" % first), text)
+        self.assertTrue(lines[1].startswith("  9-11  %s vibe/devstral-fake-2512" % second), text)
+        self.assertEqual(len(self.records()), 2)
+        meta = self.records()[1]["metadata"]["dev.capocantiere"]
+        self.assertEqual(len(meta["fingerprints"]["src/app.js"]), 2)  # only what the second job added
+
+    def test_base_includes_untracked_files(self):
+        self.write_file(".gitignore", "secret.txt\n")
+        self.write_file("notes.txt", "untracked notes\n")
+        self.write_file("secret.txt", "ignored\n")
+        with open(os.path.join(self.repo, "big.bin"), "wb") as f:
+            f.write(b"x" * (6 * 2**20))
+        self.write_file("main.txt", "hello, edited\n")
+        before = subprocess.run(["git", "status", "--porcelain"], cwd=self.repo, capture_output=True, text=True).stdout
+        jid, text = self.delegate("add a file FAKE:probe PROBE:notes.txt PROBE:.gitignore PROBE:secret.txt PROBE:big.bin",
+                                  worker="copilot", fallback=False)
+        self.assertIn('PROBE {"notes.txt": true, ".gitignore": true, "secret.txt": false, "big.bin": false}', text)
+        self.assertIn("Untracked files over 5 MB left out of the job's base: big.bin.", text)
+        self.assertIn("base: HEAD + uncommitted changes", text)
+        # only the worker's own change is in the diff, not the files of the base
+        self.assertIn("fake-copilot.txt | 1 +", text)
+        self.assertNotIn("notes.txt |", text)
+        # the user's index, files and stashes are untouched
+        after = subprocess.run(["git", "status", "--porcelain"], cwd=self.repo, capture_output=True, text=True).stdout
+        self.assertEqual(before, after)
+        stash = subprocess.run(["git", "stash", "list"], cwd=self.repo, capture_output=True, text=True).stdout
+        self.assertEqual(stash, "")
+        self.assertIn("Applied (clean)", self.server.ok("apply", {"job_id": jid}))
+
+    def test_clean_repo_starts_from_head(self):
+        jid, text = self.delegate("add a file", worker="copilot", fallback=False)
+        self.assertIn("base: HEAD (", text)
+
+    def test_ranges_follow_edits_made_before_apply(self):
+        if RUNTIME == "node":
+            self.skipTest("attribution is Python-only")
+        body = ["const v%d = %d;" % (i, i) for i in range(1, 9)]
+        self.write_file("lib.js", "\n".join(body) + "\n")
+        self.commit()
+        edited = body[:4] + ["const sum = v4 + v5;"] + body[4:]
+        jid, _ = self.delegate(self.write_task({"lib.js": "\n".join(edited) + "\n"}), worker="copilot", fallback=False)
+        # meanwhile the user adds two lines on top: the patch applies with an offset
+        self.write_file("lib.js", "// top one\n// top two\n" + "\n".join(body) + "\n")
+        self.assertIn("Applied (clean)", self.server.ok("apply", {"job_id": jid}))
+        conv = self.records()[0]["files"][0]["conversations"][0]
+        self.assertEqual([(x["start_line"], x["end_line"]) for x in conv["ranges"]], [(7, 7)])
+
+    def test_survival(self):
+        if RUNTIME == "node":
+            self.skipTest("attribution is Python-only")
+        jid = self.apply_job({"src/app.js": self.APP})
+        sys.path.insert(0, os.path.dirname(RUN_SH))
+        try:
+            import attribution
+        finally:
+            sys.path.pop(0)
+        self.assertEqual(attribution.survival(self.repo, jid), (4, 4))
+        self.write_file("src/app.js", self.APP.replace("a * b", "b * a"))
+        self.assertEqual(attribution.survival(self.repo, jid), (3, 4))
+        self.assertIsNone(attribution.survival(self.repo, "j-none"))
+
+    def test_trivial_lines(self):
+        sys.path.insert(0, os.path.dirname(RUN_SH))
+        try:
+            import attribution
+        finally:
+            sys.path.pop(0)
+        for line in ("", "   ", "}", "});", "  ]", "x=1", "fi", "*/"):
+            self.assertTrue(attribution.trivial(line), line)
+        for line in ("end", "return x;", "pass", "  n += 10"):
+            self.assertFalse(attribution.trivial(line), line)
+        self.assertEqual(attribution.fingerprint("  return x;\t"), attribution.fingerprint("return x;"))
 
     # ------------------------------------------------------------ agy authentication
 

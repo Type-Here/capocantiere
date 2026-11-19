@@ -167,7 +167,11 @@ function run(cmd, args, { cwd, input, timeoutMs, onSpawn, binary = false, extraE
 const notFound = (r) => r.error?.code === "ENOENT";
 
 async function git(cwd, ...args) {
-  const r = await run("git", args, { cwd });
+  return gitEnv(cwd, undefined, ...args);
+}
+
+async function gitEnv(cwd, extraEnv, ...args) {
+  const r = await run("git", args, { cwd, extraEnv });
   if (r.code !== 0) throw new Error(`git ${args.join(" ")} failed: ${r.stderr.trim() || r.stdout.trim()}`);
   return r.stdout;
 }
@@ -1334,6 +1338,43 @@ function pump() {
   }
 }
 
+const BIG_UNTRACKED = 5 * 2 ** 20; // untracked files bigger than this stay out of a job's base
+
+// A commit of the working tree as it is now, for a job's base: changes to tracked files plus the
+// untracked files .gitignore doesn't exclude (so a file created by an earlier apply is there).
+// Built in a throwaway copy of the index: the user's index, files and stashes are never touched.
+// Resolves to { commit (null when nothing differs from HEAD), tooBig (untracked files left out for their size) }.
+async function snapshotCommit(repo, id) {
+  const head = (await git(repo, "rev-parse", "HEAD")).trim();
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "capocantiere-index-"));
+  const env = { GIT_INDEX_FILE: path.join(tmp, "index") };
+  try {
+    try {
+      // a copy keeps the stat cache (add -A doesn't rehash every file) and files added with add -f
+      const real = (await git(repo, "rev-parse", "--path-format=absolute", "--git-path", "index")).trim();
+      fs.copyFileSync(real, env.GIT_INDEX_FILE);
+    } catch {
+      await gitEnv(repo, env, "read-tree", "HEAD");
+    }
+    const others = (await git(repo, "ls-files", "-z", "--others", "--exclude-standard")).split("\0");
+    const tooBig = [];
+    for (const p of others) {
+      try {
+        if (p && fs.lstatSync(path.join(repo, p)).size > BIG_UNTRACKED) tooBig.push(p);
+      } catch {}
+    }
+    await gitEnv(repo, env, "add", "-A", "--", ".", ...JUNK_PATHSPECS, ...tooBig.map((p) => ":(exclude,literal)" + p));
+    const tree = (await gitEnv(repo, env, "write-tree")).trim();
+    if (tree === (await git(repo, "rev-parse", "HEAD^{tree}")).trim()) return { commit: null, tooBig };
+    const commit = (await git(repo, "-c", "user.name=capocantiere", "-c", "user.email=capocantiere@localhost",
+      "-c", "commit.gpgsign=false", // commit-tree honors it: never sign with the user's key
+      "commit-tree", tree, "-p", head, "-m", `capocantiere base ${id}`)).trim();
+    return { commit, tooBig };
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
 async function createJob(args) {
   const repo = await repoRoot(args.repo_dir);
   ensureEnabled(repo);
@@ -1347,9 +1388,12 @@ async function createJob(args) {
     let b = (await git(repo, "rev-parse", "HEAD")).trim();
     let label = "HEAD";
     if (args.include_uncommitted !== false) {
-      // `git stash create` makes a commit of the uncommitted changes WITHOUT touching the working tree
-      const s = (await git(repo, "stash", "create", `capocantiere base ${id}`)).trim();
-      if (s) { b = s; label = "HEAD + uncommitted changes"; }
+      const { commit, tooBig } = await snapshotCommit(repo, id);
+      if (commit) { b = commit; label = "HEAD + uncommitted changes"; }
+      if (tooBig.length) {
+        notes.push(`Untracked files over ${BIG_UNTRACKED / 2 ** 20} MB left out of the job's base: ` +
+          tooBig.slice(0, 5).join(", ") + (tooBig.length > 5 ? " ..." : "") + ".");
+      }
     }
     await git(repo, "worktree", "add", "-q", "-b", branch, worktree, b);
     return { base: b, baseLabel: label };
@@ -1642,8 +1686,11 @@ async function setSessionDefault(value) {
 
 // ---------------------------------------------------------------- tools
 
-// Tool definitions are shared with server.py.
-const TOOLS = JSON.parse(fs.readFileSync(new URL("./tools.json", import.meta.url), "utf8"));
+// Tool definitions are shared with server.py. The Node server is frozen: tools added after it was frozen
+// exist only in the Python server, so they are not listed here.
+const PYTHON_ONLY_TOOLS = new Set(["blame"]);
+const TOOLS = JSON.parse(fs.readFileSync(new URL("./tools.json", import.meta.url), "utf8"))
+  .filter((t) => !PYTHON_ONLY_TOOLS.has(t.name));
 
 function getJob(a) {
   const j = jobs.get(a.job_id);

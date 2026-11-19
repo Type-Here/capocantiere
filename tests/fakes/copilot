@@ -32,7 +32,7 @@ _fake.log("copilot", argv, cwd, sc)
 
 denied = values("--deny-tool")
 may_write = ("--allow-all-tools" in argv or "--allow-all" in argv or "--yolo" in argv) and "write" not in denied
-code, out, err = _fake.act("copilot", sc, cwd, may_write)
+code, out, err = _fake.act("copilot", sc, cwd, may_write, prompt)
 if sc == "probe":
     out += "\nPROBE " + json.dumps(_fake.probe(prompt))
 

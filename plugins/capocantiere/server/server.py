@@ -26,6 +26,7 @@ import time
 import common
 from common import (JOBS_DIR, PATCH_DIR, SETTINGS_FILE, USAGE_FILE, CONFIG_FILE, HERE, SIGKILL, iso_now, kill_tree,
                     new_id, not_found, now_ms, read_json, run, tail, truncate, write_json)
+import attribution
 import isolation
 import workers as W
 
@@ -36,8 +37,8 @@ TERMINAL = {"done", "no_changes", "failed", "applied", "discarded", "interrupted
 SESSION = {"default": None}
 
 
-def git(cwd, *args):
-    r = run("git", args, cwd=cwd)
+def git(cwd, *args, env=None):
+    r = run("git", args, cwd=cwd, extra_env=env)
     if r["code"] != 0:
         raise RuntimeError("git %s failed: %s" % (" ".join(args), r["stderr"].strip() or r["stdout"].strip()))
     return r["stdout"]
@@ -234,6 +235,7 @@ def run_worker(w, role, prompt, cwd, model, effort, timeout_min, auto_approve, j
         "response": p.get("response") or "",
         "error": err_text,
         "conversationId": p.get("conversation_id"),
+        "effectiveModel": p.get("model") or None,  # the model the CLI says it used, when it says
         "turns": p.get("turns") or 0,
         "usage": p.get("usage"),
         "cost": p.get("cost"),
@@ -435,6 +437,47 @@ def _execute_wrapper(job):
         pump()
 
 
+BIG_UNTRACKED = 5 * 2**20  # untracked files bigger than this stay out of a job's base
+
+
+def snapshot_commit(repo, jid):
+    """A commit of the working tree as it is now, for a job's base: changes to tracked files plus the
+    untracked files .gitignore doesn't exclude (so a file created by an earlier apply is there).
+
+    Built in a throwaway copy of the index: the user's index, files and stashes are never touched.
+    Returns (commit, or None when nothing differs from HEAD; untracked files left out for their size).
+    """
+    import tempfile
+    head = git(repo, "rev-parse", "HEAD").strip()
+    tmp = tempfile.mkdtemp(prefix="capocantiere-index-")
+    env = {"GIT_INDEX_FILE": os.path.join(tmp, "index")}
+    try:
+        try:
+            # a copy keeps the stat cache (add -A doesn't rehash every file) and files added with add -f
+            shutil.copyfile(git(repo, "rev-parse", "--path-format=absolute", "--git-path", "index").strip(),
+                            env["GIT_INDEX_FILE"])
+        except (OSError, RuntimeError):
+            git(repo, "read-tree", "HEAD", env=env)
+        others = git(repo, "ls-files", "-z", "--others", "--exclude-standard").split("\0")
+        too_big = []
+        for p in others:
+            try:
+                if p and os.lstat(os.path.join(repo, p)).st_size > BIG_UNTRACKED:
+                    too_big.append(p)
+            except OSError:
+                pass
+        git(repo, "add", "-A", "--", ".", *JUNK_PATHSPECS, *(":(exclude,literal)" + p for p in too_big), env=env)
+        tree = git(repo, "write-tree", env=env).strip()
+        if tree == git(repo, "rev-parse", "HEAD^{tree}").strip():
+            return None, too_big
+        commit = git(repo, "-c", "user.name=capocantiere", "-c", "user.email=capocantiere@localhost",
+                     "-c", "commit.gpgsign=false",  # commit-tree honors it: never sign with the user's key
+                     "commit-tree", tree, "-p", head, "-m", "capocantiere base " + jid).strip()
+        return commit, too_big
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def create_job(args):
     repo = repo_root(args.get("repo_dir"))
     ensure_enabled(repo)
@@ -448,10 +491,12 @@ def create_job(args):
         base = git(repo, "rev-parse", "HEAD").strip()
         base_label = "HEAD"
         if args.get("include_uncommitted") is not False:
-            # `git stash create` makes a commit of the uncommitted changes WITHOUT touching the working tree
-            s = git(repo, "stash", "create", "capocantiere base " + jid).strip()
+            s, too_big = snapshot_commit(repo, jid)
             if s:
                 base, base_label = s, "HEAD + uncommitted changes"
+            if too_big:
+                notes = notes + ["Untracked files over %d MB left out of the job's base: %s." % (
+                    BIG_UNTRACKED // 2**20, ", ".join(too_big[:5]) + (" ..." if len(too_big) > 5 else ""))]
         git(repo, "worktree", "add", "-q", "-b", branch, worktree, base)
 
     job = {
@@ -529,6 +574,7 @@ def execute_job(job):
         "workerStatus": res["status"],
         "response": res["response"],
         "conversationId": res["conversationId"],
+        "effectiveModel": res["effectiveModel"],
         "turns": res["turns"],
         "usage": res["usage"],
         "cost": res["cost"],
@@ -623,9 +669,11 @@ def job_detail(j, include_diff=True, max_diff_chars=15000):
         "worker: %s" % j.get("worker"),
         "branch: %s   worktree: %s" % (j["branch"], j["worktree"]),
         "base: %s (%s)" % (j.get("baseLabel"), (j.get("base") or "")[:10]),
-        "model: %s%s%s" % (j.get("model") or "CLI default",
-                           " (%s)" % j["modelSource"] if j.get("modelSource") not in (None, "", "CLI default") else "",
-                           ", effort " + j["effort"] if j.get("effort") else ""),
+        "model: %s%s%s%s" % (j.get("model") or "CLI default",
+                             " (%s)" % j["modelSource"] if j.get("modelSource") not in (None, "", "CLI default") else "",
+                             ", effort " + j["effort"] if j.get("effort") else "",
+                             ", ran as " + j["effectiveModel"]
+                             if j.get("effectiveModel") and j["effectiveModel"] != j.get("model") else ""),
     ]
     if j.get("durationSeconds") is not None:
         turns = j.get("turns")
@@ -977,11 +1025,16 @@ def call_tool(name, a):
         j["status"] = "applied"
         j["appliedAt"] = iso_now()
         save_job(j)
+        try:
+            attribution.record_apply(j["repo"], j, a.get("quality"), VERSION)
+            note = ""
+        except Exception as e:  # attribution is a record, never a reason to fail an apply
+            note = "(attribution not recorded: %s)\n" % e
         if not a.get("keep_worktree"):
             remove_worktree(j)
         warn = r["stderr"].strip()
-        return "Applied (%s) to the working tree of %s. Changes are NOT committed.\n%s%s\nNow: run tests/typecheck and polish if needed." % (
-            how, j["repo"], warn + "\n" if warn else "", j.get("diffStat") or "")
+        return "Applied (%s) to the working tree of %s. Changes are NOT committed.\n%s%s%s\nNow: run tests/typecheck and polish if needed." % (
+            how, j["repo"], warn + "\n" if warn else "", note, j.get("diffStat") or "")
 
     if name == "discard":
         j = _get_job(a)
@@ -1002,6 +1055,11 @@ def call_tool(name, a):
             time.sleep(1.5)
         remove_worktree(j)
         return "Job %s discarded." % j["id"]
+
+    if name == "blame":
+        if not (a.get("path") or "").strip():
+            raise RuntimeError("path is required")
+        return attribution.blame(repo_root(a.get("repo_dir")), a["path"].strip(), a.get("start"), a.get("end"))
 
     if name == "workers":
         if a.get("doctor"):
