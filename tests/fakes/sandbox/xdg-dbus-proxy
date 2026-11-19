@@ -1,0 +1,18 @@
+#!/usr/bin/env python3
+"""Fake xdg-dbus-proxy for the tests: logs its arguments, creates the socket path as a plain file, signals
+readiness on --fd and exits when the other end of that pipe is closed, like the real one."""
+
+import os
+import select
+import sys
+
+import _log
+
+argv = sys.argv[1:]
+_log.log("xdg-dbus-proxy", argv)
+fd = int(next(a for a in argv if a.startswith("--fd=")).split("=", 1)[1])
+open(argv[1], "w").close()
+os.write(fd, b"x")
+p = select.poll()
+p.register(fd, select.POLLERR | select.POLLHUP)
+p.poll(60_000)

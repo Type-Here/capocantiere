@@ -12,6 +12,7 @@ import threading
 import time
 from datetime import datetime
 
+import isolation
 from common import (CONFIG_FILE, HERE, SETTINGS_FILE, STATE_DIR, boolean, env, iso_now, not_found, now_ms, num,
                     read_json, run, write_json)
 
@@ -21,6 +22,9 @@ GLOBAL_DEFAULTS = {
     "order": ["copilot", "vibe", "agy"],  # preference order when no worker is requested
     "fallback": True,  # on quota/rate-limit errors or exhausted budget, move on to the next worker
     "max_parallel": 4,  # jobs running at once, across all workers
+    "isolation": "none",  # none | auto | bwrap (Linux) | seatbelt (macOS, experimental); see isolation.py
+    # D-Bus names that reach the system keyring, let into the sandbox with "host" credentials (Linux)
+    "keyring_dbus_names": list(isolation.DEFAULT_KEYRING_NAMES),
 }
 
 # Settings every worker has. Adapters add their own on top.
@@ -37,7 +41,18 @@ COMMON_DEFAULTS = {
     "extra_args": [],
     "env": {},  # extra environment variables for the CLI (e.g. an API key variable)
     "strengths": [],
+    "isolation": "",  # empty = the global setting
+    # How the CLI authenticates: "host" = its own login (e.g. `copilot login`, the keyring), "token" = a minimal
+    # credential the server injects into this worker only, read from <state>/credentials/<worker> (mode 600) or
+    # from CAPOCANTIERE_<WORKER>_TOKEN. "private-home" is reserved for a later version.
+    "credentials": "host",
+    "isolation_rw": [],  # extra paths the worker may write when isolated
+    "isolation_ro": [],  # extra paths the worker may read when isolated
+    "isolation_env": [],  # extra environment variables kept when isolated (names, or prefixes ending in "_")
 }
+
+CREDENTIALS = ("host", "token", "private-home")
+CREDENTIALS_DIR = os.path.join(STATE_DIR, "credentials")
 
 # Old environment variables of the gemini-delegate server, mapped to agy settings.
 LEGACY_AGY_ENV = {
@@ -130,6 +145,7 @@ def load_config():
                 v = env.get("CAPOCANTIERE_%s_%s" % (wid.upper(), key.upper()))
                 if v:
                     s[key] = coerce(v, like)
+            s["isolation"] = s.get("isolation") or cfg["isolation"]  # effective value
             workers[wid] = s
         cfg["order"] = [w for w in cfg["order"] if w in ADAPTERS] + [w for w in ADAPTERS if w not in cfg["order"]]
         cfg["workers"] = workers
@@ -171,6 +187,11 @@ class Worker:
     WARNING = ""  # shown in `workers` and at session start when the worker is enabled
     OWN_TIMEOUT = False  # True if the CLI enforces the timeout itself (then the server adds a grace minute)
     INSTALL_HINT = ""
+    TOKEN_ENV = ""  # the variable a "token" credential is injected as
+    TOKEN_HINT = ""  # how to get a minimal token
+    CONFIG_DIRS = []  # (environment variable that overrides it, default): the CLI's own config/auth folders
+    PASS_ENV = []  # variables the CLI reads, kept when isolated ("host" credentials only for HOST_ENV)
+    HOST_ENV = []  # variables that carry the user's own login (kept with "host" credentials only)
     _version_cache = {}  # bin -> (checked_at, installed, text)
 
     def __init__(self, settings):
@@ -189,7 +210,7 @@ class Worker:
         hit = Worker._version_cache.get(self.bin)
         if hit and time.time() - hit[0] < 60:
             return hit[1], hit[2]
-        r = run(self.bin, ["--version"], timeout_ms=15_000, extra_env=self.env())
+        r = run(self.bin, ["--version"], timeout_ms=15_000, extra_env=self.run_env())
         if not_found(r):
             installed, text = False, "not found"
         else:
@@ -198,8 +219,89 @@ class Worker:
         Worker._version_cache[self.bin] = (time.time(), installed, text)
         return installed, text
 
+    # -- credentials
+
+    @property
+    def credentials(self):
+        return self.s.get("credentials") or "host"
+
+    def token_file(self):
+        return os.path.join(CREDENTIALS_DIR, self.id)
+
+    def token_var(self):
+        return "CAPOCANTIERE_%s_TOKEN" % self.id.upper()
+
+    def token(self):
+        """(token, where it was read) or (None, why not)."""
+        v = (env.get(self.token_var()) or "").strip()
+        if v:
+            return v, self.token_var()
+        path = self.token_file()
+        try:
+            st = os.stat(path)
+        except OSError:
+            return None, "no token: put it in %s (chmod 600) or in %s. %s" % (path, self.token_var(), self.TOKEN_HINT)
+        if os.name == "posix" and st.st_mode & 0o077:
+            return None, "%s is readable by other users: run chmod 600 on it" % path
+        try:
+            with open(path, encoding="utf-8") as f:
+                v = f.read().strip()
+        except OSError as e:
+            return None, "cannot read %s: %s" % (path, e)
+        return (v, path) if v else (None, "%s is empty" % path)
+
+    def credentials_problem(self):
+        c = self.credentials
+        if c not in CREDENTIALS:
+            return 'unknown credentials "%s" (use host or token)' % c
+        if c == "private-home":
+            return 'credentials "private-home" is not available yet (use host or token)'
+        if c == "token":
+            if not self.TOKEN_ENV:
+                return 'credentials "token" is not supported by %s' % self.id
+            t, why = self.token()
+            if not t:
+                return why
+        return None
+
+    def run_env(self):
+        """Variables added to the CLI's environment: the env setting, plus the token with "token" credentials."""
+        e = self.env()
+        if self.credentials == "token" and self.TOKEN_ENV:
+            t, _ = self.token()
+            if t:
+                e[self.TOKEN_ENV] = t
+        return e
+
+    def config_dirs(self):
+        return [env.get(var) or os.path.expanduser(default) if var else os.path.expanduser(default)
+                for var, default in self.CONFIG_DIRS]
+
+    def isolation_request(self, spec, inv):
+        """The worker's part of an isolation.prepare() request (see isolation.py)."""
+        import shutil
+        keep = list(self.PASS_ENV) + list(self.s.get("isolation_env") or [])
+        if self.credentials == "host":
+            keep += self.HOST_ENV
+        return {
+            "cmd": self.bin, "args": inv["argv"], "cwd": spec["cwd"], "writable": bool(spec.get("auto_approve")),
+            "env": self.run_env(), "pass_env": keep, "credentials": self.credentials,
+            "rw": self.config_dirs() + list(inv.get("cleanup") or []) + list(self.s.get("isolation_rw") or []),
+            "ro": list(self.s.get("isolation_ro") or []),
+            "keyring_names": load_config().get("keyring_dbus_names") or isolation.DEFAULT_KEYRING_NAMES,
+            "bin_path": shutil.which(self.bin),
+        }
+
     def auth_status(self):
         """(True/False/None, note). None = cannot be checked without a real call."""
+        if self.credentials != "host":
+            p = self.credentials_problem()
+            if p:
+                return False, p
+            return True, "%s token from %s" % (self.TOKEN_ENV, self.token()[1])
+        return self.host_auth_status()
+
+    def host_auth_status(self):
         return None, "not verifiable without a real call"
 
     def warnings(self):
@@ -208,7 +310,24 @@ class Worker:
 
     def blocker(self):
         """A reason why runs would certainly fail (the server then skips this worker), or None."""
-        return None
+        return self.credentials_problem() or isolation.problem(self.s.get("isolation") or "none", self.credentials)
+
+    def isolation_notes(self):
+        """The limits of the current isolation setup, one line for `workers`."""
+        setting = self.s.get("isolation") or "none"
+        try:
+            b = isolation.resolve(setting)
+        except ValueError:
+            return ""
+        if b is None:
+            return "none (the worker runs with all your permissions)"
+        parts = ["%s%s%s" % ("auto → " if setting == "auto" else "", b,
+                             " (EXPERIMENTAL, untested)" if b in isolation.EXPERIMENTAL else "")]
+        if self.credentials == "host":
+            parts.append("can read the secrets of your system keyring" if b == "bwrap"
+                         else "can read the Keychain items its own program is allowed to read")
+        parts.append("sees its own credential, has free network access")
+        return "; ".join(parts)
 
     def env(self):
         return {str(k): str(v) for k, v in (self.s.get("env") or {}).items()}
@@ -359,6 +478,17 @@ class AgyWorker(Worker):
                'with "login" on a consumer subscription.')
     INSTALL_HINT = "Install Antigravity CLI: https://antigravity.google/docs/cli"
     AUTH_MODES = ("api_key", "adc", "login")
+    TOKEN_ENV = "GEMINI_API_KEY"
+    TOKEN_HINT = "Use a Gemini API key from AI Studio (https://aistudio.google.com/apikey)."
+    CONFIG_DIRS = [("", "~/.gemini")]
+    PASS_ENV = ["AGY_", "GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_LOCATION"]
+    HOST_ENV = ["GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS"]
+
+    def config_dirs(self):
+        dirs = super().config_dirs()
+        if self.s.get("auth") == "adc":
+            dirs.append(os.path.expanduser("~/.config/gcloud"))  # the ADC file, refreshed by the client
+        return dirs
 
     def env(self):
         e = super().env()
@@ -367,14 +497,20 @@ class AgyWorker(Worker):
         return e
 
     def blocker(self):
+        base = super().blocker()
+        if base:
+            return base
         auth = self.s.get("auth")
         if auth not in self.AUTH_MODES:
             return 'unknown auth "%s" (use %s)' % (auth, ", ".join(self.AUTH_MODES))
-        if auth == "api_key" and not (env.get("GEMINI_API_KEY") or super().env().get("GEMINI_API_KEY")):
-            return 'auth is "api_key" but GEMINI_API_KEY is not set (export it, or put it under "env" in the config)'
+        if self.credentials == "token":
+            if auth != "api_key":
+                return 'credentials "token" needs "auth": "api_key"'
+        elif auth == "api_key" and not (env.get("GEMINI_API_KEY") or super().env().get("GEMINI_API_KEY")):
+            return 'auth is "api_key" but GEMINI_API_KEY is not set (export it, put it under "env" in the config, or use "token" credentials)'
         return None
 
-    def auth_status(self):
+    def host_auth_status(self):
         auth = self.s.get("auth")
         problem = self.blocker()
         if problem:
@@ -397,7 +533,7 @@ class AgyWorker(Worker):
         with MODELS_LOCK:
             cache = read_json(MODELS_FILE, {})
             if refresh or not cache.get("models") or now_ms() - (cache.get("fetchedAt") or 0) > MODELS_TTL_MS:
-                r = run(self.bin, ["models"], timeout_ms=30_000, extra_env=self.env())
+                r = run(self.bin, ["models"], timeout_ms=30_000, extra_env=self.run_env())
                 models = parse_models(r["stdout"]) if r["code"] == 0 else []
                 if models:
                     # an explicit refresh also forgets models marked unavailable
@@ -525,7 +661,7 @@ class AgyWorker(Worker):
             a.append("--dangerously-skip-permissions")
         if self.s.get("sandbox"):
             a.append("--sandbox")
-        return {"argv": a + list(self.s.get("extra_args") or []), "env": self.env(), "input": None}
+        return {"argv": a + list(self.s.get("extra_args") or []), "env": self.run_env(), "input": None}
 
     @staticmethod
     def _envelope(stdout):
@@ -625,8 +761,14 @@ class CopilotWorker(Worker):
     QUOTA_RE = re.compile(r"(quota|rate.?limit|\b429\b|too many requests|100% used|premium requests?.{0,40}(limit|exhausted|exceeded)|"
                           r"exceeded.{0,40}(limit|credits|allowance)|out of (ai )?credits)", re.I)
     INSTALL_HINT = "Install GitHub Copilot CLI (https://docs.github.com/copilot/how-tos/copilot-cli) and run `copilot login`."
+    TOKEN_ENV = "COPILOT_GITHUB_TOKEN"
+    TOKEN_HINT = ('Create a fine-grained personal access token with only the "Copilot Requests" permission '
+                  "(https://github.com/settings/personal-access-tokens/new).")
+    CONFIG_DIRS = [("COPILOT_HOME", "~/.copilot"), ("", "~/.cache/copilot")]
+    PASS_ENV = ["COPILOT_HOME", "COPILOT_AUTO_UPDATE", "GH_HOST"]
+    HOST_ENV = ["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"]
 
-    def auth_status(self):
+    def host_auth_status(self):
         for var in ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
             if env.get(var) or self.env().get(var):
                 return True, "token in %s" % var
@@ -664,7 +806,7 @@ class CopilotWorker(Worker):
         else:
             # analysis in the main repo: nothing is approved (read-only commands run anyway) and edits are denied
             a += ["--deny-tool", "write"]
-        return {"argv": a + list(self.s.get("extra_args") or []), "env": self.env(), "input": None,
+        return {"argv": a + list(self.s.get("extra_args") or []), "env": self.run_env(), "input": None,
                 "cleanup": [usage_file], "usage_file": usage_file}
 
     def parse(self, r, spec):
@@ -729,12 +871,17 @@ class VibeWorker(Worker):
                           r"no credits?( left)?|credits?.{0,20}(exhausted|left)|capacity exceeded|requests? limit)", re.I)
     OWN_TIMEOUT = True  # --time-limit
     INSTALL_HINT = "Install Mistral Vibe (`uv tool install mistral-vibe`) and log in (run `vibe` once) or set MISTRAL_API_KEY."
+    TOKEN_ENV = "MISTRAL_API_KEY"
+    TOKEN_HINT = "Use a Mistral API key (https://console.mistral.ai/api-keys)."
+    CONFIG_DIRS = [("VIBE_HOME", "~/.vibe")]
+    PASS_ENV = ["VIBE_"]
+    HOST_ENV = ["MISTRAL_API_KEY"]
 
     @staticmethod
     def home():
         return env.get("VIBE_HOME") or os.path.join(os.path.expanduser("~"), ".vibe")
 
-    def auth_status(self):
+    def host_auth_status(self):
         if env.get("MISTRAL_API_KEY") or self.env().get("MISTRAL_API_KEY"):
             return True, "MISTRAL_API_KEY set"
         try:
@@ -796,7 +943,7 @@ class VibeWorker(Worker):
         else:
             for t in self.s.get("analyze_tools") or ["read_file"]:
                 a += ["--enabled-tools", t]
-        return {"argv": a + list(self.s.get("extra_args") or []), "env": self.env(), "input": None,
+        return {"argv": a + list(self.s.get("extra_args") or []), "env": self.run_env(), "input": None,
                 "cleanup": [tmp], "export_file": os.path.join(out_dir, "export.json")}
 
     @staticmethod

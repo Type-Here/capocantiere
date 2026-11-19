@@ -93,6 +93,7 @@ test_command: "npm test -- users"
 - Failures for other reasons (timeout, wrong `test_command`, ambiguous spec, per-run cost cap) don't trigger the fallback: read the error, fix the spec, and retry once, preferably on another worker.
 - **The same task failed twice → do it yourself.** Don't start a third attempt on any worker, whatever the reason for the failures.
 - If a worker isn't installed or authenticated, the `workers` tool tells you what's missing; tell the user once and use the others (or work normally).
+- A worker skipped for **isolation or credentials** (e.g. `bwrap needs xdg-dbus-proxy`, `no token`) is skipped on purpose: it must never run without the isolation the user asked for. Don't try to get around it (no `force`, no other settings). Tell the user once and point to `/capocantiere:doctor`. Never install system packages yourself.
 
 ## Technical notes
 

@@ -215,6 +215,7 @@ const GLOBAL_DEFAULTS = {
   order: ["copilot", "vibe", "agy"], // preference order when no worker is requested
   fallback: true, // on quota/rate-limit errors or exhausted budget, move on to the next worker
   max_parallel: 4, // jobs running at once, across all workers
+  isolation: "none", // Python server only (isolation.py): the Node server refuses any other value
 };
 
 // Settings every worker has. Adapters add their own on top.
@@ -319,6 +320,16 @@ function loadConfig() {
     }
     workers[wid] = s;
   }
+  // Isolation of worker processes is implemented in the Python server only (isolation.py). Refuse rather
+  // than run a worker without the isolation the user asked for.
+  for (const [where, v] of [["global", userGlobal.isolation], ...Object.entries(userWorkers).map(([w, s]) => [w, s?.isolation])]) {
+    if (v && v !== "none")
+      errors.push(`"isolation": "${v}" (${where}) is only supported by the Python server; the Node server will not run those workers.`);
+  }
+  for (const [w, s] of Object.entries(userWorkers)) {
+    if (s?.credentials && s.credentials !== "host")
+      errors.push(`"credentials": "${s.credentials}" (${w}) is only supported by the Python server; the Node server will not run that worker.`);
+  }
   const order = Array.isArray(cfg.order) ? cfg.order : GLOBAL_DEFAULTS.order;
   cfg.order = [...order.filter((w) => ADAPTERS[w]), ...Object.keys(ADAPTERS).filter((w) => !order.includes(w))];
   cfg.workers = workers;
@@ -390,7 +401,14 @@ class Worker {
   warnings() { return this.constructor.WARNING ? [this.constructor.WARNING] : []; }
 
   // A reason why runs would certainly fail (the server then skips this worker), or null.
-  blocker() { return null; }
+  blocker() {
+    const id = this.id.toUpperCase();
+    const iso = process.env[`CAPOCANTIERE_${id}_ISOLATION`] || this.s.isolation || loadConfig().isolation;
+    if (iso && iso !== "none") return `isolation "${iso}" is only supported by the Python server`;
+    const cred = process.env[`CAPOCANTIERE_${id}_CREDENTIALS`] || this.s.credentials;
+    if (cred && cred !== "host") return `credentials "${cred}" are only supported by the Python server`;
+    return null;
+  }
 
   env() {
     return Object.fromEntries(Object.entries(this.s.env || {}).map(([k, v]) => [String(k), String(v)]));
@@ -543,6 +561,8 @@ class AgyWorker extends Worker {
   }
 
   blocker() {
+    const base = super.blocker();
+    if (base) return base;
     const auth = this.s.auth;
     if (!AgyWorker.AUTH_MODES.includes(auth)) return `unknown auth "${auth}" (use ${AgyWorker.AUTH_MODES.join(", ")})`;
     if (auth === "api_key" && !(env.GEMINI_API_KEY || super.env().GEMINI_API_KEY))
@@ -1447,6 +1467,7 @@ async function collectChanges(job) {
   if (staged.code === 1) {
     const who = job.worker || "worker";
     await git(job.worktree, "-c", `user.name=${who} (capocantiere)`, "-c", "user.email=capocantiere@localhost",
+      "-c", "commit.gpgsign=false", // never sign a worker's code with the user's key
       "commit", "-q", "--no-verify", "-m", `${who}: ${job.title}`, "-m", `job ${job.id}`);
   }
   const stat = await git(job.repo, "diff", "--stat", job.base, job.branch);
@@ -1722,6 +1743,7 @@ async function callTool(name, a = {}) {
     }
 
     case "workers": {
+      if (a.doctor) return "doctor is only available on the Python server (isolation and credentials are Python-only).";
       const head = "use" in a ? (await setSessionDefault(a.use)) + "\n\n" : "";
       return head + (await workersReport());
     }

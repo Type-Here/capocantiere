@@ -26,6 +26,7 @@ import time
 import common
 from common import (JOBS_DIR, PATCH_DIR, SETTINGS_FILE, USAGE_FILE, CONFIG_FILE, HERE, SIGKILL, iso_now, kill_tree,
                     new_id, not_found, now_ms, read_json, run, tail, truncate, write_json)
+import isolation
 import workers as W
 
 VERSION = "2.0.0"
@@ -180,13 +181,24 @@ def run_worker(w, role, prompt, cwd, model, effort, timeout_min, auto_approve, j
     inv = w.invocation(spec)
     spec.update({k: v for k, v in inv.items() if k not in ("argv", "env", "input", "cleanup")})
     started = time.time()
+    prepared = None
     try:
-        r = run(w.bin, inv["argv"], cwd=cwd, input=inv.get("input"),
-                timeout_ms=int((timeout_min + (1 if w.OWN_TIMEOUT else 0)) * 60_000),
-                on_spawn=on_spawn, extra_env=inv.get("env"))
-        nf = not_found(r)
-        p = w.parse(r, spec) if not nf else {"ok": False, "status": "NOT_FOUND", "response": "", "error": ""}
+        try:
+            prepared = isolation.prepare(w.s.get("isolation") or "none", w.isolation_request(spec, inv))
+        except Exception as e:
+            # never run unisolated when isolation was asked for
+            r = {"code": -1, "stdout": "", "stderr": "", "error": None, "timed_out": False}
+            p = {"ok": False, "status": "ISOLATION_ERROR", "response": "", "error": "isolation failed, not run: %s" % e}
+            nf = False
+        else:
+            r = run(prepared.cmd, prepared.args, cwd=cwd, input=inv.get("input"),
+                    timeout_ms=int((timeout_min + (1 if w.OWN_TIMEOUT else 0)) * 60_000),
+                    on_spawn=on_spawn, extra_env=prepared.extra_env, full_env=prepared.env)
+            nf = not_found(r)
+            p = w.parse(r, spec) if not nf else {"ok": False, "status": "NOT_FOUND", "response": "", "error": ""}
     finally:
+        if prepared:
+            prepared.close()
         for f in inv.get("cleanup") or []:
             try:
                 shutil.rmtree(f) if os.path.isdir(f) else os.remove(f)
@@ -563,6 +575,7 @@ def collect_changes(job):
             job["worktree"],
             "-c", "user.name=%s (capocantiere)" % job.get("worker", "worker"),
             "-c", "user.email=capocantiere@localhost",
+            "-c", "commit.gpgsign=false",  # never sign a worker's code with the user's key
             "commit", "-q", "--no-verify", "-m", "%s: %s" % (job.get("worker", "worker"), job["title"]),
             "-m", "job " + job["id"],
         )
@@ -731,6 +744,10 @@ def workers_report():
             len(active_jobs(w.id, ("running",))), len(active_jobs(w.id, ("queued",))), w.s["max_parallel"]))
         lines.append("  models: " + (w.models_line() if installed and w.enabled else "%s (configured)" % (w.s.get("model") or "CLI default")))
         lines.append("  strengths: %s" % (", ".join(w.s.get("strengths") or []) or "—"))
+        lines.append("  credentials: %s; isolation: %s" % (w.credentials, w.isolation_notes() or w.s.get("isolation")))
+        problem = w.blocker() if installed else None
+        if problem:
+            lines.append("  ⛔ unusable: %s" % problem)
         for warning in w.warnings():
             lines.append("  ⚠️ " + warning)
     lines += ["", "Fallback on quota/budget: %s. Max parallel jobs overall: %s." % (
@@ -740,6 +757,123 @@ def workers_report():
     for e in cfg["errors"]:
         lines.append("CONFIG ERROR: " + e)
     lines.append("State: " + common.STATE_DIR)
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- doctor
+
+# Packages of the system tools isolation needs, per package manager.
+PACKAGES = {"bwrap": "bubblewrap", "xdg-dbus-proxy": "xdg-dbus-proxy"}
+INSTALL_CMD = {
+    "pacman": "sudo pacman -S --needed %s",
+    "apt": "sudo apt install %s",
+    "dnf": "sudo dnf install %s",
+    "zypper": "sudo zypper install %s",
+    "apk": "sudo apk add %s",
+}
+
+
+def os_release():
+    out = {}
+    try:
+        with open("/etc/os-release", encoding="utf-8") as f:
+            for line in f:
+                k, _, v = line.strip().partition("=")
+                if k:
+                    out[k] = v.strip('"')
+    except OSError:
+        pass
+    return out
+
+
+def package_manager(rel):
+    ids = [rel.get("ID", "")] + rel.get("ID_LIKE", "").split()
+    for pm, family in (("pacman", ("arch",)), ("apt", ("debian", "ubuntu")), ("dnf", ("fedora", "rhel", "centos")),
+                       ("zypper", ("suse", "opensuse")), ("apk", ("alpine",))):
+        if any(i and any(i.startswith(f) for f in family) for i in ids):
+            return pm
+    for pm in INSTALL_CMD:
+        if shutil.which(pm if pm != "apt" else "apt-get"):
+            return pm
+    return None
+
+
+def doctor_report():
+    """What isolation and credentials need on this system, and what is missing. Never installs anything."""
+    sysname = isolation.system()
+    lines = []
+    native = isolation.NATIVE.get(sysname)
+    if sysname == "linux":
+        rel = os_release()
+        pm = package_manager(rel)
+        lines.append("System: Linux, %s (package manager: %s)" % (rel.get("PRETTY_NAME") or "unknown distribution", pm or "unknown"))
+    elif sysname == "darwin":
+        pm = None
+        lines.append("System: macOS. Isolation backend: seatbelt (sandbox-exec), EXPERIMENTAL: not tested by the authors.")
+    else:
+        pm = None
+        lines.append("System: %s. No isolation backend exists here yet: run the workers inside WSL2 to use the Linux "
+                     "one (bwrap). Only \"isolation\": \"none\" works natively." % sysname)
+
+    if sysname == "linux":
+        tools = [("bwrap", "isolation (bubblewrap)"), ("xdg-dbus-proxy", 'the system keyring with "host" credentials')]
+        lacking = []
+        for tool, why in tools:
+            path = shutil.which(tool)
+            lines.append("  %s: %s — needed for %s" % (tool, path or "MISSING", why))
+            if not path:
+                lacking.append(tool)
+        if shutil.which("bwrap"):
+            p = isolation._bwrap_works(shutil.which("bwrap"))
+            lines.append("  bwrap sandbox test: %s" % ("ok" if not p else p))
+            if p:
+                for path, want, fix in (("/proc/sys/kernel/unprivileged_userns_clone", "1",
+                                         "sudo sysctl kernel.unprivileged_userns_clone=1"),
+                                        ("/proc/sys/kernel/apparmor_restrict_unprivileged_userns", "0",
+                                         "AppArmor restricts user namespaces (Ubuntu 23.10+): bwrap needs an AppArmor "
+                                         "profile that allows them, see your distribution's documentation")):
+                    try:
+                        with open(path) as f:
+                            v = f.read().strip()
+                    except OSError:
+                        continue
+                    if v != want:
+                        lines.append("    %s = %s: %s" % (os.path.basename(path), v, fix))
+        lines.append("  session D-Bus: %s" % ("available" if os.environ.get("DBUS_SESSION_BUS_ADDRESS")
+                                              else 'not set: "host" credentials cannot reach the keyring when isolated'))
+        if lacking:
+            pkgs = " ".join(PACKAGES[t] for t in lacking)
+            lines.append("  To install: %s" % (INSTALL_CMD[pm] % pkgs if pm else "the packages " + pkgs + " of your distribution"))
+    elif sysname == "darwin":
+        lines.append("  sandbox-exec: %s" % (isolation.seatbelt_bin() or "MISSING (it ships with macOS; Apple deprecated it)"))
+
+    cfg = W.load_config()
+    lines += ["", "Workers:"]
+    for w in W.all_workers():
+        installed, version = w.version()
+        setting = w.s.get("isolation") or "none"
+        lines.append("%s%s" % (w.id, "" if w.enabled else " (disabled)"))
+        lines.append("  installed: %s" % (version if installed else "NO. " + w.INSTALL_HINT))
+        auth, note = w.auth_status() if installed else (None, "")
+        lines.append("  credentials: %s — %s" % (w.credentials, {True: "ok", False: "PROBLEM", None: "not checkable"}[auth]
+                                                 + (": " + note if note else "")))
+        problem = isolation.problem(setting, w.credentials)
+        lines.append("  isolation: " + ("%s — %s" % (setting, problem) if problem else w.isolation_notes()))
+        tips = []
+        if not w.enabled:
+            pass
+        elif setting == "none" and native:
+            tips.append('isolation is off: set "isolation": "auto" for %s in %s' % (w.id, CONFIG_FILE))
+        try:
+            isolated = isolation.resolve(setting) is not None
+        except ValueError:
+            isolated = False
+        if w.enabled and isolated and w.credentials == "host" and w.TOKEN_ENV:
+            tips.append('with "host" credentials this worker can read your keyring. A minimal token avoids that: %s '
+                        'Save it in %s (chmod 600) and set "credentials": "token".' % (w.TOKEN_HINT, w.token_file()))
+        lines += ["  → " + t for t in tips]
+    lines += ["", "Global isolation setting: %s. Config: %s" % (cfg["isolation"], CONFIG_FILE),
+              "Nothing was installed or changed: commands with sudo are for you to run."]
     return "\n".join(lines)
 
 
@@ -870,6 +1004,8 @@ def call_tool(name, a):
         return "Job %s discarded." % j["id"]
 
     if name == "workers":
+        if a.get("doctor"):
+            return doctor_report()
         head = set_session_default(a["use"]) + "\n\n" if "use" in a else ""
         return head + workers_report()
 
