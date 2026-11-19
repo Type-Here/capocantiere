@@ -1,49 +1,47 @@
-# Capocantiere — Claude as manager, Gemini as worker
+# Capocantiere — Claude as manager, coding agents as workers
 
-A Claude Code plugin. Claude plans, specifies, reviews and decides; **Gemini**, through Antigravity CLI (`agy`) and your Google AI Pro subscription (the student plan works too), writes the code for mechanical tasks and analyzes large codebases.
+A Claude Code plugin. Claude plans, specifies, reviews and decides; **workers** — external coding-agent CLIs running on your own subscriptions or API keys — write the code for mechanical tasks and analyze large codebases.
+
+Supported workers:
+
+| Worker | CLI | Authentication | Default |
+|---|---|---|---|
+| `copilot` | [GitHub Copilot CLI](https://docs.github.com/copilot/how-tos/copilot-cli) | `copilot login` (e.g. a Student account) | enabled, first choice |
+| `vibe` | [Mistral Vibe](https://github.com/mistralai/mistral-vibe) | your Mistral account (the Free plan works) or `MISTRAL_API_KEY` | enabled, second choice |
+| `agy` | [Antigravity CLI](https://antigravity.google/docs/cli) | Gemini API key, or Google Cloud ADC | **disabled** — see [the warning](#agy-antigravity-cli) |
 
 ## What's inside
 
 | Component | Purpose |
 |---|---|
-| **MCP server `gemini-delegate`** (Python or Node, zero dependencies) | The tools `gemini_delegate`, `gemini_analyze`, `gemini_jobs`, `gemini_apply`, `gemini_discard`, `gemini_usage`, `gemini_models`, `gemini_mode` |
-| **Skill `gemini-delegation`** | Teaches Claude *when* to delegate, how to write a task for Gemini and how to review the result. Claude loads it on its own when needed |
-| **Agent `gemini-reviewer`** (Sonnet) | First-pass review of large diffs, to save the manager's context |
-| **SessionStart hook** | At the start of each session, tells Claude whether `agy` is available, how much budget is left and whether there are open jobs from previous sessions |
-| **Commands** | `/capocantiere:manager`, `/capocantiere:delegate`, `/capocantiere:analyze`, `/capocantiere:status`, `/capocantiere:review`, `/capocantiere:models`, `/capocantiere:mode` |
+| **MCP server `capocantiere`** (Python or Node, zero dependencies) | The tools `delegate`, `analyze`, `jobs`, `apply`, `discard`, `workers`, `mode`, `models` |
+| **Skill `worker-delegation`** | Teaches Claude *when* to delegate, which worker to pick, how to write a task, how to handle fallbacks and how to review the result. Claude loads it on its own when needed |
+| **Agent `worker-reviewer`** (Sonnet) | First-pass review of large diffs, to save the manager's context |
+| **SessionStart hook** | At the start of each session, tells Claude which workers are available, how much budget each has left and whether there are open jobs from previous sessions |
+| **Commands** | `/capocantiere:manager`, `/capocantiere:delegate`, `/capocantiere:analyze`, `/capocantiere:status`, `/capocantiere:review`, `/capocantiere:use`, `/capocantiere:models`, `/capocantiere:mode` |
 
 ### How a job works
 
-1. `gemini_delegate` creates an **isolated git worktree** on a `gemini/<id>` branch, starting from the current state of the repo (uncommitted changes included).
-2. It runs `agy -p … --output-format json` inside it, in the background. Several jobs can run in parallel (with a queue).
-3. When the work is done, it commits to the job's branch and saves the diff.
-4. Claude reviews it with `gemini_jobs`, then either applies it to your working tree (`gemini_apply`, no commit) or discards it (`gemini_discard`).
+1. `delegate` picks a worker: the one requested, else the session default (`/capocantiere:use`), else the first in the configured order that is enabled, installed, authenticated and within its daily budget.
+2. It creates an **isolated git worktree** on a `capocantiere/<id>` branch, starting from the current state of the repo (uncommitted changes included), and runs the worker's CLI inside it, in the background. Several jobs can run in parallel, on the same or different workers (with a queue and per-worker limits).
+3. If the worker hits a **quota / rate limit**, the job's edits are thrown away and it is relaunched on the next available worker (fallback). The job records every attempt.
+4. When the work is done, the server commits to the job's branch and saves the diff.
+5. Claude reviews it with `jobs`, then either applies it to your working tree (`apply`, no commit) or discards it (`discard`).
 
-**Gemini never touches your repo directly.** Inside the worktree, `agy` runs with `--dangerously-skip-permissions --sandbox` (the only way to let it work without a human approving each step), while `gemini_analyze` runs in the real repo **without** auto-approval and checks that the repo state doesn't change.
+**Workers never touch your repo directly.** Inside the worktree they auto-approve their own tool calls (the only way to work headless), with safety limits per worker (see below). `analyze` runs in the real repo **without** auto-approval, with edits disabled, and checks that the repo state doesn't change.
 
-The server also counts runs over the last 24h and blocks delegation beyond a budget (default 150). If Gemini responds with 429/quota errors, the skill tells Claude to stop delegating and do the work itself.
+Each worker has a daily budget (runs per 24h, counted per worker). A worker over budget is skipped; if every worker is out of quota or budget, Claude does the work itself.
 
 ## Requirements
 
 - Claude Code
 - git
 - **Python ≥ 3.8 or Node.js ≥ 18** (only one of them: see [Python or Node](#python-or-node))
-- Antigravity CLI (`agy`), logged in with your Google AI Pro account
+- At least one worker CLI, installed and authenticated
 
 ## Installation
 
-**1. Install Antigravity CLI and log in**
-
-Follow the official guide: https://antigravity.google/docs/cli. Then run `agy` once interactively to log in with your Google account. Check it works with:
-
-```bash
-agy -p "reply only: ok" --output-format json
-agy models     # list the available model slugs
-```
-
-**2. Install the plugin**
-
-Clone or unzip the repo wherever you like, then:
+**1. Install the plugin**
 
 ```bash
 claude plugin marketplace add /path/to/capocantiere
@@ -52,26 +50,72 @@ claude plugin install capocantiere@capocantiere-local
 
 (or, inside Claude Code: `/plugin marketplace add /path/to/capocantiere` followed by `/plugin install capocantiere@capocantiere-local`). Restart Claude Code.
 
-**3. Verify**
+**2. Set up the workers you want** (sections below), then check them with `/capocantiere:status` in a session inside a git repo. Nothing needs configuring if the defaults suit you.
 
-In a session inside a git repo: `/capocantiere:status`.
+### copilot (GitHub Copilot CLI)
+
+1. Install it with the official installer (see the Copilot CLI docs) and run `copilot login` once.
+2. Check: `copilot --version`, then `/capocantiere:status` should show `copilot … authenticated: yes`.
+
+How it is run: `copilot -p <prompt> -s --no-ask-user --usage-output-file <tmp>`.
+
+- In the worktree: `--allow-all-tools` — but **not** `--allow-all-paths`, so file access stays limited to the worktree — plus `--deny-tool` for every rule in `deny_tools` (by default `git push`, `git remote`, `git config`, `git worktree`, `git branch/checkout/switch/reset/rebase`, `gh`, `sudo`; deny rules win over allow).
+- `--disable-builtin-mcps`, so the built-in GitHub MCP server can't act on your GitHub account; `--secret-env-vars` hides the other workers' API keys from Copilot's shell commands.
+- For `analyze`: nothing is auto-approved (Copilot still runs read-only commands) and `--deny-tool write`.
+- No folder trust is needed: in `-p` mode an untrusted folder only skips that folder's MCP servers and hooks, which is what we want.
+- Usage (AI credits, premium requests, tokens) is read from the usage file and shown in `jobs` and `workers`. The budget counts runs; `max_ai_credits` can cap each run.
+- Optional: `"sandbox": true` runs shell commands in Copilot's OS sandbox (on Linux it needs `bwrap`, `slirp4netns` and more; see `copilot help sandbox`).
+
+### vibe (Mistral Vibe)
+
+1. Install it (`uv tool install mistral-vibe`, or the official installer).
+2. Sign in: run `vibe` once and log in with your Mistral account in the browser. The Free plan includes limited Vibe use, with no API key and no payment. Alternatively use an API key: `vibe --setup`, export `MISTRAL_API_KEY`, or put it in the worker's `env` in the config file.
+3. **Add `outside_workdir = "deny"` to `~/.vibe/config.toml`.** Vibe's default is `ask`, which auto-approve would approve, so a job could touch files outside its worktree. `workers` warns until this is set.
+4. Check: `/capocantiere:status` should show `vibe … authenticated: yes (Mistral account, plan FREE …)` (or `MISTRAL_API_KEY set`) and no warning. The account check reads the plan vibe caches in `~/.vibe/whoami_cache.json`; an expired login only shows up on the first run.
+
+How it is run: `vibe --prompt-file <tmp> --output json --output-dir <tmp> --workdir <worktree> --max-turns 40 --max-price 0.5 --time-limit <s>`.
+
+- In the worktree: `--auto-approve`. For `analyze`: only `--enabled-tools read_file --enabled-tools grep` (without auto-approve Vibe's default agent would still edit files).
+- `--max-price` (USD) and `--max-tokens` cap each run; reaching them fails the job but does **not** trigger the fallback. The cost vibe reports is computed from the prices in its config, so `--max-price` is only an extra guard: the real budget is `daily_budget` (runs per 24h).
+- `--time-limit` is passed too (the job's timeout), so vibe stops itself cleanly and still writes its report.
+- When the plan's credit is used up (HTTP 402, `usage_limit`) or vibe is rate-limited (HTTP 429), the job counts as a quota error and moves to the next worker. The reason is read from `export.json`, where vibe writes it even when stderr is empty.
+- The answer is the last assistant message of the JSON output; outcome, usage and cost come from `export.json`.
+- `--trust` is passed by default: it trusts the worktree for that run only, so vibe reads the repo's `AGENTS.md` and project config (an untrusted folder would still work, without them). Set `"trust": false` for repos whose Vibe config you don't want applied.
+
+### agy (Antigravity CLI)
+
+> ⚠️ **Disabled by default.** According to the official Antigravity FAQ, running `agy -p` inside third-party agents is **not supported on consumer plans and can get the account suspended**. Use this worker only with a Gemini API key or Google Cloud credentials, never with the login of a consumer subscription (Google AI Pro, student plan, …).
+
+To enable it with a [Gemini API key from AI Studio](https://aistudio.google.com/apikey):
+
+```json
+{ "workers": { "agy": { "enabled": true, "auth": "api_key" } } }
+```
+
+and export `GEMINI_API_KEY` (or put it under `"env"` for the worker). With `"auth": "api_key"` every run gets `--settings '{"modelProvider":"gemini"}'`, which applies to that run only, so your interactive `agy` setup is untouched. If the key is missing, the server skips `agy` instead of running it.
+
+Other `auth` values: `"adc"` (Google Cloud Application Default Credentials, sets `AGY_ADC_AUTH=true`) and `"login"` (the signed-in account: it works, but the warning above applies and stays visible in `workers` and at session start).
+
+`agy` keeps its model groups (see [Models](#models)).
 
 ## Usage
 
 - `/capocantiere:manager` → for the rest of the session Claude delegates all mechanical work on its own. The most convenient mode.
 - `/capocantiere:delegate add the missing tests for src/billing` → plan, parallel delegation, review, apply, verify.
-- `/capocantiere:analyze how does the authentication flow work?` → Gemini reads, Claude only receives the summary.
+- `/capocantiere:analyze how does the authentication flow work?` → a worker reads, Claude only receives the summary.
 - `/capocantiere:review` → reviews and applies/discards all completed jobs.
+- `/capocantiere:status` → workers (installed, authenticated, budget, jobs, warnings) and open jobs.
+- `/capocantiere:use vibe` → use that worker by default for this session (`/capocantiere:use auto` goes back to the configured order).
 - `/capocantiere:mode` → shows or changes how much Claude delegates (see [Delegation mode](#delegation-mode)).
-- `/capocantiere:models` → shows the models your account can use and lets you choose which ones to use (see [Models](#models)).
+- `/capocantiere:models` → the models of a worker (model groups for `agy`).
 
 Even without the commands, Claude can use the tools and the skill on its own when it finds them useful.
 
 ### Who is the manager, and how much it delegates
 
-The manager is whatever model your Claude Code session runs (Opus, Sonnet, Fable…): nothing in the plugin depends on a specific one. Only the `gemini-reviewer` agent is pinned to Sonnet, to keep reviews cheap.
+The manager is whatever model your Claude Code session runs (Opus, Sonnet, Fable…): nothing in the plugin depends on a specific one. Only the `worker-reviewer` agent is pinned to Sonnet, to keep reviews cheap.
 
-The plugin doesn't change Claude's normal behavior much. Gemini is one more option, next to doing the work itself or using a Claude subagent, and Claude picks per task. Your instructions win: write in `CLAUDE.md` how much you want Gemini used (e.g. "delegate tests and docs to Gemini", or "never use Gemini in this repo") and Claude follows it. `/capocantiere:manager` is the explicit opt-in to delegate as much as possible for a session.
+The plugin doesn't change Claude's normal behavior much. Workers are one more option, next to doing the work itself or using a Claude subagent, and Claude picks per task. Your instructions win: write in `CLAUDE.md` how much you want workers used (e.g. "delegate tests and docs, preferably to vibe", or "never delegate in this repo") and Claude follows it. Claude also follows one rule of its own: a task that has failed twice is done by Claude, not sent to a worker again.
 
 ### Delegation mode
 
@@ -79,20 +123,65 @@ For a lasting setting, use `/capocantiere:mode`. There is a global default and y
 
 | Mode | Behavior | Enforced by |
 |---|---|---|
-| `off` | Gemini disabled, e.g. for repos whose code must not be sent to Google | the server: the delegation tools refuse to run |
+| `off` | delegation disabled, e.g. for repos whose code must not leave your machine | the server: the delegation tools refuse to run |
 | `manual` | delegate only when you ask (in chat, with a command, or in `CLAUDE.md`) | instruction to Claude |
 | `auto` *(default)* | Claude decides case by case | instruction to Claude |
 | `prefer` | delegate everything that makes sense, like a permanent `/capocantiere:manager` | instruction to Claude |
 
 Examples: `/capocantiere:mode off` (this repo), `/capocantiere:mode prefer global`, `/capocantiere:mode inherit` (this repo goes back to the global default).
 
-The mode is given to Claude at the start of every session. Explicit instructions in chat or in `CLAUDE.md` take precedence over it, except `off`, which is a hard block. `manual`, `auto` and `prefer` are instructions to the model: they work well, but unlike `off` they aren't enforced by code.
+The mode is given to Claude at the start of every session. Explicit instructions in chat or in `CLAUDE.md` take precedence over it, except `off`, which is a hard block.
+
+## Configuration
+
+Everything is optional. The config file is `~/.config/capocantiere/workers.json` (`$XDG_CONFIG_HOME` is honored; `CAPOCANTIERE_CONFIG` points elsewhere). It's re-read when it changes, so edits apply without restarting Claude Code. Write only what you change: missing keys use the defaults.
+
+[`plugins/capocantiere/workers.example.json`](plugins/capocantiere/workers.example.json) lists every setting with its default. Keys starting with `_` are comments. A typical file:
+
+```json
+{
+  "order": ["vibe", "copilot"],
+  "workers": {
+    "copilot": { "daily_budget": 30, "model": "gpt-5.6-sol" },
+    "vibe": { "max_price": 0.25, "strengths": ["analysis", "docs", "tests"] }
+  }
+}
+```
+
+Global settings:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `order` | `["copilot", "vibe", "agy"]` | preference order when no worker is requested |
+| `fallback` | `true` | on quota/rate-limit errors or exhausted budget, move on to the next worker |
+| `max_parallel` | `4` | jobs running at once, across all workers |
+
+Settings of every worker:
+
+| Setting | Meaning |
+|---|---|
+| `enabled` | use this worker at all |
+| `bin` | path or name of the CLI |
+| `model`, `analyze_model` | model for jobs / for analyses (empty = the CLI's default; for `agy` also a group such as `strong`) |
+| `effort` | reasoning effort (`low` … `max`), passed with the CLI's own flag |
+| `daily_budget` | max runs per 24h for this worker (running jobs included) |
+| `max_parallel` | jobs of this worker running at once |
+| `timeout_min`, `analyze_timeout_min` | time limits for a job / an analysis |
+| `extra_args` | extra command-line arguments |
+| `env` | extra environment variables for the CLI (e.g. an API key) |
+| `strengths` | tags Claude uses to choose a worker: `tests`, `boilerplate`, `docs`, `refactor`, `analysis`, … |
+
+Worker-specific settings: `copilot` — `deny_tools`, `disable_builtin_mcps`, `sandbox`, `max_ai_credits`, `secret_env_vars`; `vibe` — `max_turns`, `max_price`, `max_tokens`, `trust`, `analyze_tools`, `disabled_tools`; `agy` — `auth`, `sandbox`, `skip_permissions`.
+
+**Environment variables** override the file, e.g. in `~/.claude/settings.json` under `"env"`: `CAPOCANTIERE_<WORKER>_<SETTING>` (`CAPOCANTIERE_VIBE_MAX_PRICE=1`, `CAPOCANTIERE_COPILOT_ENABLED=0`; lists are comma-separated), `CAPOCANTIERE_ORDER`, `CAPOCANTIERE_FALLBACK`, `CAPOCANTIERE_MAX_PARALLEL`, plus `CAPOCANTIERE_RUNTIME` (`python`, `node` or `auto`). The old `GEMINI_DELEGATE_*` variables still apply to `agy`.
+
+`MCP_TOOL_TIMEOUT` (in ms) is only needed if long analyses get cut off by Claude Code; jobs are asynchronous and aren't affected.
 
 ## Models
 
-Which models you get through `agy` depends on your Google plan (e.g. the student plan has fewer than AI Pro). The plugin doesn't hard-code a list: it reads `agy models`, which only shows what your account can use, and re-reads it every 6 hours. New models, or a plan upgrade, show up on their own without updating the plugin.
+Each worker uses its CLI's default model unless `model` / `analyze_model` is set, or Claude passes `model` for one run (model names differ between CLIs, so Claude normally leaves it out).
 
-Each model is sorted into a capability group by name rules in [`server/model-groups.json`](plugins/capocantiere/server/model-groups.json):
+For `agy` the plugin reads `agy models` (only what your account can use, refreshed every 6 hours) and sorts the models into capability groups by name rules in [`server/model-groups.json`](plugins/capocantiere/server/model-groups.json):
 
 | Group | What goes in it | Used for |
 |---|---|---|
@@ -100,70 +189,46 @@ Each model is sorted into a capability group by name rules in [`server/model-gro
 | `standard` | Gemini Flash (high) | implementation jobs (default) |
 | `strong` | Gemini Pro, Claude Sonnet | harder tasks, retries after a failure |
 | `frontier` | Gemini Ultra / Deep Think, Claude Opus | only the hardest delegated tasks |
-| `other` | anything not recognized (e.g. GPT-OSS) | never picked automatically |
+| `other` | anything not recognized | never picked automatically |
 
-Inside a group, the newest version is preferred. Claude normally asks for a group (`model: "strong"`), never for a model that isn't on your account. If a model fails because the account can't use it, the server marks it unavailable and picks another one next time.
-
-`/capocantiere:models` shows the list and changes the defaults, which are saved across sessions:
-
-- **a group** (e.g. use `strong` for implementation) follows new models automatically;
-- **an exact slug** pins that model;
-- **exclude** keeps models from ever being picked automatically, e.g. `claude-*` if you only want Gemini;
-- **auto** goes back to the default choice.
-
-If the slug already contains a level (`gemini-3.8-flash-low`), `agy` rejects `--effort`. In that case the server picks the variant of the same model closest to the requested effort.
+`/capocantiere:models` shows the list and changes the `agy` defaults: a group follows new models automatically, an exact slug pins a model, `exclude` keeps models from ever being picked automatically, `auto` goes back to the default choice.
 
 ## Python or Node
 
-The MCP server exists in two equivalent versions in `plugins/capocantiere/server/`: `server.py` (standard library only) and `server.mjs` (no npm packages). They have the same tools and behavior, share `tools.json` for the tool definitions, and use the same state files, so you can switch between them at any time without losing jobs.
+The MCP server exists in two versions in `plugins/capocantiere/server/`: `server.py` (with `common.py` and `workers.py`, standard library only) and `server.mjs` (no npm packages). They have the same tools and behavior, share `tools.json`, `modes.json` and `model-groups.json`, and use the same state files, so you can switch between them at any time without losing jobs.
 
-`run.sh` starts the right one. By default it uses `python3` if it's on your `PATH`, otherwise `node`. To force a choice, set `CAPOCANTIERE_RUNTIME` to `python` or `node` (see below).
+`run.sh` starts the right one: `python3` if it's on your `PATH`, otherwise `node`. To force a choice, set `CAPOCANTIERE_RUNTIME` to `python` or `node`.
 
-## Configuration (optional)
+The Python version is the reference: it is the one covered by the test suite. The Node version is a port, not tested directly.
 
-Environment variables, e.g. in `~/.claude/settings.json` under `"env"`:
+## Tests
 
-| Variable | Default | Meaning |
-|---|---|---|
-| `CAPOCANTIERE_RUNTIME` | `auto` | `python`, `node`, or `auto` (python3 if available, otherwise node) |
-| `GEMINI_DELEGATE_MODEL` | automatic | model for implementation jobs: a group or a slug (overrides `/capocantiere:models`) |
-| `GEMINI_DELEGATE_ANALYZE_MODEL` | automatic | same, for `gemini_analyze` (falls back to `GEMINI_DELEGATE_MODEL`) |
-| `GEMINI_DELEGATE_EFFORT` | agy's default | `low` … `max` |
-| `GEMINI_DELEGATE_DAILY_BUDGET` | `150` | max agy runs per 24h |
-| `GEMINI_DELEGATE_MAX_PARALLEL` | `3` | concurrent jobs |
-| `GEMINI_DELEGATE_TASK_TIMEOUT_MIN` | `20` | timeout for a job |
-| `GEMINI_DELEGATE_ANALYZE_TIMEOUT_MIN` | `8` | timeout for an analysis |
-| `GEMINI_DELEGATE_SANDBOX` | `1` | pass `--sandbox` to agy |
-| `GEMINI_DELEGATE_SKIP_PERMISSIONS` | `1` | auto-approval inside the isolated worktree |
-| `GEMINI_DELEGATE_AGY_BIN` | `agy` | path to the binary |
-| `GEMINI_DELEGATE_EXTRA_ARGS` | — | extra arguments for agy |
-
-Example:
-
-```json
-{
-  "env": {
-    "GEMINI_DELEGATE_DAILY_BUDGET": "120",
-    "GEMINI_DELEGATE_MAX_PARALLEL": "2",
-    "MCP_TOOL_TIMEOUT": "600000"
-  }
-}
+```bash
+python3 tests/e2e.py              # Python server
+python3 tests/e2e.py -k fallback  # only some tests
+python3 tests/e2e.py --runtime node
 ```
 
-`MCP_TOOL_TIMEOUT` (in ms) is only needed if long analyses get cut off by Claude Code; write jobs are asynchronous and aren't affected.
+End-to-end tests over MCP stdio, against fake `copilot`, `vibe` and `agy` binaries in [`tests/fakes`](tests/fakes) (a marker in the task picks the scenario: success with edits, no changes, quota error, generic error, timeout). Every test uses its own temporary repo and state folders; no real worker CLI is ever started.
 
 ## Where files go
 
-- State, jobs, patches, usage log, model list (`models.json`), model and mode settings (`settings.json`): `~/.local/state/gemini-delegate/`
-- Temporary worktrees: `~/.cache/gemini-delegate/worktrees/` (removed after apply/discard)
+- State, jobs, patches, usage log (per worker), `agy` model list, mode settings: `~/.local/state/capocantiere/`
+- Temporary worktrees: `~/.cache/capocantiere/worktrees/` (removed after apply/discard)
+- Config: `~/.config/capocantiere/workers.json`
+
+Upgrading from the Gemini-only version (`gemini-delegate`): the old state in `~/.local/state/gemini-delegate/` is moved on first start; old jobs and old usage count as `agy`. Worktrees of old jobs stay where they were until those jobs are applied or discarded.
 
 ## Known limitations
 
 - The plugin starts the server through `sh run.sh`, so `sh` must be on the `PATH`. It always is on Linux and macOS; on Windows it has only been designed for, not tested.
-- Build artifacts (`__pycache__`, `*.pyc`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `node_modules`, `.DS_Store`) are never included in a job's diff, even if the repo has no `.gitignore` for them. Gemini is also asked to delete the temporary files it creates.
+- Build artifacts (`__pycache__`, `*.pyc`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `node_modules`, `.DS_Store`) are never included in a job's diff. Workers are also asked to delete the temporary files they create.
 - **Untracked** files are not copied into the job's worktree: `git add` or commit them first, or mention them in the task.
-- The budget counts `agy` runs, not the model's internal requests (each run makes several). Keep it conservative and raise it if it holds up.
-- The `agy` JSON format is the one documented as of November 2026; if Google changes it, the server still shows the raw output.
+- Budgets count runs, not the model's internal requests or tokens (each run makes several). Keep them conservative; the per-run caps (`max_price`, `max_ai_credits`) limit the cost of a single run.
+- Authentication checks don't call any model: Copilot is "authenticated" when its config records a logged-in user (or a token variable is set), Vibe when its cache records a signed-in account or `MISTRAL_API_KEY` is set. An expired login only shows up on the first run.
+- Copilot's shell commands are not limited to the worktree by path checks (only file tools are); the deny rules and, optionally, `sandbox` cover the dangerous ones.
+- After a fallback, the next worker uses its own default model (a model name rarely means the same on another CLI).
+- The CLI flags were checked against GitHub Copilot CLI 1.0.114, Mistral Vibe 3.1.3 (help, config schema and source) and Antigravity CLI 1.5.10. If a CLI changes its output, the server still shows the raw output.
 
 ## Why "Capocantiere"
 
@@ -173,4 +238,4 @@ Il nome viene da una conversazione con Claude, nel browser:
 >
 > **Claude:** Ti consiglio **Capocantiere**. È esattamente lo schema: Opus dirige il cantiere, assegna i lavori, controlla e firma, mentre Gemini fa la manovalanza. Funziona bene anche da comando: `/capocantiere:manager`, `/capocantiere:delegate`.
 
-*(A* capocantiere *is an Italian site foreman: the one who runs the construction site, hands out the work, checks it and signs off, while the crew does the heavy lifting.)*
+*(A* capocantiere *is an Italian site foreman: the one who runs the construction site, hands out the work, checks it and signs off, while the crew does the heavy lifting. Gemini was the first crew; now the crew is configurable.)*

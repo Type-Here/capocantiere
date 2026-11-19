@@ -1,13 +1,13 @@
 [
   {
-    "name": "gemini_delegate",
-    "description": "Delegate a well-defined implementation task to Gemini (Antigravity CLI). The work happens in an isolated git worktree on a dedicated branch: the main repo is NOT touched until you call gemini_apply. Asynchronous: returns a job_id immediately (you can launch several in parallel on independent parts). Use gemini_jobs to wait for / view the diff. Ideal for: boilerplate, tests, mechanical refactors, repetitive migrations, documentation, small features with a clear spec. Do NOT use it for architectural decisions or hard bugs.",
+    "name": "delegate",
+    "description": "Delegate a well-defined implementation task to a worker (an external coding-agent CLI such as GitHub Copilot CLI or Mistral Vibe). The work happens in an isolated git worktree on a dedicated branch: the main repo is NOT touched until you call apply. Asynchronous: returns a job_id immediately (you can launch several in parallel on independent parts, also on different workers). Use jobs to wait for / view the diff. Ideal for: boilerplate, tests, mechanical refactors, repetitive migrations, documentation, small features with a clear spec. Do NOT use it for architectural decisions or hard bugs.",
     "inputSchema": {
       "type": "object",
       "properties": {
         "task": {
           "type": "string",
-          "description": "Complete, self-contained spec: what to do, where, constraints. Gemini cannot see your conversation."
+          "description": "Complete, self-contained spec: what to do, where, constraints. The worker cannot see your conversation."
         },
         "title": {
           "type": "string",
@@ -30,15 +30,23 @@
         },
         "test_command": {
           "type": "string",
-          "description": "Command Gemini must run to verify its work (e.g. 'npm test -- auth')"
+          "description": "Command the worker must run to verify its work (e.g. 'npm test -- auth')"
         },
         "include_uncommitted": {
           "type": "boolean",
           "description": "Start from the current state including uncommitted changes (default true). Untracked files are not included."
         },
+        "worker": {
+          "type": "string",
+          "description": "Worker to use (see the workers tool). Omit it to use the session default or the configured preference order."
+        },
+        "fallback": {
+          "type": "boolean",
+          "description": "If the worker hits a quota/rate limit or its budget is used up, move on to the next worker (default: the fallback setting in the config)."
+        },
         "model": {
           "type": "string",
-          "description": "Model to use: a group (fast, standard, strong, frontier) or an exact slug from gemini_models. A group always picks the best model of that group available on this account. Omit it to use the configured default."
+          "description": "Model for the chosen worker. For agy: a group (fast, standard, strong, frontier) or an exact slug from the models tool. For the other workers: a model name their CLI accepts. Omit it to use the worker's configured default (recommended: model names differ between workers)."
         },
         "effort": {
           "type": "string",
@@ -60,7 +68,7 @@
         },
         "force": {
           "type": "boolean",
-          "description": "Ignore the daily budget"
+          "description": "Ignore the worker's daily budget"
         },
         "repo_dir": {
           "type": "string",
@@ -73,8 +81,8 @@
     }
   },
   {
-    "name": "gemini_analyze",
-    "description": "Ask Gemini (~1M token context) to read and analyze code in READ-ONLY mode and return a dense summary with path:line references. Use it to save your own context: exploring large codebases, huge files, logs, finding where something is implemented, mapping dependencies, preliminary reviews. Synchronous.",
+    "name": "analyze",
+    "description": "Ask a worker to read and analyze code in READ-ONLY mode and return a dense summary with path:line references. Use it to save your own context: exploring large codebases, huge files, logs, finding where something is implemented, mapping dependencies, preliminary reviews. Synchronous. Runs in the main repo without auto-approval of tool calls.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -93,9 +101,17 @@
           "type": "number",
           "description": "Maximum response length in words (default 600)"
         },
+        "worker": {
+          "type": "string",
+          "description": "Worker to use (see the workers tool). Omit it to use the session default or the configured preference order."
+        },
+        "fallback": {
+          "type": "boolean",
+          "description": "If the worker hits a quota/rate limit or its budget is used up, move on to the next worker (default: the fallback setting in the config)."
+        },
         "model": {
           "type": "string",
-          "description": "Model to use: a group (fast, standard, strong, frontier) or an exact slug from gemini_models. A group always picks the best model of that group available on this account. Omit it to use the configured default."
+          "description": "Model for the chosen worker. For agy: a group (fast, standard, strong, frontier) or an exact slug from the models tool. For the other workers: a model name their CLI accepts. Omit it to use the worker's configured default (recommended: model names differ between workers)."
         },
         "effort": {
           "type": "string",
@@ -112,7 +128,8 @@
           "type": "number"
         },
         "force": {
-          "type": "boolean"
+          "type": "boolean",
+          "description": "Ignore the worker's daily budget"
         },
         "repo_dir": {
           "type": "string"
@@ -124,8 +141,8 @@
     }
   },
   {
-    "name": "gemini_jobs",
-    "description": "Status of delegated jobs. Without job_id: list of the repo's jobs. With job_id: details including Gemini's response and the diff. wait_seconds waits for the jobs (or the given one) to finish.",
+    "name": "jobs",
+    "description": "Status of delegated jobs. Without job_id: list of the repo's jobs, with the worker that ran each. With job_id: details including the worker's response, earlier attempts (fallback) and the diff. wait_seconds waits for the jobs (or the given one) to finish.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -154,7 +171,7 @@
     }
   },
   {
-    "name": "gemini_apply",
+    "name": "apply",
     "description": "Apply a completed job's changes (after reviewing them) to the main repo's working tree, then remove the job's worktree and branch. The changes stay UNCOMMITTED so you can touch them up and test them.",
     "inputSchema": {
       "type": "object",
@@ -173,7 +190,7 @@
     }
   },
   {
-    "name": "gemini_discard",
+    "name": "discard",
     "description": "Discard a job (stopping it if running) and delete its worktree and branch.",
     "inputSchema": {
       "type": "object",
@@ -188,44 +205,21 @@
     }
   },
   {
-    "name": "gemini_usage",
-    "description": "Gemini usage over the last 24h against the configured budget, active jobs, configuration, and a check that agy is installed.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {}
-    }
-  },
-  {
-    "name": "gemini_models",
-    "description": "List the models this account can use through agy, grouped by capability (fast, standard, strong, frontier, other), and show which model is used by default for analysis and for implementation. With analyze/implement/exclude it also changes those defaults (saved across sessions). The list is re-read from `agy models` every few hours, so new models appear on their own. Does not use the daily budget.",
+    "name": "workers",
+    "description": "List the workers with their state: enabled, installed, authenticated (when checkable), budget used/left in the last 24h, active jobs, models, strengths, warnings; plus the preference order, the fallback setting and the session default. With use=<worker> it also sets the default worker for this session (\"auto\" clears it). Does not use any budget.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "refresh": {
-          "type": "boolean",
-          "description": "Re-read `agy models` now. Also forgets models marked unavailable after a failed run."
-        },
-        "analyze": {
+        "use": {
           "type": "string",
-          "description": "Default model for gemini_analyze: a group (follows new models automatically), an exact slug (pinned), or \"auto\" to go back to the automatic choice."
-        },
-        "implement": {
-          "type": "string",
-          "description": "Default model for gemini_delegate: a group, an exact slug, or \"auto\"."
-        },
-        "exclude": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "description": "Slug patterns (* wildcard) never chosen through a group or by default, e.g. [\"claude-*\"]. Replaces the current list; [] clears it."
+          "description": "Set the session default worker (a worker id), or \"auto\" to go back to the configured order. Only when the user asks."
         }
       }
     }
   },
   {
-    "name": "gemini_mode",
-    "description": "Show or change the delegation mode, i.e. how much you should delegate to Gemini: off (tools disabled), manual (only when the user asks), auto (your judgment, the default), prefer (delegate whatever makes sense). There is a global default plus per-repo settings. Without arguments it shows the current mode for this repo. Change it only when the user asks.",
+    "name": "mode",
+    "description": "Show or change the delegation mode, i.e. how much you should delegate to workers: off (tools disabled), manual (only when the user asks), auto (your judgment, the default), prefer (delegate whatever makes sense). There is a global default plus per-repo settings. Without arguments it shows the current mode for this repo. Change it only when the user asks.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -251,6 +245,38 @@
         "repo_dir": {
           "type": "string",
           "description": "Repo directory (default: current project)"
+        }
+      }
+    }
+  },
+  {
+    "name": "models",
+    "description": "Models of a worker. For agy (the default here): lists the models the account can use, grouped by capability (fast, standard, strong, frontier, other), shows the defaults for analysis and implementation, and with analyze/implement/exclude changes them (saved across sessions). Other workers don't publish a model list: it shows the configured model. Does not use any budget.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "worker": {
+          "type": "string",
+          "description": "Worker (default agy)"
+        },
+        "refresh": {
+          "type": "boolean",
+          "description": "Re-read `agy models` now. Also forgets models marked unavailable after a failed run."
+        },
+        "analyze": {
+          "type": "string",
+          "description": "Default model for analyze: a group (follows new models automatically), an exact slug (pinned), or \"auto\" to go back to the automatic choice."
+        },
+        "implement": {
+          "type": "string",
+          "description": "Default model for delegate: a group, an exact slug, or \"auto\"."
+        },
+        "exclude": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Slug patterns (* wildcard) never chosen through a group or by default, e.g. [\"claude-*\"]. Replaces the current list; [] clears it."
         }
       }
     }

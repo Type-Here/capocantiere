@@ -1,4 +1,7 @@
 ---
-description: Status of Gemini delegation (budget, open jobs)
+description: Status of delegation (workers, budgets, open jobs)
 ---
-Call gemini_usage and gemini_jobs and show me, compactly: budget used/remaining, running jobs, jobs awaiting review. For jobs awaiting review, suggest what to do (apply/discard/relaunch).
+Call the workers tool and the jobs tool and show me, compactly:
+- one line per worker: enabled/disabled, installed, authenticated, budget used/left in the last 24h, running jobs, strengths; mark the session default;
+- any warnings (configuration problems, disabled workers and why), the fallback setting and the delegation mode;
+- running jobs and jobs awaiting review, with the worker that ran each. For jobs awaiting review, suggest what to do (apply/discard/relaunch).

@@ -1,11 +1,16 @@
 #!/usr/bin/env node
-// gemini-delegate: MCP server that lets Claude Code (the "manager") delegate
-// work to Antigravity CLI (`agy`, Gemini) using a Google AI Pro subscription.
+// capocantiere: MCP server that lets Claude Code (the "manager") delegate work to external
+// coding-agent CLIs ("workers": GitHub Copilot CLI, Mistral Vibe, Antigravity CLI).
+//
+// Node port of server.py (+ common.py, workers.py), with the same behavior and the same state files,
+// so you can switch between the two runtimes without losing jobs. The Python version is the
+// reference covered by tests/e2e.py; keep the two in sync.
 //
 // - Every code-writing task runs in an isolated git worktree, on a dedicated branch.
-//   The main repo is never touched until Claude calls gemini_apply.
-// - Jobs are asynchronous and can run in parallel (with a queue).
-// - Usage/quota is tracked so the subscription's daily limits aren't exceeded.
+//   The main repo is never touched until Claude calls `apply`.
+// - Jobs are asynchronous and can run in parallel (with a queue, and a limit per worker).
+// - Usage is tracked per worker so each one's daily budget isn't exceeded. On quota/rate-limit
+//   errors the job can move on to the next worker (fallback).
 //
 // Zero dependencies: only Node >= 18 and git are required.
 
@@ -15,255 +20,36 @@ import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
 
-// ---------------------------------------------------------------- config
-
-const env = process.env;
-const num = (v, d) => (v !== undefined && v !== "" && !Number.isNaN(Number(v)) ? Number(v) : d);
-const bool = (v, d) => (v === undefined || v === "" ? d : /^(1|true|yes|on)$/i.test(v));
-
-const CONFIG = {
-  agyBin: env.GEMINI_DELEGATE_AGY_BIN || "agy",
-  model: env.GEMINI_DELEGATE_MODEL || "", // empty = agy's default
-  analyzeModel: env.GEMINI_DELEGATE_ANALYZE_MODEL || "",
-  effort: env.GEMINI_DELEGATE_EFFORT || "",
-  dailyBudget: num(env.GEMINI_DELEGATE_DAILY_BUDGET, 150), // agy runs per 24h
-  maxParallel: num(env.GEMINI_DELEGATE_MAX_PARALLEL, 3),
-  taskTimeoutMin: num(env.GEMINI_DELEGATE_TASK_TIMEOUT_MIN, 20),
-  analyzeTimeoutMin: num(env.GEMINI_DELEGATE_ANALYZE_TIMEOUT_MIN, 8),
-  sandbox: bool(env.GEMINI_DELEGATE_SANDBOX, true),
-  // Inside the isolated worktree agy may edit files and run commands without asking:
-  // it's the only way to work headless. The main repo stays protected.
-  skipPermissionsInWorktree: bool(env.GEMINI_DELEGATE_SKIP_PERMISSIONS, true),
-  extraArgs: (env.GEMINI_DELEGATE_EXTRA_ARGS || "").split(" ").filter(Boolean),
-  stateDir:
-    env.GEMINI_DELEGATE_STATE_DIR ||
-    path.join(env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state"), "gemini-delegate"),
-  worktreeDir:
-    env.GEMINI_DELEGATE_WORKTREE_DIR ||
-    path.join(env.XDG_CACHE_HOME || path.join(os.homedir(), ".cache"), "gemini-delegate", "worktrees"),
-};
-
-const JOBS_DIR = path.join(CONFIG.stateDir, "jobs");
-const PATCH_DIR = path.join(CONFIG.stateDir, "patches");
-const USAGE_FILE = path.join(CONFIG.stateDir, "usage.jsonl");
-for (const d of [JOBS_DIR, PATCH_DIR, CONFIG.worktreeDir]) fs.mkdirSync(d, { recursive: true });
-
-const VERSION = "1.0.0";
+const VERSION = "2.0.0";
 const TERMINAL = new Set(["done", "no_changes", "failed", "applied", "discarded", "interrupted"]);
+const env = process.env;
 
-// ---------------------------------------------------------------- helpers
+// ================================================================ common (common.py)
 
-// Signal the child and everything it started (its own process group on POSIX).
-function killTree(child, sig) {
-  try {
-    if (process.platform !== "win32") process.kill(-child.pid, sig);
-    else child.kill(sig);
-  } catch {
-    try { child.kill(sig); } catch {}
-  }
+function num(v, d) {
+  if (v === undefined || v === null || v === "") return d;
+  const n = Number(v);
+  return Number.isNaN(n) ? d : n;
 }
-
-function run(cmd, args, { cwd, input, timeoutMs, onSpawn } = {}) {
-  return new Promise((resolve) => {
-    let child;
-    try {
-      child = spawn(cmd, args, { cwd, env: process.env, stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32" });
-    } catch (e) {
-      return resolve({ code: -1, stdout: "", stderr: String(e), error: e });
-    }
-    onSpawn?.(child);
-    let stdout = "";
-    let stderr = "";
-    let timedOut = false;
-    let timer;
-    if (timeoutMs) {
-      timer = setTimeout(() => {
-        timedOut = true;
-        killTree(child, "SIGTERM");
-        setTimeout(() => killTree(child, "SIGKILL"), 5000).unref();
-      }, timeoutMs);
-    }
-    child.stdout.on("data", (d) => (stdout += d));
-    child.stderr.on("data", (d) => (stderr += d));
-    child.on("error", (e) => {
-      clearTimeout(timer);
-      resolve({ code: -1, stdout, stderr: stderr + String(e), error: e, timedOut });
-    });
-    child.on("close", (code, signal) => {
-      clearTimeout(timer);
-      resolve({ code: code ?? -1, signal, stdout, stderr, timedOut });
-    });
-    if (input !== undefined) child.stdin.end(input);
-    else child.stdin.end();
-  });
+function bool(v, d) {
+  if (v === undefined || v === null || v === "") return d;
+  if (typeof v === "boolean") return v;
+  return /^(1|true|yes|on)$/i.test(String(v));
 }
+const xdg = (v, ...dflt) => env[v] || path.join(os.homedir(), ...dflt);
 
-async function git(cwd, ...args) {
-  const r = await run("git", args, { cwd });
-  if (r.code !== 0) throw new Error(`git ${args.join(" ")} failed: ${r.stderr.trim() || r.stdout.trim()}`);
-  return r.stdout;
-}
+// New names (CAPOCANTIERE_*) win; the old GEMINI_DELEGATE_* variables are still honored.
+const STATE_DIR =
+  env.CAPOCANTIERE_STATE_DIR || env.GEMINI_DELEGATE_STATE_DIR || path.join(xdg("XDG_STATE_HOME", ".local", "state"), "capocantiere");
+const WORKTREE_DIR =
+  env.CAPOCANTIERE_WORKTREE_DIR || env.GEMINI_DELEGATE_WORKTREE_DIR || path.join(xdg("XDG_CACHE_HOME", ".cache"), "capocantiere", "worktrees");
+const CONFIG_FILE = env.CAPOCANTIERE_CONFIG || path.join(xdg("XDG_CONFIG_HOME", ".config"), "capocantiere", "workers.json");
+const LEGACY_STATE_DIR = path.join(xdg("XDG_STATE_HOME", ".local", "state"), "gemini-delegate");
 
-// serialize git operations that touch worktrees/branches
-let gitLock = Promise.resolve();
-function withGitLock(fn) {
-  const p = gitLock.then(fn, fn);
-  gitLock = p.catch(() => {});
-  return p;
-}
-
-const truncate = (s, n) =>
-  !s ? "" : s.length <= n ? s : s.slice(0, n) + `\n… [truncated: ${s.length - n} characters omitted]`;
-const tail = (s, n) => (!s ? "" : s.length <= n ? s : "…" + s.slice(-n));
-
-function newId() {
-  const d = new Date();
-  const p = (x) => String(x).padStart(2, "0");
-  return `g${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}-${crypto
-    .randomBytes(2)
-    .toString("hex")}`;
-}
-
-async function repoRoot(dir) {
-  const start = dir || env.CLAUDE_PROJECT_DIR || process.cwd();
-  const r = await run("git", ["rev-parse", "--show-toplevel"], { cwd: start });
-  if (r.code !== 0) throw new Error(`"${start}" is not a git repository. gemini-delegate requires git.`);
-  return r.stdout.trim();
-}
-
-// ---------------------------------------------------------------- usage / quota
-
-function recordUsage(entry) {
-  fs.appendFileSync(USAGE_FILE, JSON.stringify({ ts: Date.now(), ...entry }) + "\n");
-}
-
-function usageWindow(hours = 24) {
-  const since = Date.now() - hours * 3600_000;
-  const out = { runs: 0, turns: 0, input_tokens: 0, output_tokens: 0, total_tokens: 0, failures: 0, quota_errors: 0 };
-  if (!fs.existsSync(USAGE_FILE)) return out;
-  for (const line of fs.readFileSync(USAGE_FILE, "utf8").split("\n")) {
-    if (!line) continue;
-    let e;
-    try { e = JSON.parse(line); } catch { continue; }
-    if (e.ts < since) continue;
-    out.runs++;
-    out.turns += e.turns || 0;
-    out.input_tokens += e.usage?.input_tokens || 0;
-    out.output_tokens += e.usage?.output_tokens || 0;
-    out.total_tokens += e.usage?.total_tokens || 0;
-    if (!e.ok) out.failures++;
-    if (e.quota) out.quota_errors++;
-  }
-  return out;
-}
-
-function activeJobCount() {
-  let n = 0;
-  for (const j of jobs.values()) if (j.status === "running" || j.status === "queued") n++;
-  return n;
-}
-
-function budgetCheck(force) {
-  const u = usageWindow(24);
-  u.committed = u.runs + activeJobCount(); // includes jobs still running
-  if (!force && u.committed >= CONFIG.dailyBudget) {
-    throw new Error(
-      `Daily budget reached (${u.committed}/${CONFIG.dailyBudget} agy runs in the last 24h, including running jobs). ` +
-        `Do the work directly in Claude, or retry with force=true.`
-    );
-  }
-  return u;
-}
-
-const QUOTA_RE = /(429|RESOURCE_EXHAUSTED|rate ?limit|quota)/i;
-
-// ---------------------------------------------------------------- agy
-
-function agyArgs({ prompt, model, effort, timeoutMin, skipPermissions }) {
-  const a = ["-p", prompt, "--output-format", "json"];
-  if (model) a.push("--model", model);
-  if (effort) a.push("--effort", effort);
-  if (timeoutMin) a.push("--print-timeout", `${timeoutMin}m`);
-  if (skipPermissions) a.push("--dangerously-skip-permissions");
-  if (CONFIG.sandbox) a.push("--sandbox");
-  a.push(...CONFIG.extraArgs);
-  return a;
-}
-
-function parseAgyOutput(stdout) {
-  const lines = stdout.trim().split("\n").reverse();
-  for (const l of lines) {
-    const t = l.trim();
-    if (!t.startsWith("{")) continue;
-    try { return JSON.parse(t); } catch {}
-  }
-  try { return JSON.parse(stdout); } catch {}
-  return null;
-}
-
-async function runAgy({ cwd, prompt, model, effort, timeoutMin, skipPermissions, kind, jobId, onSpawn }) {
-  const args = agyArgs({ prompt, model, effort, timeoutMin, skipPermissions });
-  const started = Date.now();
-  const r = await run(CONFIG.agyBin, args, {
-    cwd,
-    timeoutMs: (timeoutMin + 1) * 60_000,
-    onSpawn,
-  });
-  const envl = parseAgyOutput(r.stdout);
-  const notFound = r.error && r.error.code === "ENOENT";
-  const status = envl?.status || (r.code === 0 ? "SUCCESS" : "ERROR");
-  const ok = !notFound && r.code === 0 && status === "SUCCESS";
-  const errText = [envl?.error, r.timedOut ? `timed out after ${timeoutMin} min` : "", ok ? "" : tail(r.stderr, 1500)]
-    .filter(Boolean)
-    .join("\n");
-  const quota = QUOTA_RE.test(errText) || QUOTA_RE.test(r.stderr || "");
-  recordUsage({
-    kind,
-    job: jobId,
-    model: model || undefined,
-    ok,
-    quota,
-    turns: envl?.num_turns || 0,
-    usage: envl?.usage || null,
-    seconds: Math.round((Date.now() - started) / 1000),
-  });
-  // "soft-deny" notices that agy writes to stderr even when it exits with 0
-  const softDenied = (r.stderr || "")
-    .split("\n")
-    .filter((l) => /denied|not approved|requires approval|soft-den/i.test(l))
-    .slice(0, 10);
-  return {
-    ok,
-    notFound,
-    quota,
-    status,
-    response: envl?.response ?? (envl ? "" : r.stdout.trim()),
-    error: errText,
-    conversationId: envl?.conversation_id || null,
-    turns: envl?.num_turns || 0,
-    usage: envl?.usage || null,
-    durationSeconds: envl?.duration_seconds ?? Math.round((Date.now() - started) / 1000),
-    softDenied,
-    stderrTail: tail(r.stderr, 3000),
-  };
-}
-
-// ---------------------------------------------------------------- models
-//
-// The model list comes from `agy models`, which only shows what the user's account can use,
-// so new models (or a plan upgrade) are picked up without updating the plugin. Slugs are
-// sorted into capability groups by the rules in model-groups.json.
-
-const MODEL_RULES = JSON.parse(fs.readFileSync(new URL("./model-groups.json", import.meta.url), "utf8"));
-const GROUP_IDS = MODEL_RULES.groups.map((g) => g.id);
-const OTHER_GROUP = { id: "other", description: "Not classified. Never chosen automatically, only when requested by slug or group." };
-const MODELS_FILE = path.join(CONFIG.stateDir, "models.json");
-const SETTINGS_FILE = path.join(CONFIG.stateDir, "settings.json");
-const MODELS_TTL_MS = 6 * 3600_000;
-const LEVELS = ["low", "medium", "high", "xhigh", "max"];
-const LEVEL_RE = new RegExp(`-(${LEVELS.join("|")})$`);
-const MODEL_ERROR_RE =
-  /not recognized as a known model|model.{0,80}(not available|unavailable|not allowed|not supported|not entitled|permission denied)/i;
+const JOBS_DIR = path.join(STATE_DIR, "jobs");
+const PATCH_DIR = path.join(STATE_DIR, "patches");
+const USAGE_FILE = path.join(STATE_DIR, "usage.jsonl");
+const SETTINGS_FILE = path.join(STATE_DIR, "settings.json");
 
 function readJson(file, dflt) {
   try {
@@ -280,6 +66,390 @@ function writeJson(file, data) {
   fs.renameSync(tmp, file);
 }
 
+// Move the state of the old gemini-delegate server to the new folder, once.
+// Old worktrees stay where they are: git keeps their absolute path, and the jobs point to it.
+function migrateLegacyState() {
+  if (fs.existsSync(STATE_DIR) || !fs.existsSync(LEGACY_STATE_DIR)) return;
+  if (env.CAPOCANTIERE_STATE_DIR || env.GEMINI_DELEGATE_STATE_DIR) return; // explicit state dir: don't touch anything
+  fs.mkdirSync(path.dirname(STATE_DIR), { recursive: true });
+  try {
+    fs.renameSync(LEGACY_STATE_DIR, STATE_DIR);
+  } catch {
+    fs.cpSync(LEGACY_STATE_DIR, STATE_DIR, { recursive: true });
+  }
+  const jobsDir = path.join(STATE_DIR, "jobs");
+  const oldPatches = path.join(LEGACY_STATE_DIR, "patches");
+  for (const f of fs.existsSync(jobsDir) ? fs.readdirSync(jobsDir) : []) {
+    const p = path.join(jobsDir, f);
+    const j = readJson(p, null);
+    if (!j) continue;
+    if ((j.patchFile || "").startsWith(oldPatches)) j.patchFile = PATCH_DIR + j.patchFile.slice(oldPatches.length);
+    if (!j.worker) j.worker = "agy"; // every job before workers existed ran on agy
+    writeJson(p, j);
+  }
+}
+
+function ensureDirs() {
+  migrateLegacyState();
+  for (const d of [JOBS_DIR, PATCH_DIR, WORKTREE_DIR]) fs.mkdirSync(d, { recursive: true });
+}
+
+const isoNow = () => new Date().toISOString();
+const truncate = (s, n) =>
+  !s ? "" : s.length <= n ? s : s.slice(0, n) + `\n… [truncated: ${s.length - n} characters omitted]`;
+const tail = (s, n) => (!s ? "" : s.length <= n ? s : "…" + s.slice(-n));
+const pad2 = (x) => String(x).padStart(2, "0");
+
+function newId() {
+  const d = new Date();
+  return `j${pad2(d.getMonth() + 1)}${pad2(d.getDate())}-${pad2(d.getHours())}${pad2(d.getMinutes())}-${crypto.randomBytes(2).toString("hex")}`;
+}
+
+// Signal the child and everything it started (its own process group on POSIX).
+function killTree(child, sig) {
+  try {
+    if (process.platform !== "win32") process.kill(-child.pid, sig);
+    else child.kill(sig);
+  } catch {
+    try { child.kill(sig); } catch {}
+  }
+}
+
+// Run a command; never throws. Resolves to { code, stdout, stderr, error, timedOut }.
+function run(cmd, args, { cwd, input, timeoutMs, onSpawn, binary = false, extraEnv } = {}) {
+  return new Promise((resolve) => {
+    let child;
+    let done = false;
+    const finish = (r) => { if (!done) { done = true; resolve(r); } };
+    try {
+      child = spawn(cmd, args, {
+        cwd,
+        env: extraEnv && Object.keys(extraEnv).length ? { ...process.env, ...extraEnv } : process.env,
+        stdio: ["pipe", "pipe", "pipe"],
+        detached: process.platform !== "win32",
+      });
+    } catch (e) {
+      return finish({ code: -1, stdout: binary ? Buffer.alloc(0) : "", stderr: String(e), error: e, timedOut: false });
+    }
+    onSpawn?.(child);
+    const out = [];
+    const err = [];
+    let timedOut = false;
+    let timer;
+    if (timeoutMs) {
+      timer = setTimeout(() => {
+        timedOut = true;
+        killTree(child, "SIGTERM");
+        setTimeout(() => killTree(child, "SIGKILL"), 5000).unref();
+      }, timeoutMs);
+    }
+    const collect = () => {
+      const o = Buffer.concat(out);
+      return { stdout: binary ? o : o.toString("utf8"), stderr: Buffer.concat(err).toString("utf8") };
+    };
+    child.stdout.on("data", (d) => out.push(d));
+    child.stderr.on("data", (d) => err.push(d));
+    child.stdin.on("error", () => {}); // EPIPE when the process exits without reading its input
+    child.on("error", (e) => {
+      clearTimeout(timer);
+      const c = collect();
+      finish({ code: -1, stdout: c.stdout, stderr: c.stderr + String(e), error: e, timedOut });
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      finish({ code: code ?? -1, ...collect(), error: null, timedOut });
+    });
+    if (input !== undefined && input !== null) child.stdin.end(input);
+    else child.stdin.end();
+  });
+}
+
+const notFound = (r) => r.error?.code === "ENOENT";
+
+async function git(cwd, ...args) {
+  const r = await run("git", args, { cwd });
+  if (r.code !== 0) throw new Error(`git ${args.join(" ")} failed: ${r.stderr.trim() || r.stdout.trim()}`);
+  return r.stdout;
+}
+
+// serialize git operations that touch worktrees/branches
+let gitLock = Promise.resolve();
+function withGitLock(fn) {
+  const p = gitLock.then(fn, fn);
+  gitLock = p.catch(() => {});
+  return p;
+}
+
+async function repoRoot(dir) {
+  const start = dir || env.CLAUDE_PROJECT_DIR || process.cwd();
+  const r = await run("git", ["rev-parse", "--show-toplevel"], { cwd: start });
+  if (r.code !== 0) throw new Error(`"${start}" is not a git repository. capocantiere requires git.`);
+  return r.stdout.trim();
+}
+
+async function currentRepo() {
+  try { return await repoRoot(); } catch { return null; }
+}
+
+function tmpDir(prefix) {
+  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+}
+
+// Sum every numeric value whose key matches pattern, anywhere in a JSON structure.
+function sumKeys(obj, pattern) {
+  let total = 0;
+  if (Array.isArray(obj)) {
+    for (const v of obj) total += sumKeys(v, pattern);
+  } else if (obj && typeof obj === "object") {
+    for (const [k, v] of Object.entries(obj)) {
+      if (typeof v === "number" && pattern.test(k)) total += v;
+      else total += sumKeys(v, pattern);
+    }
+  }
+  return total;
+}
+
+// ================================================================ config (workers.py)
+
+const GLOBAL_DEFAULTS = {
+  order: ["copilot", "vibe", "agy"], // preference order when no worker is requested
+  fallback: true, // on quota/rate-limit errors or exhausted budget, move on to the next worker
+  max_parallel: 4, // jobs running at once, across all workers
+};
+
+// Settings every worker has. Adapters add their own on top.
+const COMMON_DEFAULTS = {
+  enabled: true,
+  bin: "",
+  model: "", // empty = the CLI's default
+  analyze_model: "", // empty = same as model
+  effort: "",
+  daily_budget: 50, // runs per 24h
+  max_parallel: 2,
+  timeout_min: 20,
+  analyze_timeout_min: 8,
+  extra_args: [],
+  env: {}, // extra environment variables for the CLI (e.g. an API key variable)
+  strengths: [],
+};
+
+// Old environment variables of the gemini-delegate server, mapped to agy settings.
+const LEGACY_AGY_ENV = {
+  GEMINI_DELEGATE_AGY_BIN: "bin",
+  GEMINI_DELEGATE_MODEL: "model",
+  GEMINI_DELEGATE_ANALYZE_MODEL: "analyze_model",
+  GEMINI_DELEGATE_EFFORT: "effort",
+  GEMINI_DELEGATE_DAILY_BUDGET: "daily_budget",
+  GEMINI_DELEGATE_MAX_PARALLEL: "max_parallel",
+  GEMINI_DELEGATE_TASK_TIMEOUT_MIN: "timeout_min",
+  GEMINI_DELEGATE_ANALYZE_TIMEOUT_MIN: "analyze_timeout_min",
+  GEMINI_DELEGATE_SANDBOX: "sandbox",
+  GEMINI_DELEGATE_SKIP_PERMISSIONS: "skip_permissions",
+  GEMINI_DELEGATE_EXTRA_ARGS: "extra_args",
+};
+
+// Convert an environment string to the type of the default value.
+function coerce(value, like) {
+  if (typeof like === "boolean") return bool(value, like);
+  if (typeof like === "number") return num(value, like);
+  if (Array.isArray(like)) {
+    const sep = value.includes(",") ? "," : " ";
+    return value.split(sep).map((x) => x.trim()).filter(Boolean);
+  }
+  if (like && typeof like === "object") {
+    try {
+      const v = JSON.parse(value);
+      return v && typeof v === "object" && !Array.isArray(v) ? v : like;
+    } catch {
+      return like;
+    }
+  }
+  return value;
+}
+
+function mergeSettings(defaults, override) {
+  const out = { ...defaults };
+  for (const [k, v] of Object.entries(override || {})) {
+    if (k.startsWith("_")) continue; // comments
+    out[k] = v;
+  }
+  return out;
+}
+
+const configCache = { mtime: undefined, data: null };
+
+// The effective config: { order, fallback, max_parallel, workers: {id: settings}, errors: [...] }.
+// The file is re-read when it changes, so edits apply without restarting the session.
+function loadConfig() {
+  let mtime = null;
+  try { mtime = fs.statSync(CONFIG_FILE).mtimeMs; } catch {}
+  if (configCache.data && configCache.mtime === mtime) return configCache.data;
+  const errors = [];
+  let user = {};
+  if (mtime !== null) {
+    try {
+      user = JSON.parse(fs.readFileSync(CONFIG_FILE, "utf8"));
+      if (!user || typeof user !== "object" || Array.isArray(user)) throw new Error("the top level must be an object");
+    } catch (e) {
+      errors.push(`${CONFIG_FILE} is not valid JSON (${e.message}): using the built-in defaults.`);
+      user = {};
+    }
+  }
+  const { workers: userWorkersRaw, ...userGlobal } = user;
+  const cfg = mergeSettings(GLOBAL_DEFAULTS, userGlobal);
+  for (const [key, like] of Object.entries(GLOBAL_DEFAULTS)) {
+    const v = env["CAPOCANTIERE_" + key.toUpperCase()];
+    if (v) cfg[key] = coerce(v, like);
+  }
+  const userWorkers = userWorkersRaw && typeof userWorkersRaw === "object" ? userWorkersRaw : {};
+  for (const wid of Object.keys(userWorkers)) {
+    if (!ADAPTERS[wid] && !wid.startsWith("_"))
+      errors.push(`Unknown worker "${wid}" in ${CONFIG_FILE} (known: ${Object.keys(ADAPTERS).join(", ")}).`);
+  }
+  const workers = {};
+  for (const [wid, cls] of Object.entries(ADAPTERS)) {
+    const defaults = mergeSettings(COMMON_DEFAULTS, cls.DEFAULTS);
+    const s = mergeSettings(defaults, userWorkers[wid]);
+    if (wid === "agy") {
+      for (const [v, key] of Object.entries(LEGACY_AGY_ENV)) if (env[v]) s[key] = coerce(env[v], defaults[key]);
+    }
+    for (const [key, like] of Object.entries(defaults)) {
+      const v = env[`CAPOCANTIERE_${wid.toUpperCase()}_${key.toUpperCase()}`];
+      if (v) s[key] = coerce(v, like);
+    }
+    workers[wid] = s;
+  }
+  const order = Array.isArray(cfg.order) ? cfg.order : GLOBAL_DEFAULTS.order;
+  cfg.order = [...order.filter((w) => ADAPTERS[w]), ...Object.keys(ADAPTERS).filter((w) => !order.includes(w))];
+  cfg.workers = workers;
+  cfg.errors = errors;
+  configCache.mtime = mtime;
+  configCache.data = cfg;
+  return cfg;
+}
+
+function getWorker(wid) {
+  const cfg = loadConfig();
+  if (!ADAPTERS[wid]) throw new Error(`Unknown worker "${wid}". Workers: ${Object.keys(ADAPTERS).join(", ")}.`);
+  return new ADAPTERS[wid](cfg.workers[wid]);
+}
+
+function allWorkers() {
+  const cfg = loadConfig();
+  return cfg.order.map((w) => new ADAPTERS[w](cfg.workers[w]));
+}
+
+// The config file with every setting at its default.
+function exampleConfig() {
+  const out = { _comment: "Capocantiere workers. Remove what you don't change; missing keys use the defaults.", ...GLOBAL_DEFAULTS };
+  out.workers = Object.fromEntries(Object.entries(ADAPTERS).map(([wid, cls]) => [wid, mergeSettings(COMMON_DEFAULTS, cls.DEFAULTS)]));
+  return out;
+}
+
+// ================================================================ worker interface
+
+const versionCache = new Map(); // bin -> { at, installed, text }
+
+class Worker {
+  // Subclasses set the statics and implement invocation() and parse().
+  static ID = "";
+  static LABEL = "";
+  static DEFAULTS = {};
+  static QUOTA_RE = /(\b429\b|rate.?limit|quota|too many requests)/i;
+  static WARNING = ""; // shown in `workers` and at session start
+  static OWN_TIMEOUT = false; // true if the CLI enforces the timeout itself (then the server adds a grace minute)
+  static INSTALL_HINT = "";
+
+  constructor(settings) {
+    this.s = settings;
+  }
+  get id() { return this.constructor.ID; }
+  get label() { return this.constructor.LABEL; }
+  get quotaRe() { return this.constructor.QUOTA_RE; }
+  get ownTimeout() { return this.constructor.OWN_TIMEOUT; }
+  get installHint() { return this.constructor.INSTALL_HINT; }
+  get enabled() { return !!this.s.enabled; }
+  get bin() { return this.s.bin || this.id; }
+
+  // { installed, text }: first line of --version. Cached for a minute.
+  async version() {
+    const hit = versionCache.get(this.bin);
+    if (hit && Date.now() - hit.at < 60_000) return hit;
+    const r = await run(this.bin, ["--version"], { timeoutMs: 15_000, extraEnv: this.env() });
+    const v = notFound(r)
+      ? { at: Date.now(), installed: false, text: "not found" }
+      : { at: Date.now(), installed: true, text: (r.stdout || r.stderr).trim().split("\n")[0] || "ok" };
+    versionCache.set(this.bin, v);
+    return v;
+  }
+
+  // [true/false/null, note]. null = cannot be checked without a real call.
+  authStatus() { return [null, "not verifiable without a real call"]; }
+
+  // Problems in the CLI's own setup that the user should fix (shown by `workers`).
+  warnings() { return this.constructor.WARNING ? [this.constructor.WARNING] : []; }
+
+  // A reason why runs would certainly fail (the server then skips this worker), or null.
+  blocker() { return null; }
+
+  env() {
+    return Object.fromEntries(Object.entries(this.s.env || {}).map(([k, v]) => [String(k), String(v)]));
+  }
+
+  // { model, effort, source }. model "" means the CLI's default.
+  async resolveModel(role, requested, effort) {
+    const candidates = [[requested, "requested"], [role === "analyze" ? this.s.analyze_model : null, "config"], [this.s.model, "config"]];
+    for (const [value, src] of candidates) {
+      if (value && value !== "auto") return { model: value, effort: effort || this.s.effort || "", source: src };
+    }
+    return { model: "", effort: effort || this.s.effort || "", source: "CLI default" };
+  }
+
+  timeoutMin(role) { return role === "analyze" ? this.s.analyze_timeout_min : this.s.timeout_min; }
+
+  // spec: role, prompt, cwd, model, effort, timeout_min, auto_approve. Returns { argv, env, input, cleanup, ... }.
+  invocation(spec) { throw new Error("not implemented"); }
+
+  // r is the result of run(). Returns ok/status/response/error/usage/cost/turns/conversation_id/duration.
+  parse(r, spec) { throw new Error("not implemented"); }
+
+  softDenied(r) {
+    return (r.stderr || "").split("\n").filter((l) => /denied|not approved|requires approval|soft-den/i.test(l)).slice(0, 10);
+  }
+
+  // Extra text after a failed run (e.g. a model marked unavailable).
+  failureNote(model, error) { return ""; }
+
+  async modelsLine() {
+    const parts = [];
+    for (const role of ["analyze", "implement"]) {
+      try {
+        const r = await this.resolveModel(role);
+        parts.push(`${role} → ${r.model || "CLI default"}` + (r.source === "CLI default" ? "" : ` (${r.source})`));
+      } catch (e) {
+        parts.push(`${role} → ERROR: ${e.message}`);
+      }
+    }
+    return parts.join("; ");
+  }
+}
+
+// ---------------------------------------------------------------- agy (Antigravity CLI)
+//
+// The model list comes from `agy models`, which only shows what the account can use, so new
+// models are picked up without updating the plugin. Slugs are sorted into capability groups by
+// the rules in model-groups.json.
+
+const MODEL_RULES = JSON.parse(fs.readFileSync(new URL("./model-groups.json", import.meta.url), "utf8"));
+const GROUP_IDS = MODEL_RULES.groups.map((g) => g.id);
+const OTHER_GROUP = { id: "other", description: "Not classified. Never chosen automatically, only when requested by slug or group." };
+const MODELS_FILE = path.join(STATE_DIR, "models.json");
+const MODELS_TTL_MS = 6 * 3600_000;
+const LEVELS = ["low", "medium", "high", "xhigh", "max"];
+const LEVEL_RE = new RegExp(`-(${LEVELS.join("|")})$`);
+const MODEL_ERROR_RE =
+  /not recognized as a known model|model.{0,80}(not available|unavailable|not allowed|not supported|not entitled|permission denied)/i;
+
 // `agy models` prints one "slug<TAB>Display name" line per model.
 function parseModels(stdout) {
   const out = [];
@@ -290,34 +460,6 @@ function parseModels(stdout) {
     if (slug) out.push({ slug, name: line.slice(i + 1).trim() || slug });
   }
   return out;
-}
-
-// The cached model list, re-read from `agy models` when stale. Never throws.
-let modelFetch = null;
-async function modelCache(refresh = false) {
-  const cache = readJson(MODELS_FILE, {});
-  if (!refresh && cache.models?.length && Date.now() - (cache.fetchedAt || 0) <= MODELS_TTL_MS) return cache;
-  if (!modelFetch) {
-    modelFetch = (async () => {
-      const r = await run(CONFIG.agyBin, ["models"], { timeoutMs: 30_000 });
-      const models = r.code === 0 ? parseModels(r.stdout) : [];
-      const current = readJson(MODELS_FILE, {});
-      if (models.length) {
-        // an explicit refresh also forgets models marked unavailable
-        const fresh = { fetchedAt: Date.now(), models, unavailable: refresh ? {} : current.unavailable || {} };
-        writeJson(MODELS_FILE, fresh);
-        return fresh;
-      }
-      return { ...current, fetchError: (r.stderr || r.stdout).trim().slice(0, 500) || "`agy models` failed" };
-    })().finally(() => { modelFetch = null; });
-  }
-  return modelFetch;
-}
-
-function markUnavailable(slug) {
-  const cache = readJson(MODELS_FILE, {});
-  cache.unavailable = { ...(cache.unavailable || {}), [slug]: new Date().toISOString() };
-  writeJson(MODELS_FILE, cache);
 }
 
 const globRe = (p) => new RegExp("^" + p.split("*").map((x) => x.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join(".*") + "$", "i");
@@ -359,126 +501,652 @@ function catalog(cache, settings) {
 
 function groupsHint(cat) {
   const parts = Object.entries(cat.groups).filter(([, ms]) => ms.length).map(([g, ms]) => `${g}: ${ms.map((m) => m.slug).join(", ")}`);
-  return `Available — ${parts.join("; ") || "none"}. See gemini_models.`;
+  return `Available — ${parts.join("; ") || "none"}. See the models tool.`;
 }
 
-// Pick model and effort for a run. role is "analyze" or "implement".
-// Precedence: requested (tool argument) > environment variable > settings > automatic.
-// Each of them may be a slug or a group id; a group follows new models automatically.
-// Returns { model, effort, source }; model "" means agy's default.
-async function resolveModel(role, requested, effort) {
-  const cache = await modelCache();
-  const settings = readJson(SETTINGS_FILE, {});
-  const cat = catalog(cache, settings);
-  const known = new Set((cache.models || []).map((m) => m.slug));
-  const envModel = role === "analyze" ? CONFIG.analyzeModel || CONFIG.model : CONFIG.model;
-  let choice = null;
-  let source = null;
-  for (const [value, src] of [[requested, "requested"], [envModel, "env"], [settings[role], "settings"]]) {
-    if (value && value !== "auto") { choice = value; source = src; break; }
-  }
-  let model;
-  if (choice === null) {
-    model = "";
-    source = "agy default";
-    for (const gid of MODEL_RULES.defaults[role]) {
-      if (cat.groups[gid].length) { model = cat.groups[gid][0].slug; source = `auto, group ${gid}`; break; }
-    }
-  } else if (Object.hasOwn(cat.groups, choice)) {
-    if (!cat.groups[choice].length) throw new Error(`No model available in group "${choice}". ${groupsHint(cat)}`);
-    model = cat.groups[choice][0].slug;
-    source = `${source}, group ${choice}`;
-  } else if (!known.size || known.has(choice)) {
-    model = choice; // list unknown (agy models failed): pass it through and let agy decide
-  } else {
-    throw new Error(`Unknown model "${choice}". ${groupsHint(cat)}`);
+let modelFetch = null;
+
+class AgyWorker extends Worker {
+  static ID = "agy";
+  static LABEL = "Antigravity CLI (Gemini)";
+  static DEFAULTS = {
+    enabled: false,
+    bin: "agy",
+    daily_budget: 150,
+    max_parallel: 3,
+    // How agy authenticates (https://antigravity.google/docs/install.md):
+    //   "api_key": Gemini API key from AI Studio in GEMINI_API_KEY; each run gets
+    //              --settings '{"modelProvider":"gemini"}' (per session, never saved)
+    //   "adc":     Google Cloud Application Default Credentials (AGY_ADC_AUTH=true)
+    //   "login":   the signed-in Google account (consumer subscription): see WARNING
+    auth: "api_key",
+    sandbox: true, // pass --sandbox
+    // Inside the isolated worktree agy may edit files and run commands without asking:
+    // it's the only way to work headless. The main repo stays protected.
+    skip_permissions: true,
+    strengths: ["analysis", "boilerplate", "tests", "docs"],
+  };
+  static QUOTA_RE = /(429|RESOURCE_EXHAUSTED|rate ?limit|quota)/i;
+  static OWN_TIMEOUT = true; // agy stops itself (--print-timeout): the server only kills it after a grace minute
+  static WARNING =
+    "According to the official Antigravity FAQ, running `agy -p` inside third-party agents is not " +
+    "supported on consumer plans and can get the account suspended. Enable this worker only with " +
+    '"auth": "api_key" (a Gemini API key from AI Studio, the default) or "adc" (Google Cloud), never ' +
+    'with "login" on a consumer subscription.';
+  static INSTALL_HINT = "Install Antigravity CLI: https://antigravity.google/docs/cli";
+  static AUTH_MODES = ["api_key", "adc", "login"];
+
+  env() {
+    const e = super.env();
+    if (this.s.auth === "adc" && !("AGY_ADC_AUTH" in e)) e.AGY_ADC_AUTH = "true";
+    return e;
   }
 
-  effort = effort || CONFIG.effort;
-  if (effort && model && LEVEL_RE.test(model)) {
-    // the level is part of the slug and agy rejects --effort with it:
-    // pick the variant of the same model closest to the requested level
-    const base = model.replace(LEVEL_RE, "");
-    const want = LEVELS.indexOf(effort);
-    const variants = LEVELS.filter((lv) => known.has(`${base}-${lv}`));
-    if (want >= 0 && variants.length) {
-      const dist = (lv) => [Math.abs(LEVELS.indexOf(lv) - want), -LEVELS.indexOf(lv)];
-      variants.sort((x, y) => compareRank(dist(x), dist(y)));
-      model = `${base}-${variants[0]}`;
-    }
-    effort = "";
+  blocker() {
+    const auth = this.s.auth;
+    if (!AgyWorker.AUTH_MODES.includes(auth)) return `unknown auth "${auth}" (use ${AgyWorker.AUTH_MODES.join(", ")})`;
+    if (auth === "api_key" && !(env.GEMINI_API_KEY || super.env().GEMINI_API_KEY))
+      return 'auth is "api_key" but GEMINI_API_KEY is not set (export it, or put it under "env" in the config)';
+    return null;
   }
-  return { model, effort, source };
-}
 
-async function modelsReport(cache) {
-  if (!cache.models?.length)
-    return `Could not read the model list (${cache.fetchError || "no output from `agy models`"}). Runs will use agy's default model.`;
-  const settings = readJson(SETTINGS_FILE, {});
-  const cat = catalog(cache, settings);
-  const d = new Date(cache.fetchedAt);
-  const p = (x) => String(x).padStart(2, "0");
-  const when = `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
-  const lines = [`Models this account can use through agy (read ${when}):`];
-  const width = Math.max(...cache.models.map((m) => m.slug.length));
-  for (const g of [...MODEL_RULES.groups, OTHER_GROUP]) {
-    const ms = cat.groups[g.id];
-    if (g === OTHER_GROUP && !ms.length) continue;
-    lines.push("", `${g.id} — ${g.description}`);
-    if (!ms.length) lines.push("    (none available)");
-    ms.forEach((m, i) => lines.push(`  ${i === 0 ? "*" : " "} ${m.slug.padEnd(width)}  ${m.name}`));
+  authStatus() {
+    const problem = this.blocker();
+    if (problem) return [false, problem];
+    if (this.s.auth === "api_key") return [true, "Gemini API key (GEMINI_API_KEY)"];
+    if (this.s.auth === "adc") return [null, "Google Cloud ADC (AGY_ADC_AUTH=true): not verifiable without a real call"];
+    return [null, "signed-in Google account: not verifiable without a real call"];
   }
-  lines.push("", "* = the model used when that group is requested.");
-  if (cat.excluded.length) lines.push(`Excluded by settings: ${cat.excluded.map((m) => m.slug).join(", ")}`);
-  if (Object.keys(cache.unavailable || {}).length)
-    lines.push(`Marked unavailable after failing for this account (a refresh clears this): ${Object.keys(cache.unavailable).sort().join(", ")}`);
-  lines.push("", "In use:");
-  for (const role of ["analyze", "implement"]) {
+
+  warnings() {
+    return !this.enabled || this.s.auth === "login" ? [AgyWorker.WARNING] : [];
+  }
+
+  // -- models
+
+  // The cached model list, re-read from `agy models` when stale. Never throws.
+  async modelCache(refresh = false) {
+    const cache = readJson(MODELS_FILE, {});
+    if (!refresh && cache.models?.length && Date.now() - (cache.fetchedAt || 0) <= MODELS_TTL_MS) return cache;
+    if (!modelFetch) {
+      modelFetch = (async () => {
+        const r = await run(this.bin, ["models"], { timeoutMs: 30_000, extraEnv: this.env() });
+        const models = r.code === 0 ? parseModels(r.stdout) : [];
+        const current = readJson(MODELS_FILE, {});
+        if (models.length) {
+          // an explicit refresh also forgets models marked unavailable
+          const fresh = { fetchedAt: Date.now(), models, unavailable: refresh ? {} : current.unavailable || {} };
+          writeJson(MODELS_FILE, fresh);
+          return fresh;
+        }
+        return { ...current, fetchError: (r.stderr || r.stdout).trim().slice(0, 500) || "`agy models` failed" };
+      })().finally(() => { modelFetch = null; });
+    }
+    return modelFetch;
+  }
+
+  markUnavailable(slug) {
+    const cache = readJson(MODELS_FILE, {});
+    cache.unavailable = { ...(cache.unavailable || {}), [slug]: isoNow() };
+    writeJson(MODELS_FILE, cache);
+  }
+
+  // Precedence: requested (tool argument) > worker config > settings (models tool) > automatic.
+  // Each of them may be a slug or a group id; a group follows new models automatically.
+  async resolveModel(role, requested, effort) {
+    const cache = await this.modelCache();
+    const settings = readJson(SETTINGS_FILE, {});
+    const cat = catalog(cache, settings);
+    const known = new Set((cache.models || []).map((m) => m.slug));
+    const cfgModel = role === "analyze" ? this.s.analyze_model || this.s.model : this.s.model;
+    let choice = null;
+    let source = null;
+    for (const [value, src] of [[requested, "requested"], [cfgModel, "config"], [settings[role], "settings"]]) {
+      if (value && value !== "auto") { choice = value; source = src; break; }
+    }
+    let model;
+    if (choice === null) {
+      model = "";
+      source = "agy default";
+      for (const gid of MODEL_RULES.defaults[role]) {
+        if (cat.groups[gid].length) { model = cat.groups[gid][0].slug; source = `auto, group ${gid}`; break; }
+      }
+    } else if (Object.hasOwn(cat.groups, choice)) {
+      if (!cat.groups[choice].length) throw new Error(`No agy model available in group "${choice}". ${groupsHint(cat)}`);
+      model = cat.groups[choice][0].slug;
+      source = `${source}, group ${choice}`;
+    } else if (!known.size || known.has(choice)) {
+      model = choice; // list unknown (agy models failed): pass it through and let agy decide
+    } else {
+      throw new Error(`Unknown agy model "${choice}". ${groupsHint(cat)}`);
+    }
+
+    effort = effort || this.s.effort || "";
+    if (effort && model && LEVEL_RE.test(model)) {
+      // the level is part of the slug and agy rejects --effort with it:
+      // pick the variant of the same model closest to the requested level
+      const base = model.replace(LEVEL_RE, "");
+      const want = LEVELS.indexOf(effort);
+      const variants = LEVELS.filter((lv) => known.has(`${base}-${lv}`));
+      if (want >= 0 && variants.length) {
+        const dist = (lv) => [Math.abs(LEVELS.indexOf(lv) - want), -LEVELS.indexOf(lv)];
+        variants.sort((x, y) => compareRank(dist(x), dist(y)));
+        model = `${base}-${variants[0]}`;
+      }
+      effort = "";
+    }
+    return { model, effort, source };
+  }
+
+  async modelsReport(refresh = false) {
+    const cache = await this.modelCache(refresh);
+    if (!cache.models?.length)
+      return `Could not read the agy model list (${cache.fetchError || "no output from `agy models`"}). Runs will use agy's default model.`;
+    const settings = readJson(SETTINGS_FILE, {});
+    const cat = catalog(cache, settings);
+    const d = new Date(cache.fetchedAt);
+    const when = `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+    const lines = [`Models this account can use through agy (read ${when}):`];
+    const width = Math.max(...cache.models.map((m) => m.slug.length));
+    for (const g of [...MODEL_RULES.groups, OTHER_GROUP]) {
+      const ms = cat.groups[g.id];
+      if (g === OTHER_GROUP && !ms.length) continue;
+      lines.push("", `${g.id} — ${g.description}`);
+      if (!ms.length) lines.push("    (none available)");
+      ms.forEach((m, i) => lines.push(`  ${i === 0 ? "*" : " "} ${m.slug.padEnd(width)}  ${m.name}`));
+    }
+    lines.push("", "* = the model used when that group is requested.");
+    if (cat.excluded.length) lines.push(`Excluded by settings: ${cat.excluded.map((m) => m.slug).join(", ")}`);
+    if (Object.keys(cache.unavailable || {}).length)
+      lines.push(`Marked unavailable after failing for this account (a refresh clears this): ${Object.keys(cache.unavailable).sort().join(", ")}`);
+    lines.push("", `In use: ${await this.modelsLine()}`);
+    lines.push(`Settings file: ${SETTINGS_FILE} (exclude: ${(settings.exclude || []).join(", ") || "none"})`);
+    return lines.join("\n");
+  }
+
+  async updateModelSettings(a) {
+    const settings = readJson(SETTINGS_FILE, {});
+    const known = new Set(((await this.modelCache()).models || []).map((m) => m.slug));
+    for (const role of ["analyze", "implement"]) {
+      if (!(role in a)) continue;
+      const v = (a[role] || "").trim();
+      if (!v || v === "auto") delete settings[role];
+      else if (GROUP_IDS.includes(v) || v === "other" || !known.size || known.has(v)) settings[role] = v;
+      else throw new Error(`Unknown model or group "${v}". Groups: ${[...GROUP_IDS, "other"].join(", ")}.`);
+    }
+    if ("exclude" in a) settings.exclude = (a.exclude || []).map(String).filter((x) => x.trim());
+    writeJson(SETTINGS_FILE, settings);
+  }
+
+  // If agy rejected the model for this account, remember it so the next runs pick another.
+  failureNote(model, error) {
+    if (!model || !MODEL_ERROR_RE.test(error || "")) return "";
+    this.markUnavailable(model);
+    return `\nModel ${model} has been marked unavailable; the next runs will pick another one (models refresh=true clears this).`;
+  }
+
+  // -- runs
+
+  invocation(spec) {
+    const a = ["-p", spec.prompt, "--output-format", "json"];
+    if (this.s.auth === "api_key") a.push("--settings", JSON.stringify({ modelProvider: "gemini" }));
+    if (spec.model) a.push("--model", spec.model);
+    if (spec.effort) a.push("--effort", spec.effort);
+    if (spec.timeout_min) a.push("--print-timeout", `${spec.timeout_min}m`);
+    if (spec.auto_approve && this.s.skip_permissions) a.push("--dangerously-skip-permissions");
+    if (this.s.sandbox) a.push("--sandbox");
+    return { argv: [...a, ...(this.s.extra_args || [])], env: this.env(), input: null };
+  }
+
+  static envelope(stdout) {
+    for (const l of stdout.trim().split("\n").reverse()) {
+      const t = l.trim();
+      if (!t.startsWith("{")) continue;
+      try {
+        const v = JSON.parse(t);
+        if (v && typeof v === "object" && !Array.isArray(v)) return v;
+      } catch {}
+    }
     try {
-      const r = await resolveModel(role);
-      lines.push(`  ${role.padEnd(9)} → ${r.model || "agy default"} (${r.source})`);
-    } catch (e) {
-      lines.push(`  ${role.padEnd(9)} → ERROR: ${e.message}`);
+      const v = JSON.parse(stdout);
+      return v && typeof v === "object" && !Array.isArray(v) ? v : null;
+    } catch {
+      return null;
     }
   }
-  lines.push(`Settings file: ${SETTINGS_FILE} (exclude: ${(settings.exclude || []).join(", ") || "none"})`);
-  return lines.join("\n");
+
+  parse(r, spec) {
+    const envl = AgyWorker.envelope(r.stdout) || {};
+    const hasEnvl = Object.keys(envl).length > 0;
+    const status = envl.status || (r.code === 0 ? "SUCCESS" : "ERROR");
+    const ok = r.code === 0 && status === "SUCCESS" && !r.timedOut;
+    let response = envl.response;
+    if (response === undefined || response === null) response = hasEnvl ? "" : r.stdout.trim();
+    return {
+      ok,
+      status,
+      response,
+      error: envl.error ? String(envl.error) : "",
+      usage: envl.usage || null,
+      turns: envl.num_turns || 0,
+      conversation_id: envl.conversation_id || null,
+      duration: envl.duration_seconds ?? null,
+    };
+  }
 }
 
-async function modelsInUse() {
-  const parts = [];
-  for (const role of ["analyze", "implement"]) {
+// ---------------------------------------------------------------- copilot (GitHub Copilot CLI)
+//
+// Flags checked against `copilot --help` of GitHub Copilot CLI 1.0.114:
+//   -p <prompt>                 non-interactive run; tool requests that would prompt are denied
+//   -s                          print only the agent's response
+//   --allow-all-tools           auto-approve tools; WITHOUT --allow-all-paths file access stays
+//                               limited to the working directory (and the temp dir)
+//   --deny-tool <rule>          wins over every allow
+//   --usage-output-file <file>  final usage as JSON (totalNanoAiu, totalPremiumRequestCost, ...)
+// An untrusted folder in -p mode only skips its MCP servers and repo hooks, so worktrees need no trust
+// (and not trusting them keeps a repo's hooks from running).
+
+class CopilotWorker extends Worker {
+  static ID = "copilot";
+  static LABEL = "GitHub Copilot CLI";
+  static DEFAULTS = {
+    bin: "copilot",
+    daily_budget: 40,
+    max_parallel: 2,
+    // Rules always denied while auto-approving in the worktree (shell commands are not limited to the
+    // working directory by path checks, so the dangerous ones are named here).
+    deny_tools: ["shell(git push)", "shell(git remote)", "shell(git config)", "shell(git worktree)",
+      "shell(git branch)", "shell(git checkout)", "shell(git switch)", "shell(git reset)",
+      "shell(git rebase)", "shell(gh)", "shell(sudo)"],
+    disable_builtin_mcps: true, // the GitHub MCP server could act on the user's GitHub account
+    sandbox: false, // --sandbox: OS-level sandbox for shell commands (Linux: needs bwrap, slirp4netns, ...)
+    max_ai_credits: 0, // --max-ai-credits per run; 0 = no limit
+    // Hide other workers' secrets from the agent's shell commands.
+    secret_env_vars: ["MISTRAL_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY"],
+    strengths: ["tests", "boilerplate", "refactor", "docs"],
+  };
+  static QUOTA_RE =
+    /(quota|rate.?limit|\b429\b|too many requests|100% used|premium requests?.{0,40}(limit|exhausted|exceeded)|exceeded.{0,40}(limit|credits|allowance)|out of (ai )?credits)/i;
+  static INSTALL_HINT = "Install GitHub Copilot CLI (https://docs.github.com/copilot/how-tos/copilot-cli) and run `copilot login`.";
+
+  authStatus() {
+    for (const v of ["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"]) {
+      if (env[v] || this.env()[v]) return [true, `token in ${v}`];
+    }
+    const home = env.COPILOT_HOME || path.join(os.homedir(), ".copilot");
+    let text;
     try {
-      const r = await resolveModel(role);
-      parts.push(`${role} → ${r.model || "agy default"} (${r.source})`);
-    } catch (e) {
-      parts.push(`${role} → ERROR: ${e.message}`);
+      text = fs.readFileSync(path.join(home, "config.json"), "utf8"); // JSON with // comments: look for the key, never read the values
+    } catch {
+      return [false, `no ${home}/config.json: run \`copilot login\``];
+    }
+    if (/"lastLoggedInUser"\s*:\s*\{/.test(text)) return [true, `logged in, per ${home}/config.json`];
+    return [false, "run `copilot login`"];
+  }
+
+  invocation(spec) {
+    const tmp = tmpDir("capocantiere-copilot-");
+    const usageFile = path.join(tmp, "usage.json");
+    const a = ["-p", spec.prompt, "-s", "--no-ask-user", "--no-auto-update", "--no-color", "--usage-output-file", usageFile];
+    if (spec.model) a.push("--model", spec.model);
+    if (spec.effort) a.push("--reasoning-effort", spec.effort);
+    if (this.s.disable_builtin_mcps) a.push("--disable-builtin-mcps");
+    if (this.s.max_ai_credits) a.push("--max-ai-credits", String(this.s.max_ai_credits));
+    if (this.s.secret_env_vars?.length) a.push("--secret-env-vars=" + this.s.secret_env_vars.join(","));
+    if (spec.auto_approve) {
+      // isolated worktree: approve tools, keep the path check, deny the dangerous commands
+      a.push("--allow-all-tools");
+      for (const rule of this.s.deny_tools || []) a.push("--deny-tool", rule);
+      if (this.s.sandbox) a.push("--sandbox");
+    } else {
+      // analysis in the main repo: nothing is approved (read-only commands run anyway) and edits are denied
+      a.push("--deny-tool", "write");
+    }
+    return { argv: [...a, ...(this.s.extra_args || [])], env: this.env(), input: null, cleanup: [tmp], usage_file: usageFile };
+  }
+
+  parse(r, spec) {
+    let usage = null;
+    let cost = null;
+    try {
+      const u = JSON.parse(fs.readFileSync(spec.usage_file, "utf8"));
+      const inp = sumKeys(u.modelMetrics, /^input.?tokens$/i);
+      const out = sumKeys(u.modelMetrics, /^output.?tokens$/i);
+      usage = { input_tokens: inp, output_tokens: out, total_tokens: inp + out, premium_requests: u.totalPremiumRequestCost ?? null };
+      if (u.totalNanoAiu) cost = Math.round((u.totalNanoAiu / 1e9) * 10000) / 10000; // AI credits
+    } catch {}
+    const response = r.stdout.trim();
+    const ok = r.code === 0 && !r.timedOut;
+    return {
+      ok,
+      status: ok ? "SUCCESS" : `ERROR (exit ${r.code})`,
+      response,
+      error: ok ? "" : r.stderr.trim().slice(-1500) || response.slice(-1500),
+      usage,
+      cost,
+      turns: 0,
+      conversation_id: null,
+      duration: null,
+    };
+  }
+}
+
+// ---------------------------------------------------------------- vibe (Mistral Vibe CLI)
+//
+// Flags checked against `vibe --help`, `vibe config schema` and the source of vibe 3.1.3:
+//   --prompt-file <f>           headless run with the prompt read from a file (no argv length limit)
+//   --output json               the messages, as JSON, at the end of the run
+//   --output-dir <dir>          writes export.json (token usage, cost, stop reason, outcome) on every exit
+//   --workdir, --max-turns, --max-price (USD), --max-tokens, --time-limit <s> (exit 3 when reached)
+//   --model <alias>, --thinking <level>          headless mode only, not saved
+//   --auto-approve              approve every tool call (the auto-approve agent)
+//   --enabled-tools <t>         repeatable; in headless mode it disables every other tool
+// Without --auto-approve the default agent is "accept-edits", which still edits files: analyses therefore
+// run with read-only tools only. Paths outside the working directory follow `outside_workdir` in
+// ~/.vibe/config.toml ("ask" by default, which --auto-approve approves): "deny" is recommended.
+// An untrusted working directory is still usable; --trust only makes vibe load the repo's AGENTS.md and
+// project config. Exit codes: 0 finished, 1 usage/config error, 2 infrastructure failure (the model API
+// after its retries: HTTP 429 = rate limit, 402 = the account has no credit left), 3 stopped on a limit
+// (turn_limit, token_limit, price_limit, deadline, ...). export.json: outcome, stop_reason,
+// error {message, code}, usage {input_tokens, output_tokens, ...}, cost_usd.
+// The cost is computed from the prices in the config, so --max-price is only an extra guard: the real
+// budget is the number of runs per worker.
+
+class VibeWorker extends Worker {
+  static ID = "vibe";
+  static LABEL = "Mistral Vibe CLI";
+  static DEFAULTS = {
+    bin: "vibe",
+    daily_budget: 60,
+    max_parallel: 2,
+    max_turns: 40,
+    max_price: 0.5, // USD cap per run (--max-price); 0 = no cap
+    max_tokens: 0, // prompt + completion tokens cap per run (--max-tokens); 0 = no cap
+    trust: true, // --trust: trust the worktree for this run only (loads the repo's AGENTS.md and Vibe config)
+    analyze_tools: ["read_file", "grep"], // the only tools enabled for analyses
+    disabled_tools: [], // tools disabled in implementation runs (--disabled-tools)
+    strengths: ["analysis", "docs", "boilerplate", "tests"],
+  };
+  // The per-run caps (--max-price, --max-tokens) are not quota errors: a fallback would not help.
+  static QUOTA_RE =
+    /(\b429\b|\b402\b|rate.?limit|quota|too many requests|payment required|usage.?limit|no credits?( left)?|credits?.{0,20}(exhausted|left)|capacity exceeded|requests? limit)/i;
+  static OWN_TIMEOUT = true; // --time-limit
+  static INSTALL_HINT = "Install Mistral Vibe (`uv tool install mistral-vibe`) and log in (run `vibe` once) or set MISTRAL_API_KEY.";
+
+  static home() {
+    return env.VIBE_HOME || path.join(os.homedir(), ".vibe");
+  }
+
+  authStatus() {
+    if (env.MISTRAL_API_KEY || this.env().MISTRAL_API_KEY) return [true, "MISTRAL_API_KEY set"];
+    try {
+      const text = fs.readFileSync(path.join(VibeWorker.home(), ".env"), "utf8");
+      if (/^\s*(export\s+)?MISTRAL_API_KEY\s*=\s*\S/m.test(text)) return [true, `MISTRAL_API_KEY in ${VibeWorker.home()}/.env`];
+    } catch {}
+    // Signed in with a Mistral account (browser login): vibe caches the account's plan here.
+    try {
+      const m = fs.readFileSync(path.join(VibeWorker.home(), "whoami_cache.json"), "utf8").match(/"plan_name"\s*:\s*"([^"]*)"/);
+      if (m) return [true, `Mistral account, plan ${m[1]} (per ${VibeWorker.home()}/whoami_cache.json)`];
+    } catch {}
+    return [false, "not signed in: run `vibe` once to log in with your Mistral account, or set MISTRAL_API_KEY"];
+  }
+
+  warnings() {
+    let text = "";
+    try { text = fs.readFileSync(path.join(VibeWorker.home(), "config.toml"), "utf8"); } catch {}
+    const out = [];
+    if (!/^\s*outside_workdir\s*=\s*"deny"/m.test(text))
+      out.push(`${VibeWorker.home()}/config.toml does not set outside_workdir = "deny": with auto-approve, vibe may touch files ` +
+        "outside the job's worktree. Add that line (it also applies to your interactive sessions).");
+    if (/^\s*auto_worktree\s*=\s*true/m.test(text))
+      out.push(`${VibeWorker.home()}/config.toml sets auto_worktree = true: vibe would edit its own worktree instead of the ` +
+        "job's, and every job would end with no changes. Set it to false.");
+    return out;
+  }
+
+  invocation(spec) {
+    const tmp = tmpDir("capocantiere-vibe-");
+    const promptFile = path.join(tmp, "prompt.md");
+    fs.writeFileSync(promptFile, spec.prompt);
+    const outDir = path.join(tmp, "out");
+    const a = ["--prompt-file", promptFile, "--output", "json", "--output-dir", outDir, "--workdir", spec.cwd,
+      "--max-turns", String(this.s.max_turns)];
+    if (this.s.max_price) a.push("--max-price", String(this.s.max_price));
+    if (this.s.max_tokens) a.push("--max-tokens", String(this.s.max_tokens));
+    if (spec.timeout_min) a.push("--time-limit", String(Math.max(1, Math.round(spec.timeout_min * 60))));
+    if (spec.model) a.push("--model", spec.model);
+    if (spec.effort) a.push("--thinking", spec.effort);
+    if (this.s.trust) a.push("--trust");
+    if (spec.auto_approve) {
+      a.push("--auto-approve");
+      for (const t of this.s.disabled_tools || []) a.push("--disabled-tools", t);
+    } else {
+      for (const t of this.s.analyze_tools?.length ? this.s.analyze_tools : ["read_file"]) a.push("--enabled-tools", t);
+    }
+    return { argv: [...a, ...(this.s.extra_args || [])], env: this.env(), input: null, cleanup: [tmp],
+      export_file: path.join(outDir, "export.json") };
+  }
+
+  static messages(stdout) {
+    let v;
+    try { v = JSON.parse(stdout); } catch { return null; }
+    if (v && typeof v === "object" && !Array.isArray(v)) v = v.messages;
+    return Array.isArray(v) ? v : null;
+  }
+
+  static text(content) {
+    if (typeof content === "string") return content;
+    if (Array.isArray(content)) return content.map((p) => (p && typeof p === "object" ? p.text || "" : String(p))).join("\n").trim();
+    return "";
+  }
+
+  // { outcome, stop, error, usage, cost } from export.json (see the header comment).
+  static exportInfo(file) {
+    const none = { outcome: "", stop: "", error: "", usage: null, cost: null };
+    let e;
+    try { e = JSON.parse(fs.readFileSync(file, "utf8")); } catch { return none; }
+    if (!e || typeof e !== "object" || Array.isArray(e)) return none;
+    const u = e.usage && typeof e.usage === "object" ? e.usage : null;
+    const inp = u?.input_tokens || 0;
+    const out = u?.output_tokens || 0;
+    const usage = u ? { input_tokens: inp, output_tokens: out, total_tokens: u.total_tokens || inp + out } : null;
+    const err = e.error && typeof e.error === "object" ? e.error : {};
+    const error = [err.code, err.message].filter(Boolean).map(String).join(" ");
+    return { outcome: String(e.outcome || ""), stop: String(e.stop_reason || ""), error, usage,
+      cost: typeof e.cost_usd === "number" ? e.cost_usd : null };
+  }
+
+  parse(r, spec) {
+    const messages = VibeWorker.messages(r.stdout);
+    let response = "";
+    let turns = 0;
+    for (const m of messages || []) {
+      if (m && typeof m === "object" && m.role === "assistant") {
+        turns++;
+        const t = VibeWorker.text(m.content);
+        if (t) response = t;
+      }
+    }
+    if (messages === null) response = r.stdout.trim();
+    const x = VibeWorker.exportInfo(spec.export_file);
+    const ok = r.code === 0 && !r.timedOut && messages !== null;
+    let status, error;
+    if (ok) {
+      status = "SUCCESS";
+      error = "";
+    } else if (r.code === 3) {
+      // stopped on a limit: the work left so far is still collected
+      status = x.outcome === "deadline" ? "TIME_LIMIT" : (x.outcome || "LIMIT").toUpperCase();
+      error = x.outcome === "deadline" ? "time limit reached (vibe --time-limit)" : `vibe stopped on a limit: ${x.outcome || "unknown"}`;
+    } else {
+      status = `${(x.outcome || "ERROR").toUpperCase()} (exit ${r.code})`;
+      error = [x.error, r.stderr.trim().slice(-1500)].filter(Boolean).join("\n") ||
+        (r.code === 0 ? "unexpected output (no JSON messages)" : "");
+    }
+    if (!ok && (x.outcome || x.stop)) error += `\noutcome: ${x.outcome || "?"}${x.stop ? " / stop reason: " + x.stop : ""}`;
+    return { ok, status, response, error: error.trim(), usage: x.usage, cost: x.cost, turns, conversation_id: null, duration: null };
+  }
+}
+
+// Registry. The preference order comes from the config ("order").
+const ADAPTERS = { copilot: CopilotWorker, vibe: VibeWorker, agy: AgyWorker };
+
+// ================================================================ server (server.py)
+
+// The worker chosen with `workers use=...` (/capocantiere:use). One server process = one Claude session.
+const SESSION = { default: null };
+
+// ---------------------------------------------------------------- usage / budget (per worker)
+
+function recordUsage(entry) {
+  const clean = Object.fromEntries(Object.entries(entry).filter(([k, v]) => k === "usage" || (v !== null && v !== undefined)));
+  fs.appendFileSync(USAGE_FILE, JSON.stringify({ ts: Date.now(), ...clean }) + "\n");
+}
+
+const emptyUsage = () => ({ runs: 0, turns: 0, input_tokens: 0, output_tokens: 0, total_tokens: 0, failures: 0, quota_errors: 0, cost: 0 });
+
+// { worker id: totals } over the last `hours`. Entries written before workers existed count as agy.
+function usageByWorker(hours = 24) {
+  const since = Date.now() - hours * 3600_000;
+  const out = {};
+  if (!fs.existsSync(USAGE_FILE)) return out;
+  for (const line of fs.readFileSync(USAGE_FILE, "utf8").split("\n")) {
+    if (!line.trim()) continue;
+    let e;
+    try { e = JSON.parse(line); } catch { continue; }
+    if (!e || typeof e !== "object" || (e.ts || 0) < since) continue;
+    const u = e.usage || {};
+    const o = (out[e.worker || "agy"] ??= emptyUsage());
+    o.runs++;
+    o.turns += e.turns || 0;
+    for (const k of ["input_tokens", "output_tokens", "total_tokens"]) o[k] += u[k] || 0;
+    o.cost += e.cost || 0;
+    if (!e.ok) o.failures++;
+    if (e.quota) o.quota_errors++;
+  }
+  return out;
+}
+
+function activeJobs(workerId = null, statuses = ["running", "queued"]) {
+  return [...jobs.values()].filter((j) => statuses.includes(j.status) && (workerId === null || j.worker === workerId));
+}
+
+function budgetState(w, usage) {
+  const u = (usage ?? usageByWorker(24))[w.id] || emptyUsage();
+  const committed = u.runs + activeJobs(w.id).length; // includes jobs still running or queued
+  return { usage: u, committed, budget: w.s.daily_budget, left: Math.max(w.s.daily_budget - committed, 0) };
+}
+
+// ---------------------------------------------------------------- choosing a worker
+
+function candidateOrder(requested, fallback) {
+  const order = loadConfig().order;
+  const first = requested || SESSION.default;
+  if (!first) return order;
+  const rest = order.filter((w) => w !== first);
+  // an explicit request without fallback means exactly that worker
+  return [first, ...(fallback ? rest : [])];
+}
+
+// Choose the worker for a run. Returns { worker, notes }. Throws if none is usable.
+// Skips workers that are disabled, not installed, unusable or out of budget (unless force).
+async function pickWorker(requested, force, fallback, exclude = []) {
+  const cfg = loadConfig();
+  if (requested && !ADAPTERS[requested])
+    throw new Error(`Unknown worker "${requested}". Workers: ${Object.keys(ADAPTERS).join(", ")}.`);
+  fallback = fallback === undefined || fallback === null ? cfg.fallback : fallback;
+  const usage = usageByWorker(24);
+  const notes = [];
+  for (const wid of candidateOrder(requested, fallback)) {
+    if (exclude.includes(wid)) continue;
+    const w = getWorker(wid);
+    if (!w.enabled) {
+      if (wid === requested || wid === SESSION.default) notes.push(`${wid} is disabled in ${CONFIG_FILE}.`);
+      continue;
+    }
+    if (!(await w.version()).installed) {
+      notes.push(`${wid} skipped: command "${w.bin}" not found.`);
+      continue;
+    }
+    const problem = w.blocker();
+    if (problem) {
+      notes.push(`${wid} skipped: ${problem}.`);
+      continue;
+    }
+    const b = budgetState(w, usage);
+    if (b.left <= 0 && !force) {
+      notes.push(`${wid} skipped: daily budget used up (${b.committed}/${b.budget} runs in 24h, including active jobs).`);
+      continue;
+    }
+    return { worker: w, notes };
+  }
+  throw new Error(
+    `No worker available. ${notes.join(" ") || "All workers are disabled."} Do the work yourself, or retry with force=true if only the budget ` +
+      "is the problem. See the workers tool."
+  );
+}
+
+// ---------------------------------------------------------------- running a worker
+
+async function runWorker(w, role, prompt, cwd, model, effort, timeoutMin, autoApprove, jobId = null, onSpawn = null) {
+  const spec = { role, prompt, cwd, model, effort, timeout_min: timeoutMin, auto_approve: autoApprove };
+  const inv = w.invocation(spec);
+  for (const [k, v] of Object.entries(inv)) if (!["argv", "env", "input", "cleanup"].includes(k)) spec[k] = v;
+  const started = Date.now();
+  let r, nf, p;
+  try {
+    r = await run(w.bin, inv.argv, {
+      cwd,
+      input: inv.input,
+      timeoutMs: Math.round((timeoutMin + (w.ownTimeout ? 1 : 0)) * 60_000),
+      onSpawn,
+      extraEnv: inv.env,
+    });
+    nf = notFound(r);
+    p = nf ? { ok: false, status: "NOT_FOUND", response: "", error: "" } : w.parse(r, spec);
+  } finally {
+    for (const f of inv.cleanup || []) {
+      try { fs.rmSync(f, { recursive: true, force: true }); } catch {}
     }
   }
-  return parts.join("; ");
+  const ok = !!p.ok && !nf && !r.timedOut;
+  const errText = [p.error, r.timedOut ? `timed out after ${timeoutMin} min` : "", ok ? "" : tail(r.stderr, 1500)]
+    .filter(Boolean)
+    .join("\n");
+  const quota = !ok && (w.quotaRe.test(errText) || (!p.response && w.quotaRe.test(r.stdout || "")));
+  const seconds = Math.round((Date.now() - started) / 1000);
+  recordUsage({
+    worker: w.id,
+    kind: role,
+    job: jobId,
+    model: model || null,
+    ok,
+    quota,
+    turns: p.turns || 0,
+    usage: p.usage || null,
+    cost: p.cost || null,
+    seconds,
+  });
+  return {
+    ok,
+    notFound: nf,
+    timedOut: r.timedOut,
+    quota,
+    status: p.status || (ok ? "SUCCESS" : "ERROR"),
+    response: p.response || "",
+    error: errText,
+    conversationId: p.conversation_id ?? null,
+    turns: p.turns || 0,
+    usage: p.usage ?? null,
+    cost: p.cost ?? null,
+    durationSeconds: p.duration ?? seconds,
+    softDenied: w.softDenied(r),
+    stderrTail: tail(r.stderr, 3000),
+  };
 }
 
-async function updateModelSettings(a) {
-  const settings = readJson(SETTINGS_FILE, {});
-  const cache = await modelCache();
-  const known = new Set((cache.models || []).map((m) => m.slug));
-  for (const role of ["analyze", "implement"]) {
-    if (!(role in a)) continue;
-    const v = (a[role] || "").trim();
-    if (!v || v === "auto") delete settings[role];
-    else if (GROUP_IDS.includes(v) || v === "other" || !known.size || known.has(v)) settings[role] = v;
-    else throw new Error(`Unknown model or group "${v}". Groups: ${[...GROUP_IDS, "other"].join(", ")}.`);
-  }
-  if ("exclude" in a) settings.exclude = (a.exclude || []).map(String).filter((x) => x.trim());
-  writeJson(SETTINGS_FILE, settings);
-}
-
-// If agy rejected the model for this account, remember it so the next runs pick another.
-function unavailableNote(model, error) {
-  if (!model || !MODEL_ERROR_RE.test(error || "")) return "";
-  markUnavailable(model);
-  return `\nModel ${model} has been marked unavailable; the next runs will pick another one (gemini_models refresh=true clears this).`;
-}
+const notFoundMsg = (w) => `Command "${w.bin}" not found for worker ${w.id}. ${w.installHint}`;
 
 // ---------------------------------------------------------------- delegation mode
 //
@@ -501,7 +1169,7 @@ function delegationMode(repo) {
 function ensureEnabled(repo) {
   const { mode, source } = delegationMode(repo);
   if (mode === "off")
-    throw new Error(`Gemini delegation is off (${source}). Do the work without Gemini; the user can change this with /capocantiere:mode.`);
+    throw new Error(`Delegation is off (${source}). Do the work without workers; the user can change this with /capocantiere:mode.`);
 }
 
 function modeLine(repo) {
@@ -543,10 +1211,6 @@ function modeReport(repo) {
   return lines.join("\n");
 }
 
-async function currentRepo() {
-  try { return await repoRoot(); } catch { return null; }
-}
-
 // ---------------------------------------------------------------- prompts
 
 function implementPrompt({ task, files, context, acceptance, testCommand }) {
@@ -557,6 +1221,7 @@ function implementPrompt({ task, files, context, acceptance, testCommand }) {
     "- Do ONLY what the task asks. No unrequested refactors, no new dependencies unless explicitly requested.",
     "- Follow the style and conventions of the existing code.",
     "- Write code comments and documentation in the language already used in the repository.",
+    "- Stay inside this folder: do not read or modify files outside it.",
     "- Before finishing, delete any temporary files or build artifacts you created that are not part of the task (e.g. __pycache__, .pytest_cache, coverage reports).",
     "- If something is ambiguous, choose the most conservative interpretation and flag it in NOTES.",
     testCommand
@@ -602,14 +1267,16 @@ const queue = [];
 
 const jobFile = (id) => path.join(JOBS_DIR, `${id}.json`);
 function saveJob(job) {
-  job.updatedAt = new Date().toISOString();
-  fs.writeFileSync(jobFile(job.id), JSON.stringify(job, null, 2));
+  job.updatedAt = isoNow();
+  writeJson(jobFile(job.id), job);
 }
+
 function loadJobs() {
   for (const f of fs.readdirSync(JOBS_DIR)) {
     if (!f.endsWith(".json")) continue;
     try {
       const j = JSON.parse(fs.readFileSync(path.join(JOBS_DIR, f), "utf8"));
+      if (!j.worker) j.worker = "agy";
       if (j.status === "running" || j.status === "queued") {
         // the previous server died while the job was active
         j.status = "interrupted";
@@ -620,41 +1287,48 @@ function loadJobs() {
     } catch {}
   }
 }
-loadJobs();
 
-function runningCount() {
-  return [...jobs.values()].filter((j) => j.status === "running").length;
-}
-
+// Start queued jobs while there are free slots, globally and for each job's worker.
 function pump() {
-  while (queue.length && runningCount() < CONFIG.maxParallel) {
-    const id = queue.shift();
+  const cfg = loadConfig();
+  for (const id of [...queue]) {
+    if (activeJobs(null, ["running"]).length >= cfg.max_parallel) break;
     const job = jobs.get(id);
-    if (!job || job.status !== "queued") continue;
-    executeJob(job).catch((e) => {
-      job.status = "failed";
-      job.error = String(e?.message || e);
-      saveJob(job);
-    }).finally(pump);
+    if (!job || job.status !== "queued") {
+      queue.splice(queue.indexOf(id), 1);
+      continue;
+    }
+    const limit = cfg.workers[job.worker]?.max_parallel ?? 1;
+    if (activeJobs(job.worker, ["running"]).length >= limit) continue; // this worker is full; a job for another worker may still start
+    queue.splice(queue.indexOf(id), 1);
+    job.status = "running";
+    job.startedAt = isoNow();
+    saveJob(job);
+    executeJob(job)
+      .catch((e) => {
+        job.status = "failed";
+        job.error = String(e?.message || e);
+        saveJob(job);
+      })
+      .finally(pump);
   }
 }
 
 async function createJob(args) {
   const repo = await repoRoot(args.repo_dir);
   ensureEnabled(repo);
-  const usage = budgetCheck(args.force);
-  const resolved = await resolveModel("implement", args.model, args.effort);
+  const { worker: w, notes } = await pickWorker(args.worker, args.force, args.fallback);
+  const resolved = await w.resolveModel("implement", args.model, args.effort);
   const id = newId();
-  const branch = `gemini/${id}`;
-  const worktree = path.join(CONFIG.worktreeDir, `${path.basename(repo)}-${id}`);
+  const branch = `capocantiere/${id}`;
+  const worktree = path.join(WORKTREE_DIR, `${path.basename(repo)}-${id}`);
 
   const { base, baseLabel } = await withGitLock(async () => {
-    const head = (await git(repo, "rev-parse", "HEAD")).trim();
-    let b = head;
+    let b = (await git(repo, "rev-parse", "HEAD")).trim();
     let label = "HEAD";
     if (args.include_uncommitted !== false) {
       // `git stash create` makes a commit of the uncommitted changes WITHOUT touching the working tree
-      const s = (await git(repo, "stash", "create", `gemini-delegate base ${id}`)).trim();
+      const s = (await git(repo, "stash", "create", `capocantiere base ${id}`)).trim();
       if (s) { b = s; label = "HEAD + uncommitted changes"; }
     }
     await git(repo, "worktree", "add", "-q", "-b", branch, worktree, b);
@@ -675,62 +1349,86 @@ async function createJob(args) {
     context: args.context || "",
     acceptance: args.acceptance || "",
     testCommand: args.test_command || "",
+    worker: w.id,
+    requestedWorker: args.worker || null,
+    requestedModel: args.model || null,
+    requestedEffort: args.effort || null,
+    fallback: args.fallback === undefined || args.fallback === null ? loadConfig().fallback : !!args.fallback,
+    force: !!args.force,
     model: resolved.model,
     modelSource: resolved.source,
     effort: resolved.effort,
-    timeoutMin: args.timeout_minutes || CONFIG.taskTimeoutMin,
-    createdAt: new Date().toISOString(),
+    timeoutMin: args.timeout_minutes || w.timeoutMin("implement"),
+    notes,
+    attempts: [],
+    createdAt: isoNow(),
   };
   jobs.set(id, job);
   saveJob(job);
   queue.push(id);
   pump();
-  return { job, usage };
+  return job;
+}
+
+// Throw away a failed attempt's edits before the next worker starts.
+async function resetWorktree(job) {
+  await git(job.worktree, "reset", "-q", "--hard", "HEAD");
+  await git(job.worktree, "clean", "-qfd");
 }
 
 async function executeJob(job) {
-  job.status = "running";
-  job.startedAt = new Date().toISOString();
-  saveJob(job);
-
-  const prompt = implementPrompt(job);
-  const res = await runAgy({
-    cwd: job.worktree,
-    prompt,
-    model: job.model,
-    effort: job.effort,
-    timeoutMin: job.timeoutMin,
-    skipPermissions: CONFIG.skipPermissionsInWorktree,
-    kind: "implement",
-    jobId: job.id,
-    onSpawn: (c) => children.set(job.id, c),
-  });
-  children.delete(job.id);
-  if (job.status === "discarded") return; // discarded while running
+  let w, res;
+  while (true) {
+    w = getWorker(job.worker);
+    res = await runWorker(w, "implement", implementPrompt(job), job.worktree, job.model, job.effort, job.timeoutMin,
+      true, job.id, (c) => children.set(job.id, c));
+    children.delete(job.id);
+    if (job.status === "discarded") return; // discarded while running
+    if (res.ok || !res.quota || !job.fallback) break;
+    // quota / rate limit: move on to the next worker, if any is usable
+    let next;
+    try {
+      next = await pickWorker(null, job.force, true, [...job.attempts.map((a) => a.worker), w.id]);
+    } catch {
+      break;
+    }
+    job.attempts.push({ worker: w.id, model: job.model, status: res.status, quota: true, error: truncate(res.error, 1000), at: isoNow() });
+    job.notes = [...(job.notes || []), ...next.notes, `${w.id} hit a quota/rate limit: relaunched on ${next.worker.id}.`];
+    await resetWorktree(job);
+    job.worker = next.worker.id;
+    // a model name rarely means the same on another CLI
+    const resolved = await next.worker.resolveModel("implement", null, job.requestedEffort);
+    job.model = resolved.model;
+    job.effort = resolved.effort;
+    job.modelSource = resolved.source;
+    job.timeoutMin = next.worker.timeoutMin("implement");
+    saveJob(job);
+  }
 
   Object.assign(job, {
-    finishedAt: new Date().toISOString(),
-    agyStatus: res.status,
+    finishedAt: isoNow(),
+    workerStatus: res.status,
     response: res.response,
     conversationId: res.conversationId,
     turns: res.turns,
     usage: res.usage,
+    cost: res.cost,
     durationSeconds: res.durationSeconds,
     softDenied: res.softDenied,
     stderrTail: res.stderrTail,
   });
 
-  // collect changes anyway, even if agy failed midway
+  // collect changes anyway, even if the worker failed midway
   await collectChanges(job);
 
   if (res.notFound) {
     job.status = "failed";
-    job.error = `Command "${CONFIG.agyBin}" not found. Install Antigravity CLI and run \`agy\` once to log in.`;
+    job.error = notFoundMsg(w);
   } else if (!res.ok) {
     job.status = "failed";
-    job.error = res.error || `agy exited with status ${res.status}`;
-    if (res.quota) job.error = "QUOTA EXHAUSTED / Gemini rate limit.\n" + job.error;
-    job.error += unavailableNote(job.model, res.error);
+    job.error = res.error || `${w.id} exited with status ${res.status}`;
+    if (res.quota) job.error = `QUOTA EXHAUSTED / rate limit on ${w.id}${job.fallback ? "" : " (fallback off)"}.\n${job.error}`;
+    job.error += w.failureNote(job.model, res.error);
   } else {
     job.status = job.filesChanged > 0 ? "done" : "no_changes";
   }
@@ -747,30 +1445,27 @@ async function collectChanges(job) {
   await git(job.worktree, "add", "-A", "--", ".", ...JUNK_PATHSPECS);
   const staged = await run("git", ["diff", "--cached", "--quiet"], { cwd: job.worktree });
   if (staged.code === 1) {
-    await git(
-      job.worktree,
-      "-c", "user.name=Gemini (agy)",
-      "-c", "user.email=gemini-delegate@localhost",
-      "commit", "-q", "--no-verify", "-m", `gemini: ${job.title}`, "-m", `job ${job.id}`
-    );
+    const who = job.worker || "worker";
+    await git(job.worktree, "-c", `user.name=${who} (capocantiere)`, "-c", "user.email=capocantiere@localhost",
+      "commit", "-q", "--no-verify", "-m", `${who}: ${job.title}`, "-m", `job ${job.id}`);
   }
   const stat = await git(job.repo, "diff", "--stat", job.base, job.branch);
   const names = (await git(job.repo, "diff", "--name-status", job.base, job.branch)).trim();
-  const patch = await git(job.repo, "diff", "--binary", job.base, job.branch);
+  // keep the patch as raw bytes so non-UTF-8 files survive intact
+  const p = await run("git", ["diff", "--binary", job.base, job.branch], { cwd: job.repo, binary: true });
+  if (p.code !== 0) throw new Error("git diff --binary failed: " + p.stderr.trim());
   const patchFile = path.join(PATCH_DIR, `${job.id}.patch`);
-  fs.writeFileSync(patchFile, patch);
+  fs.writeFileSync(patchFile, p.stdout);
   job.diffStat = stat.trim();
   job.changedFiles = names ? names.split("\n") : [];
   job.filesChanged = job.changedFiles.length;
   job.patchFile = patchFile;
-  job.patchBytes = Buffer.byteLength(patch);
+  job.patchBytes = p.stdout.length;
 }
 
 async function removeWorktree(job) {
   await withGitLock(async () => {
-    if (fs.existsSync(job.worktree)) {
-      await run("git", ["worktree", "remove", "--force", job.worktree], { cwd: job.repo });
-    }
+    if (fs.existsSync(job.worktree)) await run("git", ["worktree", "remove", "--force", job.worktree], { cwd: job.repo });
     await run("git", ["worktree", "prune"], { cwd: job.repo });
     await run("git", ["branch", "-D", job.branch], { cwd: job.repo });
   });
@@ -780,6 +1475,7 @@ function jobSummary(j) {
   return {
     id: j.id,
     title: j.title,
+    worker: j.worker ?? null,
     status: j.status,
     files_changed: j.filesChanged ?? null,
     duration_s: j.durationSeconds ?? null,
@@ -788,34 +1484,139 @@ function jobSummary(j) {
 }
 
 function jobDetail(j, { includeDiff = true, maxDiffChars = 15000 } = {}) {
+  const ws = j.workerStatus || j.agyStatus;
   const lines = [
     `JOB ${j.id} — ${j.title}`,
-    `status: ${j.status}${j.agyStatus ? ` (agy: ${j.agyStatus})` : ""}`,
+    `status: ${j.status}${ws ? ` (${j.worker}: ${ws})` : ""}`,
+    `worker: ${j.worker}`,
     `branch: ${j.branch}   worktree: ${j.worktree}`,
-    `base: ${j.baseLabel} (${j.base?.slice(0, 10)})`,
-    `model: ${j.model || "agy default"}${j.modelSource ? ` (${j.modelSource})` : ""}${j.effort ? `, effort ${j.effort}` : ""}`,
+    `base: ${j.baseLabel} (${(j.base || "").slice(0, 10)})`,
+    `model: ${j.model || "CLI default"}${j.modelSource && j.modelSource !== "CLI default" ? ` (${j.modelSource})` : ""}${j.effort ? `, effort ${j.effort}` : ""}`,
   ];
-  if (j.durationSeconds != null) lines.push(`duration: ${Math.round(j.durationSeconds)}s, turns: ${j.turns ?? "?"}`);
+  if (j.durationSeconds != null)
+    lines.push(`duration: ${Math.round(j.durationSeconds)}s, turns: ${j.turns ?? "?"}${j.cost ? `, cost ${j.cost}` : ""}`);
+  for (const a of j.attempts || [])
+    lines.push(`earlier attempt: ${a.worker} failed${a.quota ? " (quota)" : ""} — ${(a.error || "").split("\n")[0].slice(0, 200)}`);
+  if (j.notes?.length) lines.push("", "NOTES:", ...j.notes.map((n) => `- ${n}`));
   if (j.error) lines.push("", "ERROR:", truncate(j.error, 2500));
-  if (j.softDenied?.length) lines.push("", "ACTIONS DENIED TO agy (soft-deny):", ...j.softDenied);
-  if (j.response) lines.push("", "GEMINI'S RESPONSE:", truncate(j.response, 4000));
+  if (j.softDenied?.length) lines.push("", "ACTIONS DENIED TO THE WORKER (soft-deny):", ...j.softDenied);
+  if (j.response) lines.push("", "WORKER'S RESPONSE:", truncate(j.response, 4000));
   if (j.diffStat) lines.push("", "DIFF STAT:", j.diffStat);
   if (includeDiff && j.patchBytes && j.patchFile && fs.existsSync(j.patchFile)) {
     const patch = fs.readFileSync(j.patchFile, "utf8");
     lines.push("", `DIFF (full patch: ${j.patchFile}):`, truncate(patch, maxDiffChars));
   }
-  if (j.status === "done")
-    lines.push("", "Next step: review the diff, then gemini_apply or gemini_discard (or a new gemini_delegate with the fixes).");
+  if (j.status === "done") lines.push("", "Next step: review the diff, then apply or discard (or a new delegate with the fixes).");
   return lines.join("\n");
 }
 
 async function waitFor(ids, seconds) {
   const deadline = Date.now() + seconds * 1000;
+  const allDone = () => ids.every((id) => TERMINAL.has(jobs.get(id)?.status));
   while (Date.now() < deadline) {
-    if (ids.every((id) => TERMINAL.has(jobs.get(id)?.status))) return true;
+    if (allDone()) return true;
     await new Promise((r) => setTimeout(r, 1000));
   }
-  return ids.every((id) => TERMINAL.has(jobs.get(id)?.status));
+  return allDone();
+}
+
+// ---------------------------------------------------------------- analyze
+
+async function analyze(a) {
+  const repo = await repoRoot(a.repo_dir);
+  ensureEnabled(repo);
+  const prompt = analyzePrompt({ question: a.question || "", paths: a.paths, maxWords: a.max_words || 600 });
+  const snapshot = async () => {
+    const s = await run("git", ["status", "--porcelain=v1", "-uall"], { cwd: repo });
+    const d = await run("git", ["diff"], { cwd: repo });
+    return crypto.createHash("sha1").update(s.stdout + d.stdout).digest("hex");
+  };
+  const fallback = a.fallback === undefined || a.fallback === null ? loadConfig().fallback : !!a.fallback;
+  let { worker: w, notes } = await pickWorker(a.worker, a.force, fallback);
+  let requestedModel = a.model;
+  const tried = [];
+  let res, before, after, resolved;
+  while (true) {
+    resolved = await w.resolveModel("analyze", requestedModel, a.effort);
+    before = await snapshot();
+    res = await runWorker(w, "analyze", prompt, repo, resolved.model, resolved.effort,
+      a.timeout_minutes || w.timeoutMin("analyze"), false); // in the main repo: no auto-approval
+    after = await snapshot();
+    tried.push(w.id);
+    if (res.notFound) throw new Error(notFoundMsg(w));
+    if (res.ok || !res.quota || !fallback) break;
+    let next;
+    try {
+      next = await pickWorker(null, a.force, true, tried);
+    } catch {
+      break;
+    }
+    notes = [...notes, ...next.notes, `${w.id} hit a quota/rate limit: asked ${next.worker.id} instead.`];
+    w = next.worker;
+    requestedModel = null;
+  }
+  const out = notes.length ? [`NOTES: ${notes.join(" ")}`] : [];
+  if (!res.ok)
+    out.push(`ERROR from ${w.id} (${res.status})${res.quota ? " — QUOTA/RATE LIMIT" : ""}:\n${truncate(res.error, 2000)}${w.failureNote(resolved.model, res.error)}`);
+  if (before !== after) out.push("⚠️ WARNING: the repo state changed during the analysis. Check `git status` / `git diff`.");
+  out.push(truncate(res.response || "(no response)", 16000));
+  const total = res.usage?.total_tokens;
+  out.push(`\n[analyze: ${w.id}, ${resolved.model || "CLI default"} (${resolved.source}), ${Math.round(res.durationSeconds)}s, turns ${res.turns}, tokens ${total ?? "?"}]`);
+  return { text: out.join("\n\n"), isError: !res.ok && !res.response };
+}
+
+// ---------------------------------------------------------------- workers report
+
+const fmtCost = (c) => String(Number(c.toPrecision(4)));
+
+async function workersReport() {
+  const cfg = loadConfig();
+  const usage = usageByWorker(24);
+  const lines = [
+    `Workers, in preference order (config: ${CONFIG_FILE}${fs.existsSync(CONFIG_FILE) ? "" : ", not created yet: built-in defaults"}):`,
+  ];
+  for (const w of allWorkers()) {
+    const { installed, text: version } = await w.version();
+    const b = budgetState(w, usage);
+    const u = b.usage;
+    const [auth, authNote] = installed ? w.authStatus() : [null, ""];
+    let state = w.enabled ? "enabled" : "DISABLED";
+    if (w.id === SESSION.default) state += ", session default";
+    lines.push("", `${w.id} — ${w.label} [${state}]`);
+    lines.push(`  installed: ${installed ? version : `NO (${w.bin} not found). ${w.installHint}`}`);
+    if (installed)
+      lines.push(`  authenticated: ${auth === true ? "yes" : auth === false ? "NO" : "unknown"}${authNote ? ` (${authNote})` : ""}`);
+    lines.push(
+      `  budget 24h: ${b.committed}/${b.budget} used, ${b.left} left` +
+        (u.failures ? `, ${u.failures} failed, ${u.quota_errors} quota errors` : "") +
+        (u.cost ? `, cost ${fmtCost(u.cost)}` : "")
+    );
+    lines.push(
+      `  jobs: ${activeJobs(w.id, ["running"]).length} running, ${activeJobs(w.id, ["queued"]).length} queued (max ${w.s.max_parallel})`
+    );
+    lines.push(`  models: ${installed && w.enabled ? await w.modelsLine() : `${w.s.model || "CLI default"} (configured)`}`);
+    lines.push(`  strengths: ${(w.s.strengths || []).join(", ") || "—"}`);
+    for (const warning of w.warnings()) lines.push(`  ⚠️ ${warning}`);
+  }
+  lines.push("", `Fallback on quota/budget: ${cfg.fallback ? "on" : "off"}. Max parallel jobs overall: ${cfg.max_parallel}.`);
+  lines.push(`Session default: ${SESSION.default || "none (preference order)"}.`);
+  lines.push(modeLine(await currentRepo()));
+  for (const e of cfg.errors) lines.push(`CONFIG ERROR: ${e}`);
+  lines.push(`State: ${STATE_DIR}`);
+  return lines.join("\n");
+}
+
+async function setSessionDefault(value) {
+  const v = String(value || "").trim();
+  if (["", "auto", "none"].includes(v)) {
+    SESSION.default = null;
+    return "Session default cleared: workers are chosen in the configured order.";
+  }
+  const w = getWorker(v);
+  if (!w.enabled) throw new Error(`${v} is disabled in ${CONFIG_FILE}; enable it there first.`);
+  const { installed } = await w.version();
+  SESSION.default = v;
+  return `Session default worker: ${v}${installed ? "" : ` (WARNING: ${w.bin} not found)`}.`;
 }
 
 // ---------------------------------------------------------------- tools
@@ -823,62 +1624,40 @@ async function waitFor(ids, seconds) {
 // Tool definitions are shared with server.py.
 const TOOLS = JSON.parse(fs.readFileSync(new URL("./tools.json", import.meta.url), "utf8"));
 
+function getJob(a) {
+  const j = jobs.get(a.job_id);
+  if (!j) throw new Error(`job ${a.job_id} not found`);
+  return j;
+}
+
 async function callTool(name, a = {}) {
   switch (name) {
-    case "gemini_delegate": {
+    case "delegate": {
       if (!a.task?.trim()) throw new Error("task is required");
-      const { job, usage } = await createJob(a);
+      const job = await createJob(a);
       const wait = Math.min(a.wait_seconds || 0, 600);
       if (wait > 0) {
         await waitFor([job.id], wait);
         if (TERMINAL.has(job.status)) return jobDetail(job);
       }
+      const w = getWorker(job.worker);
+      const b = budgetState(w);
       return [
-        `Job ${job.id} started (${job.status}). Branch ${job.branch}, base: ${job.baseLabel}.`,
-        `Model: ${job.model || "agy default"} (${job.modelSource}).`,
-        `Active jobs: ${runningCount()}/${CONFIG.maxParallel} running, ${queue.length} queued.`,
-        `24h usage (including running jobs): ${usage.committed + 1}/${CONFIG.dailyBudget}.`,
-        `Use gemini_jobs with job_id="${job.id}" and wait_seconds to wait for the result.`,
+        ...(job.notes.length ? [`NOTES: ${job.notes.join(" ")}`] : []),
+        `Job ${job.id} started on ${job.worker} (${job.status}). Branch ${job.branch}, base: ${job.baseLabel}.`,
+        `Model: ${job.model || "CLI default"} (${job.modelSource}).`,
+        `Active jobs: ${activeJobs(null, ["running"]).length} running, ${queue.length} queued.`,
+        `${w.id} 24h usage (including active jobs): ${b.committed}/${b.budget}.`,
+        `Use jobs with job_id="${job.id}" and wait_seconds to wait for the result.`,
       ].join("\n");
     }
 
-    case "gemini_analyze": {
-      const repo = await repoRoot(a.repo_dir);
-      ensureEnabled(repo);
-      budgetCheck(a.force);
-      const resolved = await resolveModel("analyze", a.model, a.effort);
-      const snapshot = async () => {
-        const s = await run("git", ["status", "--porcelain=v1", "-uall"], { cwd: repo });
-        const d = await run("git", ["diff"], { cwd: repo });
-        return crypto.createHash("sha1").update(s.stdout + d.stdout).digest("hex");
-      };
-      const before = await snapshot();
-      const timeoutMin = a.timeout_minutes || CONFIG.analyzeTimeoutMin;
-      const res = await runAgy({
-        cwd: repo,
-        prompt: analyzePrompt({ question: a.question, paths: a.paths, maxWords: a.max_words || 600 }),
-        model: resolved.model,
-        effort: resolved.effort,
-        timeoutMin,
-        skipPermissions: false, // in the main repo: no auto-approval
-        kind: "analyze",
-      });
-      const after = await snapshot();
-      const out = [];
-      if (res.notFound) throw new Error(`Command "${CONFIG.agyBin}" not found. Install Antigravity CLI and run \`agy\` once to log in.`);
-      if (!res.ok)
-        out.push(`ERROR (${res.status})${res.quota ? " — QUOTA/RATE LIMIT" : ""}:\n${truncate(res.error, 2000)}${unavailableNote(resolved.model, res.error)}`);
-      if (before !== after)
-        out.push("⚠️ WARNING: the repo state changed during the analysis. Check `git status` / `git diff`.");
-      out.push(truncate(res.response || "(no response)", 16000));
-      out.push(`\n[gemini_analyze: ${resolved.model || "agy default"} (${resolved.source}), ${Math.round(res.durationSeconds)}s, turns ${res.turns}, tokens ${res.usage?.total_tokens ?? "?"}]`);
-      return { text: out.join("\n\n"), isError: !res.ok && !res.response };
-    }
+    case "analyze":
+      return analyze(a);
 
-    case "gemini_jobs": {
+    case "jobs": {
       if (a.job_id) {
-        const j = jobs.get(a.job_id);
-        if (!j) throw new Error(`job ${a.job_id} not found`);
+        const j = getJob(a);
         if (a.wait_seconds) await waitFor([j.id], Math.min(a.wait_seconds, 600));
         return jobDetail(j, { includeDiff: a.include_diff !== false, maxDiffChars: a.max_diff_chars || 15000 });
       }
@@ -896,9 +1675,8 @@ async function callTool(name, a = {}) {
       return visible.map((j) => JSON.stringify(jobSummary(j))).join("\n");
     }
 
-    case "gemini_apply": {
-      const j = jobs.get(a.job_id);
-      if (!j) throw new Error(`job ${a.job_id} not found`);
+    case "apply": {
+      const j = getJob(a);
       if (j.status === "running" || j.status === "queued") throw new Error("The job is still running.");
       if (j.status === "applied") return "Already applied.";
       if (j.status === "interrupted" && fs.existsSync(j.worktree)) await collectChanges(j);
@@ -913,25 +1691,28 @@ async function callTool(name, a = {}) {
             isError: true,
             text:
               `Apply failed (even with 3-way). The repo has changed too much since the job's base.\n${truncate(r.stderr, 3000)}\n` +
-              `Options: resolve conflicts by hand (if there are markers), check the state with \`git diff\`, or relaunch the task.`,
+              "Options: resolve conflicts by hand (if there are markers), check the state with `git diff`, or relaunch the task.",
           };
         }
       }
       j.status = "applied";
-      j.appliedAt = new Date().toISOString();
+      j.appliedAt = isoNow();
       saveJob(j);
       if (!a.keep_worktree) await removeWorktree(j);
-      return `Applied (${how}) to the working tree of ${j.repo}. Changes are NOT committed.\n${r.stderr.trim() ? r.stderr.trim() + "\n" : ""}${j.diffStat || ""}\nNow: run tests/typecheck and polish if needed.`;
+      const warn = r.stderr.trim();
+      return `Applied (${how}) to the working tree of ${j.repo}. Changes are NOT committed.\n${warn ? warn + "\n" : ""}${j.diffStat || ""}\nNow: run tests/typecheck and polish if needed.`;
     }
 
-    case "gemini_discard": {
-      const j = jobs.get(a.job_id);
-      if (!j) throw new Error(`job ${a.job_id} not found`);
+    case "discard": {
+      const j = getJob(a);
       const wasRunning = j.status === "running";
       j.status = "discarded";
       saveJob(j);
       const c = children.get(j.id);
-      if (c) { killTree(c, "SIGTERM"); setTimeout(() => killTree(c, "SIGKILL"), 3000).unref(); }
+      if (c) {
+        killTree(c, "SIGTERM");
+        setTimeout(() => killTree(c, "SIGKILL"), 3000).unref();
+      }
       const qi = queue.indexOf(j.id);
       if (qi >= 0) queue.splice(qi, 1);
       pump(); // a slot may have freed up: start the next queued job
@@ -940,33 +1721,25 @@ async function callTool(name, a = {}) {
       return `Job ${j.id} discarded.`;
     }
 
-    case "gemini_usage": {
-      const u = usageWindow(24);
-      const v = await run(CONFIG.agyBin, ["--version"]);
-      const agy = v.error?.code === "ENOENT" ? "NOT FOUND" : (v.stdout || v.stderr).trim().split("\n")[0] || "ok";
-      const active = [...jobs.values()].filter((j) => !TERMINAL.has(j.status));
-      const review = [...jobs.values()].filter((j) => j.status === "done");
-      return [
-        `agy: ${agy} (${CONFIG.agyBin})`,
-        `Last 24h: ${u.runs}/${CONFIG.dailyBudget} runs, ${u.turns} turns, ${u.total_tokens} tokens, ${u.failures} failed, ${u.quota_errors} quota errors`,
-        `Active jobs: ${active.length} (max parallel ${CONFIG.maxParallel}); to review: ${review.length}`,
-        modeLine(await currentRepo()),
-        `Models: ${await modelsInUse()}. Full list and settings: gemini_models.`,
-        `Config: effort=${CONFIG.effort || "(default)"} sandbox=${CONFIG.sandbox} skip_permissions_in_worktree=${CONFIG.skipPermissionsInWorktree} timeout_task=${CONFIG.taskTimeoutMin}m`,
-        `State: ${CONFIG.stateDir}`,
-      ].join("\n");
+    case "workers": {
+      const head = "use" in a ? (await setSessionDefault(a.use)) + "\n\n" : "";
+      return head + (await workersReport());
     }
-  }
-  if (name === "gemini_mode") {
-    if (a.mode) await setMode(a);
-    let repo = null;
-    try { repo = await repoRoot(a.repo_dir); } catch {}
-    return modeReport(repo);
-  }
-  if (name === "gemini_models") {
-    const cache = await modelCache(!!a.refresh);
-    if (["analyze", "implement", "exclude"].some((k) => k in a)) await updateModelSettings(a);
-    return modelsReport(cache);
+
+    case "mode": {
+      if (a.mode) await setMode(a);
+      const repo = await repoRoot(a.repo_dir).catch(() => null);
+      return modeReport(repo);
+    }
+
+    case "models": {
+      const wid = a.worker || "agy";
+      const w = getWorker(wid);
+      if (!(w instanceof AgyWorker))
+        return `${wid} does not publish a model list. Model in use: ${await w.modelsLine()}. Set "model" / "analyze_model" for it in ${CONFIG_FILE}, or pass model to delegate/analyze.`;
+      if (["analyze", "implement", "exclude"].some((k) => k in a)) await w.updateModelSettings(a);
+      return w.modelsReport(!!a.refresh);
+    }
   }
   throw new Error(`unknown tool: ${name}`);
 }
@@ -975,26 +1748,42 @@ async function callTool(name, a = {}) {
 
 async function sessionSummary() {
   const repo = await currentRepo();
-  if (delegationMode(repo).mode === "off") return `[gemini-delegate] ${modeLine(repo)}`;
-  const v = await run(CONFIG.agyBin, ["--version"]);
-  const lines = [];
-  if (v.error?.code === "ENOENT") {
-    lines.push(`[gemini-delegate] agy not found: delegation to Gemini is unavailable in this session (install Antigravity CLI and run \`agy\` to log in).`);
-    return lines.join("\n");
+  const tag = "[capocantiere]";
+  if (delegationMode(repo).mode === "off") return `${tag} ${modeLine(repo)}`;
+  const usage = usageByWorker(24);
+  const ready = [];
+  const other = [];
+  for (const w of allWorkers()) {
+    if (!w.enabled) continue;
+    if (!(await w.version()).installed) {
+      other.push(`${w.id} not installed`);
+      continue;
+    }
+    if (w.blocker()) {
+      other.push(`${w.id} unusable: ${w.blocker()}`);
+      continue;
+    }
+    const b = budgetState(w, usage);
+    const u = b.usage;
+    ready.push(
+      `${w.id} (${b.left}/${b.budget} runs left${u.quota_errors ? `, ${u.quota_errors} recent quota errors` : ""}; good at ${(w.s.strengths || []).join(", ") || "anything"})`
+    );
+    for (const x of w.warnings()) other.push(`${w.id}: ${x}`);
   }
-  const u = usageWindow(24);
-  const left = Math.max(CONFIG.dailyBudget - u.runs, 0);
-  lines.push(
-    `[gemini-delegate] Delegation to Gemini available (MCP tools gemini_*). 24h budget: ${left}/${CONFIG.dailyBudget} runs left` +
-      (u.quota_errors ? `, WARNING: ${u.quota_errors} recent quota errors` : "") + "."
-  );
-  lines.push(`[gemini-delegate] ${modeLine(repo)}`);
-  lines.push(`[gemini-delegate] Models: ${await modelsInUse()}. Full list: gemini_models.`);
+  const lines = [];
+  if (ready.length)
+    lines.push(`${tag} Workers available for delegation (MCP tools delegate/analyze/jobs/apply/discard/workers), in preference order: ${ready.join("; ")}.`);
+  else
+    lines.push(`${tag} No worker is available in this session (none enabled and installed): work without delegating. See the workers tool.`);
+  for (const o of other) lines.push(`${tag} ${o}`);
+  lines.push(`${tag} ${modeLine(repo)}`);
   if (repo) {
-    const pending = [...jobs.values()].filter((j) => j.repo === repo && (j.status === "interrupted" || (["done", "failed"].includes(j.status) && j.filesChanged > 0)));
+    const pending = [...jobs.values()].filter(
+      (j) => j.repo === repo && (j.status === "interrupted" || (["done", "failed"].includes(j.status) && (j.filesChanged || 0) > 0))
+    );
     if (pending.length)
       lines.push(
-        `[gemini-delegate] Jobs from previous sessions still open in this repo: ${pending.map((j) => `${j.id} (${j.status}: ${j.title})`).join("; ")}. Review them with gemini_jobs, then gemini_apply or gemini_discard.`
+        `${tag} Jobs from previous sessions still open in this repo: ${pending.map((j) => `${j.id} (${j.status} on ${j.worker}: ${j.title})`).join("; ")}. Review them with jobs, then apply or discard.`
       );
   }
   return lines.join("\n");
@@ -1007,6 +1796,7 @@ function send(msg) {
 }
 
 async function handle(msg) {
+  if (!msg || typeof msg !== "object") return;
   const { id, method, params } = msg;
   const isRequest = id !== undefined && id !== null;
   try {
@@ -1016,9 +1806,10 @@ async function handle(msg) {
         result = {
           protocolVersion: params?.protocolVersion || "2025-06-18",
           capabilities: { tools: { listChanged: false } },
-          serverInfo: { name: "gemini-delegate", version: VERSION },
+          serverInfo: { name: "capocantiere", version: VERSION },
           instructions:
-            "Tools for delegating work to Gemini (Antigravity CLI) using the user's Google subscription. You remain the manager: you plan, delegate well-specified tasks, review the diffs, and apply or discard them.",
+            "Tools for delegating work to external coding-agent CLIs (workers: GitHub Copilot CLI, Mistral Vibe, ...). " +
+            "You remain the manager: you plan, delegate well-specified tasks, review the diffs, and apply or discard them.",
         };
         break;
       case "ping":
@@ -1048,28 +1839,36 @@ async function handle(msg) {
   }
 }
 
-if (process.argv.includes("--session-summary")) {
-  sessionSummary().then((s) => { if (s) process.stdout.write(s + "\n"); }).catch(() => {});
+ensureDirs();
+if (process.argv.includes("--example-config")) {
+  process.stdout.write(JSON.stringify(exampleConfig(), null, 2) + "\n");
 } else {
-  let buf = "";
-  process.stdin.setEncoding("utf8");
-  process.stdin.on("data", (chunk) => {
-    buf += chunk;
-    let i;
-    while ((i = buf.indexOf("\n")) >= 0) {
-      const line = buf.slice(0, i).trim();
-      buf = buf.slice(i + 1);
-      if (!line) continue;
-      let msg;
-      try { msg = JSON.parse(line); } catch {
-        send({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } });
-        continue;
+  loadJobs();
+  if (process.argv.includes("--session-summary")) {
+    sessionSummary().then((s) => { if (s) process.stdout.write(s + "\n"); }).catch(() => {});
+  } else {
+    let buf = "";
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", (chunk) => {
+      buf += chunk;
+      let i;
+      while ((i = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, i).trim();
+        buf = buf.slice(i + 1);
+        if (!line) continue;
+        let msg;
+        try {
+          msg = JSON.parse(line);
+        } catch {
+          send({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } });
+          continue;
+        }
+        handle(msg);
       }
-      handle(msg);
-    }
-  });
-  process.stdin.on("end", () => {
-    for (const c of children.values()) killTree(c, "SIGTERM");
-    setTimeout(() => process.exit(0), 200).unref();
-  });
+    });
+    process.stdin.on("end", () => {
+      for (const c of children.values()) killTree(c, "SIGTERM");
+      setTimeout(() => process.exit(0), 200).unref();
+    });
+  }
 }

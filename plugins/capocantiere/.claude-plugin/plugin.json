@@ -1,16 +1,17 @@
 {
   "name": "capocantiere",
-  "version": "1.0.0",
-  "description": "Claude acts as manager and delegates implementation and analysis tasks to Gemini via Antigravity CLI (agy), using a Google AI Pro subscription. Isolated git worktrees, parallel jobs, controlled review and apply, quota management.",
+  "version": "2.0.0",
+  "description": "Claude acts as manager and delegates implementation and analysis tasks to configurable workers: external coding-agent CLIs such as GitHub Copilot CLI and Mistral Vibe. Isolated git worktrees, parallel jobs, per-worker budgets with automatic fallback, controlled review and apply.",
   "author": {
     "name": "Type-Here"
   },
   "keywords": [
-    "gemini",
-    "antigravity",
-    "agy",
     "delegation",
-    "multi-agent"
+    "multi-agent",
+    "workers",
+    "copilot",
+    "mistral-vibe",
+    "worktree"
   ],
   "license": "MIT"
 }

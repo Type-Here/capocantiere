@@ -1,5 +1,5 @@
 #!/bin/sh
-# Starts the gemini-delegate server with the chosen runtime.
+# Starts the capocantiere server with the chosen runtime.
 # CAPOCANTIERE_RUNTIME=python | node | auto (default: python3 if available, otherwise node).
 dir=$(dirname "$0")
 case "${CAPOCANTIERE_RUNTIME:-auto}" in

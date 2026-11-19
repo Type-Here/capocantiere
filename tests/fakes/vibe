@@ -1,0 +1,87 @@
+#!/usr/bin/env python3
+"""Fake Mistral Vibe CLI for the tests. Mimics the flags, exit codes and export.json of vibe 3.1.3."""
+
+import json
+import os
+import sys
+import time
+
+import _fake
+
+argv = sys.argv[1:]
+if argv[:1] in (["--version"], ["-v"]):
+    print("vibe 0.0.0-fake")
+    sys.exit(0)
+
+
+def values(flag):
+    out = []
+    for i, a in enumerate(argv):
+        if a == flag and i + 1 < len(argv):
+            out.append(argv[i + 1])
+        elif a.startswith(flag + "="):
+            out.append(a.split("=", 1)[1])
+    return out
+
+
+def value(flag):
+    v = values(flag)
+    return v[0] if v else None
+
+
+prompt = value("--prompt") or value("-p")
+if value("--prompt-file"):
+    with open(value("--prompt-file"), encoding="utf-8") as f:
+        prompt = f.read()
+if not prompt:
+    _fake.finish(1, "", "error: --prompt or --prompt-file is required in programmatic mode\n")
+cwd = value("--workdir") or os.getcwd()
+sc = _fake.scenario(prompt, "vibe")
+_fake.log("vibe", argv, cwd, sc)
+
+
+def export(outcome, stop=None, error=None, cost=0.0123):
+    """export.json in the format of vibe 3.1.3 (vibe/app_server/run_export.py)."""
+    out_dir = value("--output-dir")
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+        with open(os.path.join(out_dir, "export.json"), "w", encoding="utf-8") as f:
+            json.dump({"outcome": outcome, "stop_reason": stop, "error": error, "session_id": "fake",
+                       "usage": {"input_tokens": 900, "output_tokens": 100, "cached_input_tokens": 0, "total_tokens": 1000},
+                       "cost_usd": cost, "steps": 2}, f)
+
+
+# --time-limit: vibe stops itself, writes the export and exits 3 (outcome "deadline")
+if sc == "timeout" and value("--time-limit"):
+    time.sleep(float(value("--time-limit")))
+    export("deadline", "interrupted")
+    _fake.finish(3, "", "")
+
+# --max-price reached: exit 3, outcome "price_limit"
+if sc == "price":
+    export("price_limit", "limit")
+    _fake.finish(3, "", "")
+
+# The free plan's credit is used up: the model API answers 402 after the retries. Vibe exits 2 and the
+# reason is only in export.json (nothing useful on stderr).
+if sc == "quota":
+    export("infrastructure_failure", None, {"code": "usage_limit", "message": "402 Payment Required: the account has no credit left"}, 0)
+    _fake.finish(2, "", "")
+
+# --enabled-tools disables every other tool in headless mode: writing needs write_file or edit
+enabled = values("--enabled-tools")
+may_write = "--auto-approve" in argv and (not enabled or "write_file" in enabled or "edit" in enabled)
+code, out, err = _fake.act("vibe", sc, cwd, may_write)
+if code == 0:
+    export("finished")
+else:
+    export("infrastructure_failure", None, {"code": "internal_error", "message": err.strip()}, 0)
+if code == 0 and value("--output") == "json":
+    out = json.dumps([
+        {"role": "system", "content": "You are Vibe."},
+        {"role": "user", "content": prompt},
+        {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "write_file"}}]},
+        {"role": "tool", "content": "ok"},
+        {"role": "assistant", "content": out},
+    ])
+_fake.finish(code, out + "\n" if out else "", err)
