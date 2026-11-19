@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-# gemini-delegate: MCP server that lets Claude Code (the "manager") delegate
-# work to Antigravity CLI (`agy`, Gemini) using a Google AI Pro subscription.
+# capocantiere: MCP server that lets Claude Code (the "manager") delegate work to external
+# coding-agent CLIs ("workers": GitHub Copilot CLI, Mistral Vibe, Antigravity CLI).
 #
 # Python port of server.mjs, with the same behavior and the same state files,
 # so you can switch between the two runtimes without losing jobs.
 #
 # - Every code-writing task runs in an isolated git worktree, on a dedicated branch.
-#   The main repo is never touched until Claude calls gemini_apply.
-# - Jobs are asynchronous and can run in parallel (with a queue).
-# - Usage/quota is tracked so the subscription's daily limits aren't exceeded.
+#   The main repo is never touched until Claude calls `apply`.
+# - Jobs are asynchronous and can run in parallel (with a queue, and a limit per worker).
+# - Usage is tracked per worker so each one's daily budget isn't exceeded. On quota/rate-limit
+#   errors the job can move on to the next worker (fallback).
 #
 # Zero dependencies: only Python >= 3.8 (standard library) and git are required.
 
@@ -16,142 +17,22 @@ import hashlib
 import json
 import os
 import re
-import secrets
+import shutil
 import signal
-import subprocess
 import sys
 import threading
 import time
-from datetime import datetime, timezone
 
-# ---------------------------------------------------------------- config
+import common
+from common import (JOBS_DIR, PATCH_DIR, SETTINGS_FILE, USAGE_FILE, CONFIG_FILE, HERE, SIGKILL, iso_now, kill_tree,
+                    new_id, not_found, now_ms, read_json, run, tail, truncate, write_json)
+import workers as W
 
-env = os.environ
-
-
-def num(v, d):
-    if v is None or v == "":
-        return d
-    try:
-        f = float(v)
-    except ValueError:
-        return d
-    return int(f) if f.is_integer() else f
-
-
-def boolean(v, d):
-    if v is None or v == "":
-        return d
-    return re.match(r"^(1|true|yes|on)$", v, re.I) is not None
-
-
-def _xdg(var, *default):
-    return env.get(var) or os.path.join(os.path.expanduser("~"), *default)
-
-
-CONFIG = {
-    "agyBin": env.get("GEMINI_DELEGATE_AGY_BIN") or "agy",
-    "model": env.get("GEMINI_DELEGATE_MODEL") or "",  # empty = agy's default
-    "analyzeModel": env.get("GEMINI_DELEGATE_ANALYZE_MODEL") or "",
-    "effort": env.get("GEMINI_DELEGATE_EFFORT") or "",
-    "dailyBudget": num(env.get("GEMINI_DELEGATE_DAILY_BUDGET"), 150),  # agy runs per 24h
-    "maxParallel": num(env.get("GEMINI_DELEGATE_MAX_PARALLEL"), 3),
-    "taskTimeoutMin": num(env.get("GEMINI_DELEGATE_TASK_TIMEOUT_MIN"), 20),
-    "analyzeTimeoutMin": num(env.get("GEMINI_DELEGATE_ANALYZE_TIMEOUT_MIN"), 8),
-    "sandbox": boolean(env.get("GEMINI_DELEGATE_SANDBOX"), True),
-    # Inside the isolated worktree agy may edit files and run commands without asking:
-    # it's the only way to work headless. The main repo stays protected.
-    "skipPermissionsInWorktree": boolean(env.get("GEMINI_DELEGATE_SKIP_PERMISSIONS"), True),
-    "extraArgs": [x for x in (env.get("GEMINI_DELEGATE_EXTRA_ARGS") or "").split(" ") if x],
-    "stateDir": env.get("GEMINI_DELEGATE_STATE_DIR")
-    or os.path.join(_xdg("XDG_STATE_HOME", ".local", "state"), "gemini-delegate"),
-    "worktreeDir": env.get("GEMINI_DELEGATE_WORKTREE_DIR")
-    or os.path.join(_xdg("XDG_CACHE_HOME", ".cache"), "gemini-delegate", "worktrees"),
-}
-
-JOBS_DIR = os.path.join(CONFIG["stateDir"], "jobs")
-PATCH_DIR = os.path.join(CONFIG["stateDir"], "patches")
-USAGE_FILE = os.path.join(CONFIG["stateDir"], "usage.jsonl")
-for _d in (JOBS_DIR, PATCH_DIR, CONFIG["worktreeDir"]):
-    os.makedirs(_d, exist_ok=True)
-
-VERSION = "1.0.0"
+VERSION = "2.0.0"
 TERMINAL = {"done", "no_changes", "failed", "applied", "discarded", "interrupted"}
-HERE = os.path.dirname(os.path.abspath(__file__))
 
-# ---------------------------------------------------------------- helpers
-
-
-def now_ms():
-    return int(time.time() * 1000)
-
-
-def iso_now():
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
-
-
-def js(v):
-    """Format a value the way the Node version prints it in text output."""
-    if v is True:
-        return "true"
-    if v is False:
-        return "false"
-    return str(v)
-
-
-SIGKILL = getattr(signal, "SIGKILL", signal.SIGTERM)
-
-
-def kill_tree(child, sig):
-    """Signal the child and everything it started (its own process group on POSIX)."""
-    try:
-        if os.name == "posix":
-            os.killpg(child.pid, sig)
-        else:
-            child.send_signal(sig)
-    except OSError:
-        pass
-
-
-def run(cmd, args, cwd=None, input=None, timeout_ms=None, on_spawn=None, binary=False):
-    """Run a command; never raises. Returns code/stdout/stderr/error/timed_out."""
-    try:
-        child = subprocess.Popen(
-            [cmd] + list(args),
-            cwd=cwd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=os.name == "posix",
-        )
-    except OSError as e:
-        return {"code": -1, "stdout": b"" if binary else "", "stderr": str(e), "error": e, "timed_out": False}
-    if on_spawn:
-        on_spawn(child)
-    data = input.encode("utf-8") if isinstance(input, str) else input
-    timed_out = False
-    try:
-        out, err = child.communicate(data, timeout=timeout_ms / 1000 if timeout_ms else None)
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        kill_tree(child, signal.SIGTERM)
-        try:
-            out, err = child.communicate(timeout=5)
-        except subprocess.TimeoutExpired:
-            kill_tree(child, SIGKILL)
-            out, err = child.communicate()
-    code = child.returncode if child.returncode is not None and child.returncode >= 0 else -1
-    return {
-        "code": code,
-        "stdout": out if binary else out.decode("utf-8", "replace"),
-        "stderr": err.decode("utf-8", "replace"),
-        "error": None,
-        "timed_out": timed_out,
-    }
-
-
-def not_found(r):
-    return isinstance(r.get("error"), FileNotFoundError)
+# The worker chosen with `workers use=...` (/capocantiere:use). One server process = one Claude session.
+SESSION = {"default": None}
 
 
 def git(cwd, *args):
@@ -165,33 +46,22 @@ def git(cwd, *args):
 GIT_LOCK = threading.Lock()
 
 
-def truncate(s, n):
-    if not s:
-        return ""
-    if len(s) <= n:
-        return s
-    return s[:n] + "\n… [truncated: %d characters omitted]" % (len(s) - n)
-
-
-def tail(s, n):
-    if not s:
-        return ""
-    return s if len(s) <= n else "…" + s[-n:]
-
-
-def new_id():
-    return datetime.now().strftime("g%m%d-%H%M-") + secrets.token_hex(2)
-
-
 def repo_root(d=None):
-    start = d or env.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    start = d or common.env.get("CLAUDE_PROJECT_DIR") or os.getcwd()
     r = run("git", ["rev-parse", "--show-toplevel"], cwd=start)
     if r["code"] != 0:
-        raise RuntimeError('"%s" is not a git repository. gemini-delegate requires git.' % start)
+        raise RuntimeError('"%s" is not a git repository. capocantiere requires git.' % start)
     return r["stdout"].strip()
 
 
-# ---------------------------------------------------------------- usage / quota
+def current_repo():
+    try:
+        return repo_root()
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------- usage / budget (per worker)
 
 USAGE_LOCK = threading.Lock()
 
@@ -203,10 +73,15 @@ def record_usage(entry):
         f.write(line + "\n")
 
 
-def usage_window(hours=24):
+def empty_usage():
+    return {"runs": 0, "turns": 0, "input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
+            "failures": 0, "quota_errors": 0, "cost": 0.0}
+
+
+def usage_by_worker(hours=24):
+    """{worker id: totals} over the last `hours`. Entries written before workers existed count as agy."""
     since = now_ms() - hours * 3600_000
-    out = {"runs": 0, "turns": 0, "input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
-           "failures": 0, "quota_errors": 0}
+    out = {}
     if not os.path.exists(USAGE_FILE):
         return out
     with open(USAGE_FILE, encoding="utf-8") as f:
@@ -221,348 +96,143 @@ def usage_window(hours=24):
             if not isinstance(e, dict) or (e.get("ts") or 0) < since:
                 continue
             u = e.get("usage") or {}
-            out["runs"] += 1
-            out["turns"] += e.get("turns") or 0
-            out["input_tokens"] += u.get("input_tokens") or 0
-            out["output_tokens"] += u.get("output_tokens") or 0
-            out["total_tokens"] += u.get("total_tokens") or 0
+            o = out.setdefault(e.get("worker") or "agy", empty_usage())
+            o["runs"] += 1
+            o["turns"] += e.get("turns") or 0
+            for k in ("input_tokens", "output_tokens", "total_tokens"):
+                o[k] += u.get(k) or 0
+            o["cost"] += e.get("cost") or 0
             if not e.get("ok"):
-                out["failures"] += 1
+                o["failures"] += 1
             if e.get("quota"):
-                out["quota_errors"] += 1
+                o["quota_errors"] += 1
     return out
 
 
-def active_job_count():
-    return sum(1 for j in list(jobs.values()) if j["status"] in ("running", "queued"))
+def active_jobs(worker_id=None, statuses=("running", "queued")):
+    return [j for j in list(jobs.values()) if j["status"] in statuses and (worker_id is None or j.get("worker") == worker_id)]
 
 
-def budget_check(force):
-    u = usage_window(24)
-    u["committed"] = u["runs"] + active_job_count()  # includes jobs still running
-    if not force and u["committed"] >= CONFIG["dailyBudget"]:
-        raise RuntimeError(
-            "Daily budget reached (%d/%s agy runs in the last 24h, including running jobs). "
-            "Do the work directly in Claude, or retry with force=true." % (u["committed"], CONFIG["dailyBudget"])
-        )
-    return u
+def budget_state(w, usage=None):
+    u = (usage if usage is not None else usage_by_worker(24)).get(w.id) or empty_usage()
+    committed = u["runs"] + len(active_jobs(w.id))  # includes jobs still running or queued
+    return {"usage": u, "committed": committed, "budget": w.s["daily_budget"],
+            "left": max(w.s["daily_budget"] - committed, 0)}
 
 
-QUOTA_RE = re.compile(r"(429|RESOURCE_EXHAUSTED|rate ?limit|quota)", re.I)
-
-# ---------------------------------------------------------------- agy
+# ---------------------------------------------------------------- choosing a worker
 
 
-def agy_args(prompt, model, effort, timeout_min, skip_permissions):
-    a = ["-p", prompt, "--output-format", "json"]
-    if model:
-        a += ["--model", model]
-    if effort:
-        a += ["--effort", effort]
-    if timeout_min:
-        a += ["--print-timeout", "%sm" % timeout_min]
-    if skip_permissions:
-        a.append("--dangerously-skip-permissions")
-    if CONFIG["sandbox"]:
-        a.append("--sandbox")
-    return a + CONFIG["extraArgs"]
+def candidate_order(requested, fallback):
+    order = W.load_config()["order"]
+    first = requested or SESSION["default"]
+    if not first:
+        return order
+    rest = [w for w in order if w != first]
+    # an explicit request without fallback means exactly that worker
+    return [first] + (rest if fallback else [])
 
 
-def parse_agy_output(stdout):
-    for l in reversed(stdout.strip().split("\n")):
-        t = l.strip()
-        if not t.startswith("{"):
+def pick_worker(requested=None, force=False, fallback=None, exclude=()):
+    """Choose the worker for a run. Returns (worker, notes). Raises if none is usable.
+
+    Skips workers that are disabled, not installed, or out of budget (unless force); every skipped
+    worker that was asked for explicitly, or that sits before the chosen one, is explained in notes.
+    """
+    cfg = W.load_config()
+    if requested and requested not in W.ADAPTERS:
+        raise RuntimeError('Unknown worker "%s". Workers: %s.' % (requested, ", ".join(W.ADAPTERS)))
+    fallback = cfg["fallback"] if fallback is None else fallback
+    usage = usage_by_worker(24)
+    notes = []
+    for wid in candidate_order(requested, fallback):
+        if wid in exclude:
             continue
-        try:
-            v = json.loads(t)
-            if isinstance(v, dict):
-                return v
-        except ValueError:
-            pass
-    try:
-        v = json.loads(stdout)
-        return v if isinstance(v, dict) else None
-    except ValueError:
-        return None
+        w = W.get_worker(wid)
+        if not w.enabled:
+            if wid == requested or wid == SESSION["default"]:
+                notes.append("%s is disabled in %s." % (wid, CONFIG_FILE))
+            continue
+        installed, _ = w.version()
+        if not installed:
+            notes.append('%s skipped: command "%s" not found.' % (wid, w.bin))
+            continue
+        problem = w.blocker()
+        if problem:
+            notes.append("%s skipped: %s." % (wid, problem))
+            continue
+        b = budget_state(w, usage)
+        if b["left"] <= 0 and not force:
+            notes.append("%s skipped: daily budget used up (%d/%s runs in 24h, including active jobs)."
+                         % (wid, b["committed"], b["budget"]))
+            continue
+        return w, notes
+    raise RuntimeError("No worker available. %s Do the work yourself, or retry with force=true if only the budget "
+                       "is the problem. See the workers tool." % (" ".join(notes) or "All workers are disabled."))
 
 
-def run_agy(cwd, prompt, model, effort, timeout_min, skip_permissions, kind, job_id=None, on_spawn=None):
-    args = agy_args(prompt, model, effort, timeout_min, skip_permissions)
+# ---------------------------------------------------------------- running a worker
+
+
+def run_worker(w, role, prompt, cwd, model, effort, timeout_min, auto_approve, job_id=None, on_spawn=None):
+    spec = {"role": role, "prompt": prompt, "cwd": cwd, "model": model, "effort": effort,
+            "timeout_min": timeout_min, "auto_approve": auto_approve}
+    inv = w.invocation(spec)
+    spec.update({k: v for k, v in inv.items() if k not in ("argv", "env", "input", "cleanup")})
     started = time.time()
-    r = run(CONFIG["agyBin"], args, cwd=cwd, timeout_ms=(timeout_min + 1) * 60_000, on_spawn=on_spawn)
-    envl = parse_agy_output(r["stdout"]) or {}
-    has_envl = bool(envl)
-    nf = not_found(r)
-    status = envl.get("status") or ("SUCCESS" if r["code"] == 0 else "ERROR")
-    ok = not nf and r["code"] == 0 and status == "SUCCESS"
-    err = envl.get("error")
-    err_text = "\n".join(
-        str(x)
-        for x in [err, "timed out after %s min" % timeout_min if r["timed_out"] else "", "" if ok else tail(r["stderr"], 1500)]
-        if x
-    )
-    quota = bool(QUOTA_RE.search(err_text) or QUOTA_RE.search(r["stderr"] or ""))
+    try:
+        r = run(w.bin, inv["argv"], cwd=cwd, input=inv.get("input"),
+                timeout_ms=int((timeout_min + (1 if w.OWN_TIMEOUT else 0)) * 60_000),
+                on_spawn=on_spawn, extra_env=inv.get("env"))
+        nf = not_found(r)
+        p = w.parse(r, spec) if not nf else {"ok": False, "status": "NOT_FOUND", "response": "", "error": ""}
+    finally:
+        for f in inv.get("cleanup") or []:
+            try:
+                shutil.rmtree(f) if os.path.isdir(f) else os.remove(f)
+            except OSError:
+                pass
+    ok = bool(p.get("ok")) and not nf and not r["timed_out"]
+    err_text = "\n".join(str(x) for x in [
+        p.get("error"),
+        "timed out after %s min" % timeout_min if r["timed_out"] else "",
+        "" if ok else tail(r["stderr"], 1500),
+    ] if x)
+    quota = not ok and bool(w.QUOTA_RE.search(err_text) or (not p.get("response") and w.QUOTA_RE.search(r["stdout"] or "")))
     seconds = round(time.time() - started)
     record_usage({
-        "kind": kind,
+        "worker": w.id,
+        "kind": role,
         "job": job_id,
         "model": model or None,
         "ok": ok,
         "quota": quota,
-        "turns": envl.get("num_turns") or 0,
-        "usage": envl.get("usage") or None,
+        "turns": p.get("turns") or 0,
+        "usage": p.get("usage") or None,
+        "cost": p.get("cost") or None,
         "seconds": seconds,
     })
-    # "soft-deny" notices that agy writes to stderr even when it exits with 0
-    soft_denied = [
-        l for l in (r["stderr"] or "").split("\n")
-        if re.search(r"denied|not approved|requires approval|soft-den", l, re.I)
-    ][:10]
-    response = envl.get("response")
-    if response is None:
-        response = "" if has_envl else r["stdout"].strip()
-    duration = envl.get("duration_seconds")
+    duration = p.get("duration")
     return {
         "ok": ok,
         "notFound": nf,
+        "timedOut": r["timed_out"],
         "quota": quota,
-        "status": status,
-        "response": response,
+        "status": p.get("status") or ("SUCCESS" if ok else "ERROR"),
+        "response": p.get("response") or "",
         "error": err_text,
-        "conversationId": envl.get("conversation_id") or None,
-        "turns": envl.get("num_turns") or 0,
-        "usage": envl.get("usage") or None,
+        "conversationId": p.get("conversation_id"),
+        "turns": p.get("turns") or 0,
+        "usage": p.get("usage"),
+        "cost": p.get("cost"),
         "durationSeconds": duration if duration is not None else seconds,
-        "softDenied": soft_denied,
+        "softDenied": w.soft_denied(r),
         "stderrTail": tail(r["stderr"], 3000),
     }
 
 
-# ---------------------------------------------------------------- models
-#
-# The model list comes from `agy models`, which only shows what the user's account can use,
-# so new models (or a plan upgrade) are picked up without updating the plugin. Slugs are
-# sorted into capability groups by the rules in model-groups.json.
-
-with open(os.path.join(HERE, "model-groups.json"), encoding="utf-8") as _f:
-    MODEL_RULES = json.load(_f)
-GROUP_IDS = [g["id"] for g in MODEL_RULES["groups"]]
-OTHER_GROUP = {"id": "other", "description": "Not classified. Never chosen automatically, only when requested by slug or group."}
-MODELS_FILE = os.path.join(CONFIG["stateDir"], "models.json")
-SETTINGS_FILE = os.path.join(CONFIG["stateDir"], "settings.json")
-MODELS_TTL_MS = 6 * 3600_000
-LEVELS = ("low", "medium", "high", "xhigh", "max")
-LEVEL_RE = re.compile(r"-(%s)$" % "|".join(LEVELS))
-MODEL_ERROR_RE = re.compile(
-    r"not recognized as a known model|model.{0,80}(not available|unavailable|not allowed|not supported|not entitled|permission denied)",
-    re.I,
-)
-MODELS_LOCK = threading.Lock()
-
-
-def read_json(path, default):
-    try:
-        with open(path, encoding="utf-8") as f:
-            v = json.load(f)
-        return v if isinstance(v, dict) else default
-    except (OSError, ValueError):
-        return default
-
-
-def write_json(path, data):
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-    os.replace(tmp, path)
-
-
-def parse_models(stdout):
-    """`agy models` prints one "slug<TAB>Display name" line per model."""
-    out = []
-    for line in stdout.split("\n"):
-        if "\t" not in line:
-            continue
-        slug, name = line.split("\t", 1)
-        if slug.strip():
-            out.append({"slug": slug.strip(), "name": name.strip() or slug.strip()})
-    return out
-
-
-def model_cache(refresh=False):
-    """The cached model list, re-read from `agy models` when stale. Never raises."""
-    with MODELS_LOCK:
-        cache = read_json(MODELS_FILE, {})
-        if refresh or not cache.get("models") or now_ms() - (cache.get("fetchedAt") or 0) > MODELS_TTL_MS:
-            r = run(CONFIG["agyBin"], ["models"], timeout_ms=30_000)
-            models = parse_models(r["stdout"]) if r["code"] == 0 else []
-            if models:
-                # an explicit refresh also forgets models marked unavailable
-                cache = {"fetchedAt": now_ms(), "models": models,
-                         "unavailable": {} if refresh else cache.get("unavailable") or {}}
-                write_json(MODELS_FILE, cache)
-            else:
-                cache = dict(cache, fetchError=(r["stderr"] or r["stdout"]).strip()[:500] or "`agy models` failed")
-        return cache
-
-
-def mark_unavailable(slug):
-    with MODELS_LOCK:
-        cache = read_json(MODELS_FILE, {})
-        cache.setdefault("unavailable", {})[slug] = iso_now()
-        write_json(MODELS_FILE, cache)
-
-
-def glob_re(pattern):
-    return re.compile("^" + ".*".join(re.escape(x) for x in pattern.split("*")) + "$", re.I)
-
-
-def group_of(slug):
-    for g in MODEL_RULES["groups"]:
-        for i, pat in enumerate(g["match"]):
-            if re.search(pat, slug, re.I):
-                return g["id"], i
-    return "other", 0
-
-
-def version_key(name):
-    """Newest first: "Gemini 3.8 Flash" -> (-3, -8, 0, 0)."""
-    m = re.search(r"\d+(?:\.\d+)*", name)
-    parts = [int(x) for x in m.group().split(".")][:4] if m else []
-    return tuple(-x for x in parts + [0] * (4 - len(parts)))
-
-
-def catalog(cache, settings):
-    """Usable models by group, best first, plus the ones excluded by settings."""
-    unavailable = cache.get("unavailable") or {}
-    excl = [glob_re(p) for p in settings.get("exclude") or []]
-    groups = {gid: [] for gid in GROUP_IDS + ["other"]}
-    excluded = []
-    for m in cache.get("models") or []:
-        if m["slug"] in unavailable:
-            continue
-        if any(rx.match(m["slug"]) for rx in excl):
-            excluded.append(m)
-            continue
-        gid, idx = group_of(m["slug"])
-        groups[gid].append(dict(m, rank=(idx,) + version_key(m["name"])))
-    for lst in groups.values():
-        lst.sort(key=lambda m: m["rank"])
-    return {"groups": groups, "excluded": excluded}
-
-
-def groups_hint(cat):
-    parts = ["%s: %s" % (g, ", ".join(m["slug"] for m in ms)) for g, ms in cat["groups"].items() if ms]
-    return "Available — " + ("; ".join(parts) or "none") + ". See gemini_models."
-
-
-def resolve_model(role, requested=None, effort=None):
-    """Pick model and effort for a run. role is "analyze" or "implement".
-
-    Precedence: requested (tool argument) > environment variable > settings > automatic.
-    Each of them may be a slug or a group id; a group follows new models automatically.
-    Returns (model, effort, source); model "" means agy's default.
-    """
-    cache = model_cache()
-    settings = read_json(SETTINGS_FILE, {})
-    cat = catalog(cache, settings)
-    known = {m["slug"] for m in cache.get("models") or []}
-    env_model = (CONFIG["analyzeModel"] or CONFIG["model"]) if role == "analyze" else CONFIG["model"]
-    choice = source = None
-    for value, src in ((requested, "requested"), (env_model, "env"), (settings.get(role), "settings")):
-        if value and value != "auto":
-            choice, source = value, src
-            break
-    if choice is None:
-        model, source = "", "agy default"
-        for gid in MODEL_RULES["defaults"][role]:
-            if cat["groups"][gid]:
-                model, source = cat["groups"][gid][0]["slug"], "auto, group " + gid
-                break
-    elif choice in cat["groups"]:
-        if not cat["groups"][choice]:
-            raise RuntimeError('No model available in group "%s". %s' % (choice, groups_hint(cat)))
-        model, source = cat["groups"][choice][0]["slug"], "%s, group %s" % (source, choice)
-    elif not known or choice in known:
-        model = choice  # list unknown (agy models failed): pass it through and let agy decide
-    else:
-        raise RuntimeError('Unknown model "%s". %s' % (choice, groups_hint(cat)))
-
-    effort = effort or CONFIG["effort"]
-    if effort and model and LEVEL_RE.search(model):
-        # the level is part of the slug and agy rejects --effort with it:
-        # pick the variant of the same model closest to the requested level
-        base = LEVEL_RE.sub("", model)
-        want = LEVELS.index(effort) if effort in LEVELS else None
-        variants = [lv for lv in LEVELS if "%s-%s" % (base, lv) in known]
-        if want is not None and variants:
-            model = "%s-%s" % (base, min(variants, key=lambda lv: (abs(LEVELS.index(lv) - want), -LEVELS.index(lv))))
-        effort = ""
-    return model, effort, source
-
-
-def models_report(cache):
-    if not cache.get("models"):
-        return "Could not read the model list (%s). Runs will use agy's default model." % (
-            cache.get("fetchError") or "no output from `agy models`")
-    settings = read_json(SETTINGS_FILE, {})
-    cat = catalog(cache, settings)
-    when = datetime.fromtimestamp(cache["fetchedAt"] / 1000).strftime("%Y-%m-%d %H:%M")
-    lines = ["Models this account can use through agy (read %s):" % when]
-    width = max(len(m["slug"]) for m in cache["models"])
-    for g in MODEL_RULES["groups"] + [OTHER_GROUP]:
-        ms = cat["groups"][g["id"]]
-        if g is OTHER_GROUP and not ms:
-            continue
-        lines += ["", "%s — %s" % (g["id"], g["description"])]
-        if not ms:
-            lines.append("    (none available)")
-        for i, m in enumerate(ms):
-            lines.append("  %s %s  %s" % ("*" if i == 0 else " ", m["slug"].ljust(width), m["name"]))
-    lines += ["", "* = the model used when that group is requested."]
-    if cat["excluded"]:
-        lines.append("Excluded by settings: " + ", ".join(m["slug"] for m in cat["excluded"]))
-    if cache.get("unavailable"):
-        lines.append("Marked unavailable after failing for this account (a refresh clears this): "
-                     + ", ".join(sorted(cache["unavailable"])))
-    lines += ["", "In use:"]
-    for role in ("analyze", "implement"):
-        try:
-            model, _, source = resolve_model(role)
-            lines.append("  %-9s → %s (%s)" % (role, model or "agy default", source))
-        except Exception as e:
-            lines.append("  %-9s → ERROR: %s" % (role, e))
-    lines.append("Settings file: %s (exclude: %s)" % (SETTINGS_FILE, ", ".join(settings.get("exclude") or []) or "none"))
-    return "\n".join(lines)
-
-
-def models_in_use():
-    parts = []
-    for role in ("analyze", "implement"):
-        try:
-            model, _, source = resolve_model(role)
-            parts.append("%s → %s (%s)" % (role, model or "agy default", source))
-        except Exception as e:
-            parts.append("%s → ERROR: %s" % (role, e))
-    return "; ".join(parts)
-
-
-def update_model_settings(a):
-    settings = read_json(SETTINGS_FILE, {})
-    cache = model_cache()
-    known = {m["slug"] for m in cache.get("models") or []}
-    for role in ("analyze", "implement"):
-        if role not in a:
-            continue
-        v = (a[role] or "").strip()
-        if not v or v == "auto":
-            settings.pop(role, None)
-        elif v in GROUP_IDS or v == "other" or not known or v in known:
-            settings[role] = v
-        else:
-            raise RuntimeError('Unknown model or group "%s". Groups: %s.' % (v, ", ".join(GROUP_IDS + ["other"])))
-    if "exclude" in a:
-        settings["exclude"] = [str(x) for x in a["exclude"] or [] if str(x).strip()]
-    write_json(SETTINGS_FILE, settings)
+def not_found_msg(w):
+    return 'Command "%s" not found for worker %s. %s' % (w.bin, w.id, w.INSTALL_HINT)
 
 
 # ---------------------------------------------------------------- delegation mode
@@ -590,7 +260,7 @@ def delegation_mode(repo):
 def ensure_enabled(repo):
     mode, source = delegation_mode(repo)
     if mode == "off":
-        raise RuntimeError("Gemini delegation is off (%s). Do the work without Gemini; "
+        raise RuntimeError("Delegation is off (%s). Do the work without workers; "
                            "the user can change this with /capocantiere:mode." % source)
 
 
@@ -650,6 +320,7 @@ def implement_prompt(job):
         "- Do ONLY what the task asks. No unrequested refactors, no new dependencies unless explicitly requested.",
         "- Follow the style and conventions of the existing code.",
         "- Write code comments and documentation in the language already used in the repository.",
+        "- Stay inside this folder: do not read or modify files outside it.",
         "- Before finishing, delete any temporary files or build artifacts you created that are not part of the task (e.g. __pycache__, .pytest_cache, coverage reports).",
         "- If something is ambiguous, choose the most conservative interpretation and flag it in NOTES.",
         "- When you are done, run: %s and fix any errors you introduced." % test_command
@@ -699,10 +370,7 @@ def job_file(jid):
 
 def save_job(job):
     job["updatedAt"] = iso_now()
-    tmp = job_file(job["id"]) + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(job, f, indent=2, ensure_ascii=False)
-    os.replace(tmp, job_file(job["id"]))
+    write_json(job_file(job["id"]), job)
 
 
 def load_jobs():
@@ -712,6 +380,7 @@ def load_jobs():
         try:
             with open(os.path.join(JOBS_DIR, f), encoding="utf-8") as fh:
                 j = json.load(fh)
+            j.setdefault("worker", "agy")
             if j.get("status") in ("running", "queued"):
                 # the previous server died while the job was active
                 j["status"] = "interrupted"
@@ -722,16 +391,21 @@ def load_jobs():
             pass
 
 
-def running_count():
-    return sum(1 for j in list(jobs.values()) if j["status"] == "running")
-
-
 def pump():
+    """Start queued jobs while there are free slots, globally and for each job's worker."""
+    cfg = W.load_config()
     with STATE_LOCK:
-        while queue and running_count() < CONFIG["maxParallel"]:
-            job = jobs.get(queue.pop(0))
+        for jid in list(queue):
+            if len(active_jobs(statuses=("running",))) >= cfg["max_parallel"]:
+                break
+            job = jobs.get(jid)
             if not job or job["status"] != "queued":
+                queue.remove(jid)
                 continue
+            limit = cfg["workers"].get(job["worker"], {}).get("max_parallel", 1)
+            if len(active_jobs(job["worker"], ("running",))) >= limit:
+                continue  # this worker is full; a job for another worker may still start
+            queue.remove(jid)
             job["status"] = "running"
             job["startedAt"] = iso_now()
             save_job(job)
@@ -752,18 +426,18 @@ def _execute_wrapper(job):
 def create_job(args):
     repo = repo_root(args.get("repo_dir"))
     ensure_enabled(repo)
-    usage = budget_check(args.get("force"))
-    model, effort, model_source = resolve_model("implement", args.get("model"), args.get("effort"))
+    w, notes = pick_worker(args.get("worker"), args.get("force"), args.get("fallback"))
+    model, effort, model_source = w.resolve_model("implement", args.get("model"), args.get("effort"))
     jid = new_id()
-    branch = "gemini/" + jid
-    worktree = os.path.join(CONFIG["worktreeDir"], "%s-%s" % (os.path.basename(repo), jid))
+    branch = "capocantiere/" + jid
+    worktree = os.path.join(common.WORKTREE_DIR, "%s-%s" % (os.path.basename(repo), jid))
 
     with GIT_LOCK:
         base = git(repo, "rev-parse", "HEAD").strip()
         base_label = "HEAD"
         if args.get("include_uncommitted") is not False:
             # `git stash create` makes a commit of the uncommitted changes WITHOUT touching the working tree
-            s = git(repo, "stash", "create", "gemini-delegate base " + jid).strip()
+            s = git(repo, "stash", "create", "capocantiere base " + jid).strip()
             if s:
                 base, base_label = s, "HEAD + uncommitted changes"
         git(repo, "worktree", "add", "-q", "-b", branch, worktree, base)
@@ -782,10 +456,18 @@ def create_job(args):
         "context": args.get("context") or "",
         "acceptance": args.get("acceptance") or "",
         "testCommand": args.get("test_command") or "",
+        "worker": w.id,
+        "requestedWorker": args.get("worker") or None,
+        "requestedModel": args.get("model") or None,
+        "requestedEffort": args.get("effort") or None,
+        "fallback": W.load_config()["fallback"] if args.get("fallback") is None else bool(args.get("fallback")),
+        "force": bool(args.get("force")),
         "model": model,
         "modelSource": model_source,
         "effort": effort,
-        "timeoutMin": args.get("timeout_minutes") or CONFIG["taskTimeoutMin"],
+        "timeoutMin": args.get("timeout_minutes") or w.timeout_min("implement"),
+        "notes": notes,
+        "attempts": [],
         "createdAt": iso_now(),
     }
     with STATE_LOCK:
@@ -793,49 +475,69 @@ def create_job(args):
         save_job(job)
         queue.append(jid)
     pump()
-    return job, usage
+    return job
+
+
+def reset_worktree(job):
+    """Throw away a failed attempt's edits before the next worker starts."""
+    git(job["worktree"], "reset", "-q", "--hard", "HEAD")
+    git(job["worktree"], "clean", "-qfd")
 
 
 def execute_job(job):
-    res = run_agy(
-        cwd=job["worktree"],
-        prompt=implement_prompt(job),
-        model=job["model"],
-        effort=job["effort"],
-        timeout_min=job["timeoutMin"],
-        skip_permissions=CONFIG["skipPermissionsInWorktree"],
-        kind="implement",
-        job_id=job["id"],
-        on_spawn=lambda c: children.__setitem__(job["id"], c),
-    )
-    children.pop(job["id"], None)
-    if job["status"] == "discarded":
-        return  # discarded while running
+    while True:
+        w = W.get_worker(job["worker"])
+        res = run_worker(
+            w, "implement", implement_prompt(job), job["worktree"], job["model"], job["effort"], job["timeoutMin"],
+            auto_approve=True, job_id=job["id"], on_spawn=lambda c: children.__setitem__(job["id"], c),
+        )
+        children.pop(job["id"], None)
+        if job["status"] == "discarded":
+            return  # discarded while running
+        if res["ok"] or not res["quota"] or not job.get("fallback"):
+            break
+        # quota / rate limit: move on to the next worker, if any is usable
+        try:
+            nxt, notes = pick_worker(None, job.get("force"), True, exclude=[a["worker"] for a in job["attempts"]] + [w.id])
+        except RuntimeError:
+            break
+        job["attempts"].append({"worker": w.id, "model": job["model"], "status": res["status"],
+                                "quota": True, "error": truncate(res["error"], 1000), "at": iso_now()})
+        job["notes"] = (job.get("notes") or []) + notes + [
+            "%s hit a quota/rate limit: relaunched on %s." % (w.id, nxt.id)]
+        reset_worktree(job)
+        job["worker"] = nxt.id
+        job["model"], job["effort"], job["modelSource"] = nxt.resolve_model(
+            "implement", None, job.get("requestedEffort"))  # a model name rarely means the same on another CLI
+        job["timeoutMin"] = nxt.timeout_min("implement")
+        save_job(job)
 
     job.update({
         "finishedAt": iso_now(),
-        "agyStatus": res["status"],
+        "workerStatus": res["status"],
         "response": res["response"],
         "conversationId": res["conversationId"],
         "turns": res["turns"],
         "usage": res["usage"],
+        "cost": res["cost"],
         "durationSeconds": res["durationSeconds"],
         "softDenied": res["softDenied"],
         "stderrTail": res["stderrTail"],
     })
 
-    # collect changes anyway, even if agy failed midway
+    # collect changes anyway, even if the worker failed midway
     collect_changes(job)
 
     if res["notFound"]:
         job["status"] = "failed"
-        job["error"] = 'Command "%s" not found. Install Antigravity CLI and run `agy` once to log in.' % CONFIG["agyBin"]
+        job["error"] = not_found_msg(w)
     elif not res["ok"]:
         job["status"] = "failed"
-        job["error"] = res["error"] or "agy exited with status %s" % res["status"]
+        job["error"] = res["error"] or "%s exited with status %s" % (w.id, res["status"])
         if res["quota"]:
-            job["error"] = "QUOTA EXHAUSTED / Gemini rate limit.\n" + job["error"]
-        job["error"] += unavailable_note(job["model"], res["error"])
+            job["error"] = "QUOTA EXHAUSTED / rate limit on %s%s.\n%s" % (
+                w.id, "" if job.get("fallback") else " (fallback off)", job["error"])
+        job["error"] += w.failure_note(job["model"], res["error"])
     else:
         job["status"] = "done" if job.get("filesChanged", 0) > 0 else "no_changes"
     save_job(job)
@@ -845,14 +547,6 @@ def execute_job(job):
             remove_worktree(job)
         except Exception:
             pass
-
-
-def unavailable_note(model, error):
-    """If agy rejected the model for this account, remember it so the next runs pick another."""
-    if not model or not MODEL_ERROR_RE.search(error or ""):
-        return ""
-    mark_unavailable(model)
-    return "\nModel %s has been marked unavailable; the next runs will pick another one (gemini_models refresh=true clears this)." % model
 
 
 # Build artifacts that never belong in a job's diff, even if the repo has no .gitignore for them.
@@ -867,9 +561,10 @@ def collect_changes(job):
     if staged["code"] == 1:
         git(
             job["worktree"],
-            "-c", "user.name=Gemini (agy)",
-            "-c", "user.email=gemini-delegate@localhost",
-            "commit", "-q", "--no-verify", "-m", "gemini: " + job["title"], "-m", "job " + job["id"],
+            "-c", "user.name=%s (capocantiere)" % job.get("worker", "worker"),
+            "-c", "user.email=capocantiere@localhost",
+            "commit", "-q", "--no-verify", "-m", "%s: %s" % (job.get("worker", "worker"), job["title"]),
+            "-m", "job " + job["id"],
         )
     stat = git(job["repo"], "diff", "--stat", job["base"], job["branch"])
     names = git(job["repo"], "diff", "--name-status", job["base"], job["branch"]).strip()
@@ -899,6 +594,7 @@ def job_summary(j):
     return {
         "id": j["id"],
         "title": j["title"],
+        "worker": j.get("worker"),
         "status": j["status"],
         "files_changed": j.get("filesChanged"),
         "duration_s": j.get("durationSeconds"),
@@ -907,24 +603,32 @@ def job_summary(j):
 
 
 def job_detail(j, include_diff=True, max_diff_chars=15000):
+    ws = j.get("workerStatus") or j.get("agyStatus")
     lines = [
         "JOB %s — %s" % (j["id"], j["title"]),
-        "status: %s%s" % (j["status"], " (agy: %s)" % j["agyStatus"] if j.get("agyStatus") else ""),
+        "status: %s%s" % (j["status"], " (%s: %s)" % (j.get("worker"), ws) if ws else ""),
+        "worker: %s" % j.get("worker"),
         "branch: %s   worktree: %s" % (j["branch"], j["worktree"]),
         "base: %s (%s)" % (j.get("baseLabel"), (j.get("base") or "")[:10]),
-        "model: %s%s%s" % (j.get("model") or "agy default",
-                           " (%s)" % j["modelSource"] if j.get("modelSource") else "",
+        "model: %s%s%s" % (j.get("model") or "CLI default",
+                           " (%s)" % j["modelSource"] if j.get("modelSource") not in (None, "", "CLI default") else "",
                            ", effort " + j["effort"] if j.get("effort") else ""),
     ]
     if j.get("durationSeconds") is not None:
         turns = j.get("turns")
-        lines.append("duration: %ss, turns: %s" % (round(j["durationSeconds"]), "?" if turns is None else turns))
+        extra = ", cost %s" % j["cost"] if j.get("cost") else ""
+        lines.append("duration: %ss, turns: %s%s" % (round(j["durationSeconds"]), "?" if turns is None else turns, extra))
+    for a in j.get("attempts") or []:
+        lines.append("earlier attempt: %s failed%s — %s" % (a["worker"], " (quota)" if a.get("quota") else "",
+                                                           (a.get("error") or "").split("\n")[0][:200]))
+    if j.get("notes"):
+        lines += ["", "NOTES:"] + ["- " + n for n in j["notes"]]
     if j.get("error"):
         lines += ["", "ERROR:", truncate(j["error"], 2500)]
     if j.get("softDenied"):
-        lines += ["", "ACTIONS DENIED TO agy (soft-deny):"] + j["softDenied"]
+        lines += ["", "ACTIONS DENIED TO THE WORKER (soft-deny):"] + j["softDenied"]
     if j.get("response"):
-        lines += ["", "GEMINI'S RESPONSE:", truncate(j["response"], 4000)]
+        lines += ["", "WORKER'S RESPONSE:", truncate(j["response"], 4000)]
     if j.get("diffStat"):
         lines += ["", "DIFF STAT:", j["diffStat"]]
     if include_diff and j.get("patchBytes") and j.get("patchFile") and os.path.exists(j["patchFile"]):
@@ -932,7 +636,7 @@ def job_detail(j, include_diff=True, max_diff_chars=15000):
             patch = f.read()
         lines += ["", "DIFF (full patch: %s):" % j["patchFile"], truncate(patch, max_diff_chars)]
     if j["status"] == "done":
-        lines += ["", "Next step: review the diff, then gemini_apply or gemini_discard (or a new gemini_delegate with the fixes)."]
+        lines += ["", "Next step: review the diff, then apply or discard (or a new delegate with the fixes)."]
     return "\n".join(lines)
 
 
@@ -947,6 +651,109 @@ def wait_for(ids, seconds):
             return True
         time.sleep(1)
     return all_done()
+
+
+# ---------------------------------------------------------------- analyze
+
+
+def analyze(a):
+    repo = repo_root(a.get("repo_dir"))
+    ensure_enabled(repo)
+    prompt = analyze_prompt(a.get("question") or "", a.get("paths"), a.get("max_words") or 600)
+
+    def snapshot():
+        s = run("git", ["status", "--porcelain=v1", "-uall"], cwd=repo)
+        d = run("git", ["diff"], cwd=repo)
+        return hashlib.sha1((s["stdout"] + d["stdout"]).encode("utf-8")).hexdigest()
+
+    fallback = W.load_config()["fallback"] if a.get("fallback") is None else bool(a.get("fallback"))
+    w, notes = pick_worker(a.get("worker"), a.get("force"), fallback)
+    requested_model = a.get("model")
+    tried = []
+    while True:
+        model, effort, model_source = w.resolve_model("analyze", requested_model, a.get("effort"))
+        before = snapshot()
+        res = run_worker(w, "analyze", prompt, repo, model, effort,
+                         a.get("timeout_minutes") or w.timeout_min("analyze"),
+                         auto_approve=False)  # in the main repo: no auto-approval
+        after = snapshot()
+        tried.append(w.id)
+        if res["notFound"]:
+            raise RuntimeError(not_found_msg(w))
+        if res["ok"] or not res["quota"] or not fallback:
+            break
+        try:
+            nxt, more = pick_worker(None, a.get("force"), True, exclude=tried)
+        except RuntimeError:
+            break
+        notes += more + ["%s hit a quota/rate limit: asked %s instead." % (w.id, nxt.id)]
+        w, requested_model = nxt, None
+    out = ["NOTES: " + " ".join(notes)] if notes else []
+    if not res["ok"]:
+        out.append("ERROR from %s (%s)%s:\n%s%s" % (w.id, res["status"], " — QUOTA/RATE LIMIT" if res["quota"] else "",
+                                                   truncate(res["error"], 2000), w.failure_note(model, res["error"])))
+    if before != after:
+        out.append("⚠️ WARNING: the repo state changed during the analysis. Check `git status` / `git diff`.")
+    out.append(truncate(res["response"] or "(no response)", 16000))
+    total = (res["usage"] or {}).get("total_tokens")
+    out.append("\n[analyze: %s, %s (%s), %ss, turns %s, tokens %s]" % (
+        w.id, model or "CLI default", model_source, round(res["durationSeconds"]), res["turns"],
+        "?" if total is None else total))
+    return {"text": "\n\n".join(out), "isError": not res["ok"] and not res["response"]}
+
+
+# ---------------------------------------------------------------- workers report
+
+
+def workers_report():
+    cfg = W.load_config()
+    usage = usage_by_worker(24)
+    lines = ["Workers, in preference order (config: %s%s):" % (
+        CONFIG_FILE, "" if os.path.exists(CONFIG_FILE) else ", not created yet: built-in defaults")]
+    for w in W.all_workers():
+        installed, version = w.version()
+        b = budget_state(w, usage)
+        u = b["usage"]
+        auth, auth_note = w.auth_status() if installed else (None, "")
+        state = "enabled" if w.enabled else "DISABLED"
+        if w.id == SESSION["default"]:
+            state += ", session default"
+        lines += ["", "%s — %s [%s]" % (w.id, w.label, state)]
+        lines.append("  installed: %s" % (version if installed else "NO (%s not found). %s" % (w.bin, w.INSTALL_HINT)))
+        if installed:
+            lines.append("  authenticated: %s" % ({True: "yes", False: "NO", None: "unknown"}[auth]
+                                                  + (" (%s)" % auth_note if auth_note else "")))
+        lines.append("  budget 24h: %d/%s used, %d left%s%s" % (
+            b["committed"], b["budget"], b["left"],
+            ", %d failed, %d quota errors" % (u["failures"], u["quota_errors"]) if u["failures"] else "",
+            ", cost %.4g" % u["cost"] if u["cost"] else ""))
+        lines.append("  jobs: %d running, %d queued (max %s)" % (
+            len(active_jobs(w.id, ("running",))), len(active_jobs(w.id, ("queued",))), w.s["max_parallel"]))
+        lines.append("  models: " + (w.models_line() if installed and w.enabled else "%s (configured)" % (w.s.get("model") or "CLI default")))
+        lines.append("  strengths: %s" % (", ".join(w.s.get("strengths") or []) or "—"))
+        for warning in w.warnings():
+            lines.append("  ⚠️ " + warning)
+    lines += ["", "Fallback on quota/budget: %s. Max parallel jobs overall: %s." % (
+        "on" if cfg["fallback"] else "off", cfg["max_parallel"])]
+    lines.append("Session default: %s." % (SESSION["default"] or "none (preference order)"))
+    lines.append(mode_line(current_repo()))
+    for e in cfg["errors"]:
+        lines.append("CONFIG ERROR: " + e)
+    lines.append("State: " + common.STATE_DIR)
+    return "\n".join(lines)
+
+
+def set_session_default(value):
+    v = (value or "").strip()
+    if v in ("", "auto", "none"):
+        SESSION["default"] = None
+        return "Session default cleared: workers are chosen in the configured order."
+    w = W.get_worker(v)
+    if not w.enabled:
+        raise RuntimeError("%s is disabled in %s; enable it there first." % (v, CONFIG_FILE))
+    installed, _ = w.version()
+    SESSION["default"] = v
+    return "Session default worker: %s%s." % (v, "" if installed else " (WARNING: %s not found)" % w.bin)
 
 
 # ---------------------------------------------------------------- tools
@@ -964,60 +771,29 @@ def _get_job(a):
 
 
 def call_tool(name, a):
-    if name == "gemini_delegate":
+    if name == "delegate":
         if not (a.get("task") or "").strip():
             raise RuntimeError("task is required")
-        job, usage = create_job(a)
+        job = create_job(a)
         wait = min(a.get("wait_seconds") or 0, 600)
         if wait > 0:
             wait_for([job["id"]], wait)
             if job["status"] in TERMINAL:
                 return job_detail(job)
-        return "\n".join([
-            "Job %s started (%s). Branch %s, base: %s." % (job["id"], job["status"], job["branch"], job["baseLabel"]),
-            "Model: %s (%s)." % (job["model"] or "agy default", job["modelSource"]),
-            "Active jobs: %d/%s running, %d queued." % (running_count(), CONFIG["maxParallel"], len(queue)),
-            "24h usage (including running jobs): %d/%s." % (usage["committed"] + 1, CONFIG["dailyBudget"]),
-            'Use gemini_jobs with job_id="%s" and wait_seconds to wait for the result.' % job["id"],
+        w = W.get_worker(job["worker"])
+        b = budget_state(w)
+        return "\n".join(([("NOTES: " + " ".join(job["notes"]))] if job["notes"] else []) + [
+            "Job %s started on %s (%s). Branch %s, base: %s." % (job["id"], job["worker"], job["status"], job["branch"], job["baseLabel"]),
+            "Model: %s (%s)." % (job["model"] or "CLI default", job["modelSource"]),
+            "Active jobs: %d running, %d queued." % (len(active_jobs(statuses=("running",))), len(queue)),
+            "%s 24h usage (including active jobs): %d/%s." % (w.id, b["committed"], b["budget"]),
+            'Use jobs with job_id="%s" and wait_seconds to wait for the result.' % job["id"],
         ])
 
-    if name == "gemini_analyze":
-        repo = repo_root(a.get("repo_dir"))
-        ensure_enabled(repo)
-        budget_check(a.get("force"))
-        model, effort, model_source = resolve_model("analyze", a.get("model"), a.get("effort"))
+    if name == "analyze":
+        return analyze(a)
 
-        def snapshot():
-            s = run("git", ["status", "--porcelain=v1", "-uall"], cwd=repo)
-            d = run("git", ["diff"], cwd=repo)
-            return hashlib.sha1((s["stdout"] + d["stdout"]).encode("utf-8")).hexdigest()
-
-        before = snapshot()
-        res = run_agy(
-            cwd=repo,
-            prompt=analyze_prompt(a.get("question") or "", a.get("paths"), a.get("max_words") or 600),
-            model=model,
-            effort=effort,
-            timeout_min=a.get("timeout_minutes") or CONFIG["analyzeTimeoutMin"],
-            skip_permissions=False,  # in the main repo: no auto-approval
-            kind="analyze",
-        )
-        after = snapshot()
-        out = []
-        if res["notFound"]:
-            raise RuntimeError('Command "%s" not found. Install Antigravity CLI and run `agy` once to log in.' % CONFIG["agyBin"])
-        if not res["ok"]:
-            out.append("ERROR (%s)%s:\n%s%s" % (res["status"], " — QUOTA/RATE LIMIT" if res["quota"] else "",
-                                                truncate(res["error"], 2000), unavailable_note(model, res["error"])))
-        if before != after:
-            out.append("⚠️ WARNING: the repo state changed during the analysis. Check `git status` / `git diff`.")
-        out.append(truncate(res["response"] or "(no response)", 16000))
-        total = (res["usage"] or {}).get("total_tokens")
-        out.append("\n[gemini_analyze: %s (%s), %ss, turns %s, tokens %s]" % (
-            model or "agy default", model_source, round(res["durationSeconds"]), res["turns"], "?" if total is None else total))
-        return {"text": "\n\n".join(out), "isError": not res["ok"] and not res["response"]}
-
-    if name == "gemini_jobs":
+    if name == "jobs":
         if a.get("job_id"):
             j = _get_job(a)
             if a.get("wait_seconds"):
@@ -1042,7 +818,7 @@ def call_tool(name, a):
             return "No open jobs."
         return "\n".join(json.dumps(job_summary(j), ensure_ascii=False, separators=(",", ":")) for j in visible)
 
-    if name == "gemini_apply":
+    if name == "apply":
         j = _get_job(a)
         if j["status"] in ("running", "queued"):
             raise RuntimeError("The job is still running.")
@@ -1073,7 +849,7 @@ def call_tool(name, a):
         return "Applied (%s) to the working tree of %s. Changes are NOT committed.\n%s%s\nNow: run tests/typecheck and polish if needed." % (
             how, j["repo"], warn + "\n" if warn else "", j.get("diffStat") or "")
 
-    if name == "gemini_discard":
+    if name == "discard":
         j = _get_job(a)
         was_running = j["status"] == "running"
         j["status"] = "discarded"
@@ -1093,32 +869,11 @@ def call_tool(name, a):
         remove_worktree(j)
         return "Job %s discarded." % j["id"]
 
-    if name == "gemini_usage":
-        u = usage_window(24)
-        v = run(CONFIG["agyBin"], ["--version"])
-        if not_found(v):
-            agy = "NOT FOUND"
-        else:
-            agy = ((v["stdout"] or v["stderr"]).strip().split("\n")[0]) or "ok"
-        active = [j for j in list(jobs.values()) if j["status"] not in TERMINAL]
-        review = [j for j in list(jobs.values()) if j["status"] == "done"]
-        return "\n".join([
-            "agy: %s (%s)" % (agy, CONFIG["agyBin"]),
-            "Last 24h: %d/%s runs, %d turns, %d tokens, %d failed, %d quota errors"
-            % (u["runs"], CONFIG["dailyBudget"], u["turns"], u["total_tokens"], u["failures"], u["quota_errors"]),
-            "Active jobs: %d (max parallel %s); to review: %d" % (len(active), CONFIG["maxParallel"], len(review)),
-            mode_line(current_repo()),
-            "Models: %s. Full list and settings: gemini_models." % models_in_use(),
-            "Config: effort=%s sandbox=%s skip_permissions_in_worktree=%s timeout_task=%sm" % (
-                CONFIG["effort"] or "(default)",
-                js(CONFIG["sandbox"]),
-                js(CONFIG["skipPermissionsInWorktree"]),
-                CONFIG["taskTimeoutMin"],
-            ),
-            "State: " + CONFIG["stateDir"],
-        ])
+    if name == "workers":
+        head = set_session_default(a["use"]) + "\n\n" if "use" in a else ""
+        return head + workers_report()
 
-    if name == "gemini_mode":
+    if name == "mode":
         if a.get("mode"):
             set_mode(a)
         try:
@@ -1127,11 +882,15 @@ def call_tool(name, a):
             repo = None
         return mode_report(repo)
 
-    if name == "gemini_models":
-        cache = model_cache(bool(a.get("refresh")))
+    if name == "models":
+        wid = a.get("worker") or "agy"
+        w = W.get_worker(wid)
+        if not isinstance(w, W.AgyWorker):
+            return ("%s does not publish a model list. Model in use: %s. Set \"model\" / \"analyze_model\" for it in %s, "
+                    "or pass model to delegate/analyze." % (wid, w.models_line(), CONFIG_FILE))
         if any(k in a for k in ("analyze", "implement", "exclude")):
-            update_model_settings(a)
-        return models_report(cache)
+            w.update_model_settings(a)
+        return w.models_report(bool(a.get("refresh")))
 
     raise RuntimeError("unknown tool: %s" % name)
 
@@ -1139,30 +898,38 @@ def call_tool(name, a):
 # ---------------------------------------------------------------- session summary (for the SessionStart hook)
 
 
-def current_repo():
-    try:
-        return repo_root()
-    except Exception:
-        return None
-
-
 def session_summary():
     repo = current_repo()
+    tag = "[capocantiere]"
     if delegation_mode(repo)[0] == "off":
-        return "[gemini-delegate] " + mode_line(repo)
-    v = run(CONFIG["agyBin"], ["--version"])
-    if not_found(v):
-        return ("[gemini-delegate] agy not found: delegation to Gemini is unavailable in this session "
-                "(install Antigravity CLI and run `agy` to log in).")
+        return "%s %s" % (tag, mode_line(repo))
+    usage = usage_by_worker(24)
+    ready, other = [], []
+    for w in W.all_workers():
+        if not w.enabled:
+            continue
+        installed, _ = w.version()
+        if not installed:
+            other.append("%s not installed" % w.id)
+            continue
+        if w.blocker():
+            other.append("%s unusable: %s" % (w.id, w.blocker()))
+            continue
+        b = budget_state(w, usage)
+        u = b["usage"]
+        ready.append("%s (%d/%s runs left%s; good at %s)" % (
+            w.id, b["left"], b["budget"], ", %d recent quota errors" % u["quota_errors"] if u["quota_errors"] else "",
+            ", ".join(w.s.get("strengths") or []) or "anything"))
+        other += ["%s: %s" % (w.id, x) for x in w.warnings()]
     lines = []
-    u = usage_window(24)
-    left = max(CONFIG["dailyBudget"] - u["runs"], 0)
-    lines.append(
-        "[gemini-delegate] Delegation to Gemini available (MCP tools gemini_*). 24h budget: %s/%s runs left" % (left, CONFIG["dailyBudget"])
-        + (", WARNING: %d recent quota errors" % u["quota_errors"] if u["quota_errors"] else "") + "."
-    )
-    lines.append("[gemini-delegate] " + mode_line(repo))
-    lines.append("[gemini-delegate] Models: %s. Full list: gemini_models." % models_in_use())
+    if ready:
+        lines.append("%s Workers available for delegation (MCP tools delegate/analyze/jobs/apply/discard/workers), "
+                     "in preference order: %s." % (tag, "; ".join(ready)))
+    else:
+        lines.append("%s No worker is available in this session (none enabled and installed): work without delegating. "
+                     "See the workers tool." % tag)
+    lines += ["%s %s" % (tag, o) for o in other]
+    lines.append("%s %s" % (tag, mode_line(repo)))
     if repo:
         pending = [
             j for j in jobs.values()
@@ -1170,9 +937,9 @@ def session_summary():
         ]
         if pending:
             lines.append(
-                "[gemini-delegate] Jobs from previous sessions still open in this repo: %s. "
-                "Review them with gemini_jobs, then gemini_apply or gemini_discard."
-                % "; ".join("%s (%s: %s)" % (j["id"], j["status"], j["title"]) for j in pending)
+                "%s Jobs from previous sessions still open in this repo: %s. "
+                "Review them with jobs, then apply or discard."
+                % (tag, "; ".join("%s (%s on %s: %s)" % (j["id"], j["status"], j.get("worker"), j["title"]) for j in pending))
             )
     return "\n".join(lines)
 
@@ -1199,9 +966,10 @@ def handle(msg):
             result = {
                 "protocolVersion": params.get("protocolVersion") or "2025-06-18",
                 "capabilities": {"tools": {"listChanged": False}},
-                "serverInfo": {"name": "gemini-delegate", "version": VERSION},
-                "instructions": "Tools for delegating work to Gemini (Antigravity CLI) using the user's Google subscription. "
-                "You remain the manager: you plan, delegate well-specified tasks, review the diffs, and apply or discard them.",
+                "serverInfo": {"name": "capocantiere", "version": VERSION},
+                "instructions": "Tools for delegating work to external coding-agent CLIs (workers: GitHub Copilot CLI, "
+                "Mistral Vibe, ...). You remain the manager: you plan, delegate well-specified tasks, review the diffs, "
+                "and apply or discard them.",
             }
         elif method == "ping":
             result = {}
@@ -1227,6 +995,10 @@ def handle(msg):
 
 
 def main():
+    common.ensure_dirs()
+    if "--example-config" in sys.argv:
+        sys.stdout.write(json.dumps(W.example_config(), indent=2) + "\n")
+        return
     load_jobs()
     if "--session-summary" in sys.argv:
         try:

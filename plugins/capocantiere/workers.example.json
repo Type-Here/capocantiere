@@ -1,0 +1,111 @@
+{
+  "_comment": "Copy to ~/.config/capocantiere/workers.json and keep only what you change: missing keys use the built-in defaults. Keys starting with _ are comments. Environment variables CAPOCANTIERE_<WORKER>_<SETTING> (e.g. CAPOCANTIERE_VIBE_MAX_PRICE=1) override this file.",
+  "order": [
+    "copilot",
+    "vibe",
+    "agy"
+  ],
+  "_order": "Preference order when no worker is requested (the session default from /capocantiere:use goes first).",
+  "fallback": true,
+  "_fallback": "On a quota/rate-limit error or an exhausted budget, move the job to the next worker.",
+  "max_parallel": 4,
+  "_max_parallel": "Jobs running at once across all workers (each worker also has its own max_parallel).",
+  "workers": {
+    "copilot": {
+      "_comment": "GitHub Copilot CLI. Logs in with `copilot login`. daily_budget counts runs (each run costs AI credits / premium requests). deny_tools are always denied while auto-approving in the job's worktree.",
+      "enabled": true,
+      "bin": "copilot",
+      "model": "",
+      "analyze_model": "",
+      "effort": "",
+      "daily_budget": 40,
+      "max_parallel": 2,
+      "timeout_min": 20,
+      "analyze_timeout_min": 8,
+      "extra_args": [],
+      "env": {},
+      "strengths": [
+        "tests",
+        "boilerplate",
+        "refactor",
+        "docs"
+      ],
+      "deny_tools": [
+        "shell(git push)",
+        "shell(git remote)",
+        "shell(git config)",
+        "shell(git worktree)",
+        "shell(git branch)",
+        "shell(git checkout)",
+        "shell(git switch)",
+        "shell(git reset)",
+        "shell(git rebase)",
+        "shell(gh)",
+        "shell(sudo)"
+      ],
+      "disable_builtin_mcps": true,
+      "sandbox": false,
+      "max_ai_credits": 0,
+      "secret_env_vars": [
+        "MISTRAL_API_KEY",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY"
+      ]
+    },
+    "vibe": {
+      "_comment": "Mistral Vibe CLI. Signs in with your Mistral account (run `vibe` once; the Free plan works) or MISTRAL_API_KEY. max_price is a USD cap per run computed from vibe's configured prices: an extra guard only. Set outside_workdir = \"deny\" in ~/.vibe/config.toml.",
+      "enabled": true,
+      "bin": "vibe",
+      "model": "",
+      "analyze_model": "",
+      "effort": "",
+      "daily_budget": 60,
+      "max_parallel": 2,
+      "timeout_min": 20,
+      "analyze_timeout_min": 8,
+      "extra_args": [],
+      "env": {},
+      "strengths": [
+        "analysis",
+        "docs",
+        "boilerplate",
+        "tests"
+      ],
+      "max_turns": 40,
+      "max_price": 0.5,
+      "max_tokens": 0,
+      "trust": true,
+      "analyze_tools": [
+        "read_file",
+        "grep"
+      ],
+      "disabled_tools": []
+    },
+    "agy": {
+      "_comment": "Antigravity CLI. DISABLED by default: running `agy -p` inside third-party agents is not supported on consumer plans and can get the account suspended. Enable it only with an API key, never with the subscription login.",
+      "enabled": false,
+      "auth": "api_key",
+      "_auth": "api_key: Gemini API key from AI Studio in GEMINI_API_KEY (export it, or set it under env); adc: Google Cloud Application Default Credentials; login: the signed-in Google account (NOT recommended, see above).",
+      "bin": "agy",
+      "model": "",
+      "analyze_model": "",
+      "effort": "",
+      "daily_budget": 150,
+      "max_parallel": 3,
+      "timeout_min": 20,
+      "analyze_timeout_min": 8,
+      "extra_args": [],
+      "env": {},
+      "strengths": [
+        "analysis",
+        "boilerplate",
+        "tests",
+        "docs"
+      ],
+      "sandbox": true,
+      "skip_permissions": true
+    }
+  }
+}

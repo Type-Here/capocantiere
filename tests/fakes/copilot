@@ -1,0 +1,42 @@
+#!/usr/bin/env python3
+"""Fake GitHub Copilot CLI for the tests. Mimics the flags of Copilot CLI 1.0.114 that the adapter uses."""
+
+import json
+import os
+import sys
+
+import _fake
+
+argv = sys.argv[1:]
+if argv[:1] in (["--version"], ["-v"]):
+    print("GitHub Copilot CLI 0.0.0-fake.")
+    sys.exit(0)
+
+
+def values(flag):
+    out = []
+    for i, a in enumerate(argv):
+        if a == flag and i + 1 < len(argv):
+            out.append(argv[i + 1])
+        elif a.startswith(flag + "="):
+            out.append(a.split("=", 1)[1])
+    return out
+
+
+prompt = (values("-p") or values("--prompt") or [""])[0]
+if not prompt:
+    _fake.finish(1, "", "error: this fake only supports -p\n")
+sc = _fake.scenario(prompt, "copilot")
+cwd = os.getcwd()
+_fake.log("copilot", argv, cwd, sc)
+
+denied = values("--deny-tool")
+may_write = ("--allow-all-tools" in argv or "--allow-all" in argv or "--yolo" in argv) and "write" not in denied
+code, out, err = _fake.act("copilot", sc, cwd, may_write)
+
+usage_file = (values("--usage-output-file") or [None])[0]
+if usage_file and code == 0:
+    with open(usage_file, "w", encoding="utf-8") as f:
+        json.dump({"totalNanoAiu": 2500000000, "totalPremiumRequestCost": 1,
+                   "modelMetrics": {"fake-model": {"inputTokens": 1200, "outputTokens": 300}}}, f)
+_fake.finish(code, out + "\n" if out else "", err)

@@ -1,0 +1,26 @@
+#!/usr/bin/env python3
+"""Fake Antigravity CLI for the tests: -p ... --output-format json, plus `models` and --version."""
+
+import json
+import os
+import sys
+
+import _fake
+
+argv = sys.argv[1:]
+if argv[:1] == ["--version"]:
+    print("1.0.0-fake")
+    sys.exit(0)
+if argv[:1] == ["models"]:
+    print("gemini-9-flash-high\tGemini 9 Flash\ngemini-9-pro-high\tGemini 9 Pro")
+    sys.exit(0)
+prompt = argv[argv.index("-p") + 1] if "-p" in argv else ""
+sc = _fake.scenario(prompt, "agy")
+cwd = os.getcwd()
+_fake.log("agy", argv + ["ENV:AGY_ADC_AUTH=%s" % os.environ.get("AGY_ADC_AUTH", ""),
+                         "ENV:GEMINI_API_KEY=%s" % ("set" if os.environ.get("GEMINI_API_KEY") else "")], cwd, sc)
+code, out, err = _fake.act("agy", sc, cwd, "--dangerously-skip-permissions" in argv)
+print(json.dumps({"status": "SUCCESS" if code == 0 else "ERROR", "response": out, "error": err.strip() or None,
+                  "num_turns": 3, "usage": {"total_tokens": 500}}))
+sys.stderr.write(err)
+sys.exit(code)
