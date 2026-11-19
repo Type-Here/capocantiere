@@ -60,7 +60,7 @@ The session-start message lists the workers available, their remaining budget an
 2. **Break the work down** into independent tasks that touch different files. Tasks that touch the same files go in sequence, not in parallel.
 3. **Delegate** with `delegate`, one job per task. Several independent jobs can be launched right away in parallel, also on different workers (the server queues them beyond the limits).
 4. **While the workers run**, do your own part (the hard part) instead of waiting.
-5. **Collect** with `jobs` using `wait_seconds` (e.g. 300). For each `done` job, look at the diff.
+5. **Collect** with `jobs` using `wait_seconds` (at most 110: Claude Code moves tool calls over 120 s to the background; call again if the job is still running). For each `done` job, look at the diff.
 6. **Actually review.** Check: does it do what the task asked? Did it touch files it wasn't asked to? Does it follow the style? Are there notes or denied actions (soft-deny) in the response? For large diffs you can have the `worker-reviewer` subagent do a first pass.
 7. **Decide:**
    - good → `apply` (the changes land in the working tree, uncommitted), then run tests/typecheck yourself;
@@ -103,6 +103,7 @@ test_command: "npm test -- users"
 
 - Every job starts from the current state of the working tree: uncommitted changes and untracked files included (also the files created by jobs you just applied), except files ignored by `.gitignore` and untracked files over 5 MB (the job's notes list them).
 - The main repo is never touched until you call `apply`. If the apply fails due to conflicts, the repo has changed too much: relaunch the task on the new state.
+- `analyze` is synchronous: a long one may be moved to the background, and its result then arrives as a notification. Ask questions a reader can answer by reading and searching files; an analysis cannot run commands that change anything (and with vibe only read-only shell commands run).
 - Inside the worktree, workers auto-approve their tool calls, with dangerous commands (e.g. `git push`) denied. `analyze` runs in the main repo without auto-approval and with edits denied; if it reports that the repo state changed, check `git status`.
 - **`blame`** tells which applied job (worker, model, date, task title) wrote the lines of a file, matching them by content, so it still works after commits and moved code; lines edited after the apply count as not from a worker. Use it when a bug lands in code a worker may have written: reread that job's task (`jobs` with its id, if still listed) to see whether the spec or the worker was at fault. Don't call it routinely.
 - At session start you may receive the list of open jobs from previous sessions: handle them (apply or discard) before letting them pile up.

@@ -304,6 +304,13 @@ class E2E(unittest.TestCase):
         self.vibe_config('outside_workdir = "deny"\n')
         self.assertNotIn("outside_workdir", self.server.ok("workers"))
 
+    def test_vibe_warnings_grep_and_isolation(self):
+        text = self.server.ok("workers")
+        self.assertIn("vibe auto-approves every command", text)  # isolation is "none" in these tests
+        self.assertNotIn('analyze_tools lists "grep"', text)
+        self.write_config(vibe={"analyze_tools": ["read_file", "grep"]})
+        self.assertIn('analyze_tools lists "grep"', self.server.ok("workers"))
+
     def test_generic_error_does_not_fall_back(self):
         jid, text = self.delegate("FAKE:error", worker="copilot")
         self.assertIn("status: failed", text)
@@ -385,7 +392,8 @@ class E2E(unittest.TestCase):
         self.server.ok("analyze", {"question": "what is in main.txt?", "worker": "vibe"})
         v = self.calls("vibe")[0]["argv"]
         self.assertNotIn("--auto-approve", v)
-        self.assertEqual([v[i + 1] for i, a in enumerate(v) if a == "--enabled-tools"], ["read_file", "grep"])
+        self.assertEqual([v[i + 1] for i, a in enumerate(v) if a == "--enabled-tools"], ["read_file", "bash"])
+        self.assertEqual(v[v.index("--max-tokens") + 1], "200000")  # analyze_max_tokens
         self.assertFalse(os.path.exists(os.path.join(self.repo, "fake-vibe.txt")))
 
     # ------------------------------------------------------------ apply / discard
