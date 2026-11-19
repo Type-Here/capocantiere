@@ -13,6 +13,7 @@ import argparse
 import json
 import os
 import queue
+import re
 import shutil
 import subprocess
 import sys
@@ -937,6 +938,159 @@ class E2E(unittest.TestCase):
         with open(os.path.join(self.tmp, "state", "capocantiere", "jobs", "g0101-0000-abcd.json")) as f:
             self.assertIn(os.path.join("capocantiere", "patches"), json.load(f)["patchFile"])
 
+    # ------------------------------------------------------------ trust scores
+
+    def score_events(self):
+        path = os.path.join(self.tmp, "state", "capocantiere", "scores.jsonl")
+        if not os.path.exists(path):
+            return []
+        with open(path) as f:
+            return [json.loads(l) for l in f if l.strip()]
+
+    def last_score(self, rid):
+        """The latest score event of this job/analysis id (the only one that counts)."""
+        evs = [e for e in self.score_events() if e["id"] == rid]
+        self.assertTrue(evs, "no score event for %s" % rid)
+        return evs[-1]
+
+    def write_history(self, n=30):
+        """A history of n reward-0.0 events on the copilot arm, so score-based selection must avoid it."""
+        path = os.path.join(self.tmp, "state", "capocantiere", "scores.jsonl")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        ts = int(time.time() * 1000)
+        with open(path, "w") as f:
+            for i in range(n):
+                f.write(json.dumps({"ts": ts, "id": "j-history-%04d" % i, "repo": self.repo, "worker": "copilot",
+                                    "requested": "", "effective": None, "model": "fake-model", "kind": "implement",
+                                    "tier": "standard", "event": "apply:bad", "reward": 0.0}) + "\n")
+
+    def analyze_id(self, text):
+        m = re.search(r"\bid (a[0-9a-z-]+)\]", text)
+        self.assertTrue(m, "no analysis id in:\n" + text)
+        return m.group(1)
+
+    def skip_on_node(self):
+        if RUNTIME == "node":
+            self.skipTest("the Node server is frozen: no trust scores")
+
+    def test_score_apply(self):
+        self.skip_on_node()
+        self.assertTrue(self.server.ok("workers", {"scores": True}).startswith("No trust scores yet"))
+        jid, _ = self.delegate("add a file", worker="copilot")
+        self.assertIn("Applied", self.server.ok("apply", {"job_id": jid}))  # default quality: good
+        e = self.last_score(jid)
+        self.assertEqual((e["event"], e["reward"], e["worker"], e["model"], e["kind"]),
+                         ("apply:good", 1.0, "copilot", "fake-model", "implement"))
+        jid, _ = self.delegate("add a file", worker="copilot")
+        self.assertIn("Applied", self.server.ok("apply", {"job_id": jid, "quality": "minor_fixes"}))
+        e = self.last_score(jid)
+        self.assertEqual((e["event"], e["reward"]), ("apply:minor_fixes", 0.6))
+
+    def test_score_discard(self):
+        self.skip_on_node()
+        jid, _ = self.delegate("add a file", worker="copilot")
+        self.assertIn("discarded", self.server.ok("discard", {"job_id": jid}))  # no reason = bad
+        e = self.last_score(jid)
+        self.assertEqual((e["event"], e["reward"]), ("discard:bad", 0.0))
+        jid, _ = self.delegate("add a file", worker="copilot")
+        self.assertIn("discarded", self.server.ok("discard", {"job_id": jid, "reason": "obsolete"}))
+        e = self.last_score(jid)
+        self.assertEqual(e["event"], "discard:obsolete")
+        self.assertIsNone(e["reward"])  # obsolete: the job is withdrawn, no vote either way
+
+    def test_score_quota_is_no_vote(self):
+        self.skip_on_node()
+        jid, text = self.delegate("FAKE:quota-copilot add a file", worker="copilot")
+        self.assertIn("worker: vibe", text)
+        evs = [e for e in self.score_events() if e["worker"] == "copilot"]
+        self.assertEqual([(e["id"], e["event"], e["reward"]) for e in evs], [(jid, "quota", None)])
+        v = [e for e in self.score_events() if e["worker"] == "vibe"]  # the job ended on vibe
+        self.assertEqual(v[-1]["event"], "done")
+        self.assertIsNone(v[-1]["reward"])
+
+    def test_score_no_changes_then_rate(self):
+        self.skip_on_node()
+        jid, text = self.delegate("FAKE:noop look around", worker="copilot")
+        self.assertIn("status: no_changes", text)
+        e = self.last_score(jid)
+        self.assertEqual((e["event"], e["reward"]), ("no_changes", 0.0))
+        self.assertIn("vote withdrawn", self.server.ok("rate", {"id": jid, "quality": "obsolete"}))
+        e = self.last_score(jid)
+        self.assertEqual(e["event"], "rate:obsolete")
+        self.assertIsNone(e["reward"])
+
+    def test_score_analysis_rate(self):
+        self.skip_on_node()
+        out = self.server.ok("analyze", {"question": "FAKE:noop what is in main.txt?", "worker": "copilot"})
+        aid = self.analyze_id(out)
+        e = self.last_score(aid)
+        self.assertEqual((e["event"], e["reward"]), ("analysis", None))  # analyses only vote when rated
+        self.assertIn("Rated %s (copilot:fake-model): good." % aid, self.server.ok("rate", {"id": aid, "quality": "good"}))
+        e = self.last_score(aid)
+        self.assertEqual((e["event"], e["reward"], e["kind"]), ("rate:good", 1.0, "analysis"))
+
+    def test_score_requested_worker_wins(self):
+        self.skip_on_node()
+        self.write_history()
+        self.write_config(glob={"selection": "scores"})
+        jid, text = self.delegate("add a file", worker="copilot")
+        self.assertIn("worker: copilot", text)
+        self.assertIn("worker requested", text)  # an explicit request ignores the scores
+
+    def test_score_order_ignores_scores(self):
+        self.skip_on_node()
+        self.write_history()
+        self.write_config(glob={"selection": "order"})
+        jid, text = self.delegate("add a file")
+        self.assertIn("worker: copilot", text)
+        self.assertIn("worker configured order", text)
+
+    def test_score_selection_avoids_bad_history(self):
+        self.skip_on_node()
+        # CAPOCANTIERE_SEED must be set before the server starts: scores.py seeds its sampler at import time
+        self.env["CAPOCANTIERE_SEED"] = "1"
+        self.write_history()
+        self.write_config(glob={"selection": "scores"})
+        workers = [self.delegate("FAKE:noop look around")[1] for _ in range(6)]
+        copilot = sum("worker: copilot" in t for t in workers)  # vibe has no history and a prior near 0.6
+        self.assertLessEqual(copilot, 1, "\n\n".join("\n".join(t.split("\n")[:3]) for t in workers))
+        self.assertIn("chosen by trust score", workers[-1])
+
+    def test_tier_selection(self):
+        self.skip_on_node()
+        self.write_config(glob={"selection": "order"}, copilot={"tiers": {"fast": "m-fast"}})
+        jid, text = self.delegate("add a file", tier="fast")
+        self.assertIn("worker: copilot", text)
+        self.assertIn("tier: fast", text)
+        c = self.calls("copilot")[-1]["argv"]
+        self.assertEqual(c[c.index("--model") + 1], "m-fast")
+        jid, text = self.delegate("add a file", tier="strong")
+        self.assertIn("worker: vibe", text)  # copilot only serves the tiers its "tiers" setting lists
+        self.assertIn("tier: strong", text)
+        self.assertEqual(len(self.calls("copilot")), 1)  # no copilot call was made again
+
+
+class Scores(unittest.TestCase):
+    """Unit tests of the score computation itself, imported directly and without a server."""
+
+    def test_decay(self):
+        sys.path.insert(0, os.path.join(ROOT, "plugins", "capocantiere", "server"))
+        try:
+            import scores
+        finally:
+            sys.path.pop(0)
+        now = int(time.time() * 1000)
+        events = [{"id": "j1", "worker": "copilot", "model": "fake-model", "kind": "implement",
+                   "ts": now - 30 * scores.DAY_MS, "reward": 1.0}]
+        t = scores.Table(events, 30, now=now)  # half_life_days=30
+        self.assertEqual(t.arms(), ["copilot:fake-model"])
+        self.assertAlmostEqual(t.glob["copilot:fake-model"][2], 0.5, places=6)  # weight after one half-life
+        self.assertAlmostEqual(t.glob["copilot:fake-model"][0], 0.5, places=6)  # the reward 1.0 part of it
+        self.assertAlmostEqual(t.kind[("copilot:fake-model", "implement")][2], 0.5, places=6)
+        events[0]["ts"] = now - 60 * scores.DAY_MS  # two half-lives: weight 0.25
+        t = scores.Table(events, 30, now=now)
+        self.assertAlmostEqual(t.glob["copilot:fake-model"][2], 0.25, places=6)
+
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
@@ -947,6 +1101,6 @@ if __name__ == "__main__":
     loader = unittest.TestLoader()
     if args.k:
         loader.testNamePatterns = ["*%s*" % args.k]
-    suite = loader.loadTestsFromTestCase(E2E)
+    suite = unittest.TestSuite(loader.loadTestsFromTestCase(c) for c in (E2E, Scores))
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     sys.exit(0 if result.wasSuccessful() else 1)
