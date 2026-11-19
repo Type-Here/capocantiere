@@ -43,7 +43,9 @@ Rule of thumb: if you can write the acceptance criteria in a few lines and verif
 
 The session-start message lists the workers available, their remaining budget and their strengths; `workers` gives the full picture (installed, authenticated, budget used/left, active jobs, model, warnings).
 
-- **Usually omit `worker`.** The server uses the session default (set by the user with `/capocantiere:use`) or the configured preference order, and skips workers that are disabled, not installed or out of budget.
+- **Usually omit `worker`.** The server uses the session default (set by the user with `/capocantiere:use`); otherwise it ranks every worker:model by its **trust score** for the kind of task (learned from how past jobs went, with some exploration) or, if the user configured so, follows the preference order. It skips workers that are disabled, not installed or out of budget.
+- **Always pass `kind`** on `delegate` (`implement`, `tests`, `refactor`, `docs`): it costs two words and is what the trust scores learn from.
+- **Pass `tier` only when the task is clearly simple (`fast`) or clearly hard (`strong`, `frontier`).** Without it jobs use `standard` and analyses `fast`.
 - **Pass `worker` when it clearly matters:**
   - match the task to the worker's `strengths` (tags such as `tests`, `boilerplate`, `docs`, `refactor`, `analysis`);
   - spread parallel jobs across workers when one of them has little budget left or already has jobs running (each worker has its own `max_parallel`);
@@ -62,9 +64,11 @@ The session-start message lists the workers available, their remaining budget an
 6. **Actually review.** Check: does it do what the task asked? Did it touch files it wasn't asked to? Does it follow the style? Are there notes or denied actions (soft-deny) in the response? For large diffs you can have the `worker-reviewer` subagent do a first pass.
 7. **Decide:**
    - good → `apply` (the changes land in the working tree, uncommitted), then run tests/typecheck yourself;
-   - almost good → apply and fix the details yourself (often cheaper than a second round);
-   - wrong → `discard` and relaunch with a better spec (possibly on another worker), or do it yourself.
+   - almost good → apply and fix the details yourself (often cheaper than a second round), with `quality: "minor_fixes"`, or `"major_fixes"` if much of it must be redone;
+   - wrong → `discard` and relaunch with a better spec (possibly on another worker), or do it yourself. If the job is fine but no longer needed (the plan changed), pass `reason: "obsolete"` so the worker isn't blamed.
 8. **Final verification** is always yours: tests, build, lint on the main repo.
+
+**Trust scores.** `apply` and `discard` already vote for the worker (the defaults cover the normal case); failures and empty results count against it, quota errors don't. Rate an `analyze` (its id is in the footer) with `rate` only when it was clearly useful (`good`) or useless (`bad`); use `rate` on a job only to correct its vote, e.g. when bugs in applied code show up later. A high score never replaces the review: review every worker the same way.
 
 ## Writing a good task
 
