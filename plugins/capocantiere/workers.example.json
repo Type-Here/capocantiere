@@ -10,6 +10,14 @@
   "_fallback": "On a quota/rate-limit error or an exhausted budget, move the job to the next worker.",
   "max_parallel": 4,
   "_max_parallel": "Jobs running at once across all workers (each worker also has its own max_parallel).",
+  "isolation": "none",
+  "_isolation": "How worker processes are isolated: none, auto (the backend of this system), bwrap (Linux), seatbelt (macOS, EXPERIMENTAL). A worker whose isolation cannot work is skipped, never run unisolated. Each worker can override it. Check what is missing with /capocantiere:doctor.",
+  "keyring_dbus_names": [
+    "org.freedesktop.secrets",
+    "org.kde.kwalletd6",
+    "org.kde.kwalletd5"
+  ],
+  "_keyring_dbus_names": "Linux, \"host\" credentials: the only session D-Bus services an isolated worker can reach (through xdg-dbus-proxy), i.e. the system keyring.",
   "workers": {
     "copilot": {
       "_comment": "GitHub Copilot CLI. Logs in with `copilot login`. daily_budget counts runs (each run costs AI credits / premium requests). deny_tools are always denied while auto-approving in the job's worktree.",
@@ -52,7 +60,14 @@
         "GOOGLE_API_KEY",
         "ANTHROPIC_API_KEY",
         "OPENAI_API_KEY"
-      ]
+      ],
+      "credentials": "host",
+      "isolation": "",
+      "isolation_rw": [],
+      "isolation_ro": [],
+      "isolation_env": [],
+      "_credentials": "\"host\": the login of the CLI itself (copilot login, in the system keyring). \"token\": a fine-grained personal access token with only the \"Copilot Requests\" permission, read from ~/.local/state/capocantiere/credentials/copilot (chmod 600) or CAPOCANTIERE_COPILOT_TOKEN and given to this worker only, as COPILOT_GITHUB_TOKEN. Same for vibe (MISTRAL_API_KEY) and agy (GEMINI_API_KEY).",
+      "_isolation": "Empty = the global setting. isolation_rw / isolation_ro: extra paths the isolated worker may write / read; isolation_env: extra environment variables it keeps (names, or prefixes ending in \"_\")."
     },
     "vibe": {
       "_comment": "Mistral Vibe CLI. Signs in with your Mistral account (run `vibe` once; the Free plan works) or MISTRAL_API_KEY. max_price is a USD cap per run computed from vibe's configured prices: an extra guard only. Set outside_workdir = \"deny\" in ~/.vibe/config.toml.",
@@ -81,7 +96,12 @@
         "read_file",
         "grep"
       ],
-      "disabled_tools": []
+      "disabled_tools": [],
+      "credentials": "host",
+      "isolation": "",
+      "isolation_rw": [],
+      "isolation_ro": [],
+      "isolation_env": []
     },
     "agy": {
       "_comment": "Antigravity CLI. DISABLED by default: running `agy -p` inside third-party agents is not supported on consumer plans and can get the account suspended. Enable it only with an API key, never with the subscription login.",
@@ -105,7 +125,12 @@
         "docs"
       ],
       "sandbox": true,
-      "skip_permissions": true
+      "skip_permissions": true,
+      "credentials": "host",
+      "isolation": "",
+      "isolation_rw": [],
+      "isolation_ro": [],
+      "isolation_env": []
     }
   }
 }

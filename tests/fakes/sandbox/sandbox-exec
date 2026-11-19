@@ -1,0 +1,14 @@
+#!/usr/bin/env python3
+"""Fake macOS sandbox-exec for the tests: logs the profile, then runs the command without any sandbox."""
+
+import os
+import sys
+
+import _log
+
+argv = sys.argv[1:]
+if argv[:1] != ["-p"] or len(argv) < 3:
+    sys.stderr.write("fake sandbox-exec: expected -p <profile> <command>\n")
+    sys.exit(2)
+_log.log("sandbox-exec", argv[2:], profile=argv[1])
+os.execvp(argv[2], argv[2:])

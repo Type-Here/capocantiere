@@ -33,6 +33,8 @@ _fake.log("copilot", argv, cwd, sc)
 denied = values("--deny-tool")
 may_write = ("--allow-all-tools" in argv or "--allow-all" in argv or "--yolo" in argv) and "write" not in denied
 code, out, err = _fake.act("copilot", sc, cwd, may_write)
+if sc == "probe":
+    out += "\nPROBE " + json.dumps(_fake.probe(prompt))
 
 usage_file = (values("--usage-output-file") or [None])[0]
 if usage_file and code == 0:

@@ -124,6 +124,8 @@ class E2E(unittest.TestCase):
             "VIBE_HOME": self.vibe_home,
             "MISTRAL_API_KEY": "fake-key",
             "FAKE_LOG": self.log,
+            "GIT_CONFIG_GLOBAL": os.devnull,  # the user's git config (e.g. commit signing) must not affect the tests
+            "GIT_CONFIG_NOSYSTEM": "1",
         })
         self.write_config()
         self._server = None
@@ -451,6 +453,248 @@ class E2E(unittest.TestCase):
         text = self.server.ok("workers")
         self.assertNotIn("CONFIG ERROR", text)
         self.assertIn("agy — Antigravity CLI (Gemini) [DISABLED]", text)
+
+    # ------------------------------------------------------------ isolation hook
+
+    def test_isolation_none_is_the_default(self):
+        jid, text = self.delegate("add a file", worker="copilot")
+        self.assertIn("status: done", text)
+        self.assertEqual(os.path.basename(self.calls("copilot")[0]["argv"][0]), "-p")  # run unwrapped
+
+    def test_unknown_isolation_backend_skips_the_worker(self):
+        self.write_config(copilot={"isolation": "chroot"})
+        jid, text = self.delegate("add a file")
+        self.assertIn('copilot skipped: isolation "chroot" is unknown', text)
+        self.assertIn("worker: vibe", text)
+        self.assertEqual(self.calls("copilot"), [])
+
+    # ------------------------------------------------------------ credentials and isolation backends
+
+    SANDBOX_FAKES = os.path.join(FAKES, "sandbox")
+
+    def use_sandbox_fakes(self, only=None):
+        """Put the fake bwrap / xdg-dbus-proxy / sandbox-exec first on PATH. With only, PATH holds nothing else
+        than the basic tools and those fakes, so the other sandbox tools look missing."""
+        if only is None:
+            self.env["PATH"] = self.SANDBOX_FAKES + os.pathsep + self.env["PATH"]
+            return
+        d = os.path.join(self.tmp, "bin")
+        os.makedirs(d)
+        for tool in ("sh", "dirname", "python3", "git", "env", "true"):
+            os.symlink(shutil.which(tool), os.path.join(d, tool))
+        for tool in only:
+            os.symlink(os.path.join(self.SANDBOX_FAKES, tool), os.path.join(d, tool))
+        self.env["PATH"] = d
+
+    def token_file(self, worker, value, mode=0o600):
+        d = os.path.join(self.tmp, "state", "capocantiere", "credentials")
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, worker)
+        with open(path, "w") as f:
+            f.write(value + "\n")
+        os.chmod(path, mode)
+        return path
+
+    def test_token_is_injected_only_into_its_worker(self):
+        self.write_config(copilot={"credentials": "token"})
+        self.env["CAPOCANTIERE_COPILOT_TOKEN"] = "gh-fine-grained"
+        self.assertIn("authenticated: yes (COPILOT_GITHUB_TOKEN token from CAPOCANTIERE_COPILOT_TOKEN)", self.server.ok("workers"))
+        self.delegate("add a file", worker="copilot", fallback=False)
+        self.delegate("add a file", worker="vibe", fallback=False)
+        copilot, vibe = self.calls("copilot")[0]["env"], self.calls("vibe")[0]["env"]
+        self.assertEqual(copilot.get("COPILOT_GITHUB_TOKEN"), "gh-fine-grained")
+        self.assertNotIn("CAPOCANTIERE_COPILOT_TOKEN", copilot)
+        self.assertNotIn("COPILOT_GITHUB_TOKEN", vibe)
+        self.assertNotIn("CAPOCANTIERE_COPILOT_TOKEN", vibe)
+
+    def test_token_file(self):
+        self.write_config(vibe={"credentials": "token"})
+        self.token_file("vibe", "mistral-minimal")
+        self.delegate("add a file", worker="vibe", fallback=False)
+        self.assertEqual(self.calls("vibe")[0]["env"].get("MISTRAL_API_KEY"), "mistral-minimal")
+
+    def test_token_problems_skip_the_worker(self):
+        self.write_config(copilot={"credentials": "token"})
+        jid, text = self.delegate("add a file")
+        self.assertIn("copilot skipped: no token: put it in", text)
+        self.assertIn('only the "Copilot Requests" permission', text)
+        self.assertIn("worker: vibe", text)
+        path = self.token_file("copilot", "x", mode=0o644)
+        jid, text = self.delegate("add a file")
+        self.assertIn("copilot skipped: %s is readable by other users" % path, text)
+        self.write_config(copilot={"credentials": "private-home"})
+        jid, text = self.delegate("add a file")
+        self.assertIn('copilot skipped: credentials "private-home" is not available yet', text)
+        self.assertEqual(self.calls("copilot"), [])
+
+    def test_bwrap_with_token_credentials(self):
+        self.use_sandbox_fakes()
+        self.write_config(copilot={"isolation": "bwrap", "credentials": "token", "isolation_env": ["FAKE_LOG"]})
+        self.token_file("copilot", "gh-fine-grained")
+        jid, text = self.delegate("add a file", worker="copilot", fallback=False)
+        self.assertIn("status: done", text)
+        self.assertIn("fake-copilot.txt | 1 +", text)
+        bw = self.calls("bwrap")[0]
+        opts, wt = bw["argv"], self.calls("copilot")[0]["cwd"]
+        joined = " ".join(opts)
+        for expected in ("--unshare-all --share-net", "--ro-bind / /", "--tmpfs /tmp", "--bind %s %s" % (wt, wt),
+                         "--ro-bind {0} {0}".format(os.path.realpath(os.path.join(self.repo, ".git"))),
+                         "--bind {0} {0}".format(os.path.realpath(os.path.join(self.repo, ".git", "objects")))):
+            self.assertIn(expected, joined)
+        self.assertIn("--tmpfs " + os.path.realpath(os.path.expanduser("~")).rsplit("/", 1)[0], joined)
+        self.assertEqual(bw["command"][0], os.path.join(FAKES, "copilot"))
+        env = self.calls("copilot")[0]["env"]
+        self.assertEqual(env.get("COPILOT_GITHUB_TOKEN"), "gh-fine-grained")
+        self.assertNotIn("MISTRAL_API_KEY", env)  # another worker's credential, set in the server's environment
+        self.assertNotIn("DBUS_SESSION_BUS_ADDRESS", env)  # token credentials: no D-Bus at all
+        self.assertEqual(self.calls("xdg-dbus-proxy"), [])
+
+    def test_bwrap_with_host_credentials_uses_the_dbus_proxy(self):
+        self.use_sandbox_fakes()
+        runtime = os.path.join(self.tmp, "run")
+        os.makedirs(runtime)
+        self.env.update(XDG_RUNTIME_DIR=runtime, DBUS_SESSION_BUS_ADDRESS="unix:path=%s/real-bus" % runtime)
+        self.write_config(copilot={"isolation": "auto", "isolation_env": ["FAKE_LOG"]})
+        jid, text = self.delegate("add a file", worker="copilot", fallback=False)
+        self.assertIn("status: done", text)
+        proxy = self.calls("xdg-dbus-proxy")[0]["argv"]
+        self.assertEqual(proxy[0], "unix:path=%s/real-bus" % runtime)
+        self.assertIn("--filter", proxy)
+        self.assertEqual([a for a in proxy if a.startswith("--talk=")],
+                         ["--talk=org.freedesktop.secrets", "--talk=org.kde.kwalletd6", "--talk=org.kde.kwalletd5"])
+        opts = self.calls("bwrap")[0]["argv"]
+        self.assertIn("--tmpfs", opts)
+        self.assertIn(runtime, opts)  # the real runtime dir (and its bus) is hidden ...
+        i = opts.index(proxy[1])
+        self.assertEqual(opts[i - 1:i + 2], ["--bind", proxy[1], os.path.join(runtime, "bus")])  # ... the proxy shows up there
+        env = self.calls("copilot")[0]["env"]
+        self.assertEqual(env.get("DBUS_SESSION_BUS_ADDRESS"), "unix:path=%s/bus" % runtime)
+        self.assertFalse(os.path.exists(os.path.dirname(proxy[1])))  # the proxy's folder is removed after the run
+
+    def test_keyring_names_are_configurable(self):
+        self.use_sandbox_fakes()
+        runtime = os.path.join(self.tmp, "run")
+        os.makedirs(runtime)
+        self.env.update(XDG_RUNTIME_DIR=runtime, DBUS_SESSION_BUS_ADDRESS="unix:path=/nonexistent")
+        cfg_path = os.path.join(self.tmp, "config", "capocantiere", "workers.json")
+        self.write_config(copilot={"isolation": "bwrap", "isolation_env": ["FAKE_LOG"]})
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+        cfg["keyring_dbus_names"] = ["org.keepassxc.KeePassXC.MainWindow"]
+        with open(cfg_path, "w") as f:
+            json.dump(cfg, f)
+        self.delegate("add a file", worker="copilot", fallback=False)
+        self.assertEqual([a for a in self.calls("xdg-dbus-proxy")[0]["argv"] if a.startswith("--talk=")],
+                         ["--talk=org.keepassxc.KeePassXC.MainWindow"])
+
+    def test_missing_dbus_proxy_skips_host_credentials(self):
+        self.use_sandbox_fakes(only=["bwrap"])
+        self.write_config(copilot={"isolation": "bwrap"}, vibe={"isolation": "bwrap", "credentials": "token",
+                                                              "isolation_env": ["FAKE_LOG"]})
+        self.token_file("vibe", "mistral-minimal")
+        jid, text = self.delegate("add a file")
+        self.assertIn("copilot skipped: bwrap needs xdg-dbus-proxy, which is not installed (see /capocantiere:doctor)", text)
+        self.assertIn("worker: vibe", text)  # token credentials need no D-Bus
+        self.assertIn("status: done", text)
+        self.assertEqual(self.calls("copilot"), [])
+        report = self.server.ok("workers")
+        self.assertIn("credentials: host; isolation: bwrap; can read the secrets of your system keyring", report)
+        self.assertIn("⛔ unusable: bwrap needs xdg-dbus-proxy", report)
+        self.assertIn("credentials: token; isolation: bwrap; sees its own credential", report)
+
+    def test_missing_bwrap_skips_the_worker(self):
+        self.use_sandbox_fakes(only=[])
+        self.write_config(copilot={"isolation": "bwrap", "credentials": "token"})
+        self.token_file("copilot", "x")
+        jid, text = self.delegate("add a file")
+        self.assertIn("copilot skipped: bwrap needs bwrap, which is not installed", text)
+        self.assertIn("worker: vibe", text)
+
+    def test_unusable_bwrap_skips_the_worker(self):
+        self.use_sandbox_fakes()
+        self.env["FAKE_BWRAP_FAIL"] = "1"
+        self.write_config(copilot={"isolation": "bwrap", "credentials": "token"})
+        self.token_file("copilot", "x")
+        jid, text = self.delegate("add a file")
+        self.assertIn("copilot skipped: bwrap cannot create a sandbox here: bwrap: setting up uid map", text)
+        self.assertIn("worker: vibe", text)
+
+    def test_isolation_auto_on_windows_skips(self):
+        self.env["CAPOCANTIERE_PLATFORM"] = "win32"
+        self.write_config(copilot={"isolation": "auto"})
+        jid, text = self.delegate("add a file")
+        self.assertIn('copilot skipped: isolation "auto": no isolation backend exists for win32 yet (run the workers '
+                      'inside WSL2', text)
+        self.assertIn("worker: vibe", text)
+
+    def test_backend_of_another_system_skips(self):
+        self.write_config(copilot={"isolation": "seatbelt"})
+        jid, text = self.delegate("add a file")
+        self.assertIn('copilot skipped: isolation "seatbelt" does not work on linux', text)
+
+    def test_seatbelt_on_macos(self):
+        self.use_sandbox_fakes()
+        self.env["CAPOCANTIERE_PLATFORM"] = "darwin"
+        self.write_config(copilot={"isolation": "auto", "isolation_env": ["FAKE_LOG"]})
+        self.assertIn("seatbelt (EXPERIMENTAL, untested)", self.server.ok("workers"))
+        jid, text = self.delegate("add a file", worker="copilot", fallback=False)
+        self.assertIn("status: done", text)
+        sb = self.calls("sandbox-exec")[0]
+        wt = os.path.realpath(self.calls("copilot")[0]["cwd"])
+        profile = sb["profile"]
+        self.assertTrue(profile.startswith("(version 1)\n(deny default)"))
+        self.assertIn('(subpath "%s")' % wt, profile.split("(allow file-write*", 1)[1].split("\n", 1)[0])
+        self.assertIn('(deny file-read* (subpath "/Users")', profile)
+        self.assertIn('(global-name "com.apple.SecurityServer")', profile)
+        self.assertNotIn("launchservicesd", profile)
+        self.assertNotIn("appleevents", profile.lower())
+        self.assertEqual(sb["argv"][0], os.path.join(FAKES, "copilot"))
+
+    def test_seatbelt_missing(self):
+        self.use_sandbox_fakes(only=[])
+        self.env["CAPOCANTIERE_PLATFORM"] = "darwin"
+        self.write_config(copilot={"isolation": "seatbelt"})
+        jid, text = self.delegate("add a file")
+        self.assertIn("copilot skipped: seatbelt needs sandbox-exec, which is not installed", text)
+
+    def test_doctor(self):
+        self.use_sandbox_fakes(only=["bwrap"])
+        self.write_config(copilot={"isolation": "auto"}, vibe={"isolation": "auto", "credentials": "token"})
+        self.token_file("vibe", "x")
+        text = self.server.ok("workers", {"doctor": True})
+        self.assertIn("System: Linux", text)
+        self.assertIn("xdg-dbus-proxy: MISSING", text)
+        self.assertIn("bwrap sandbox test: ok", text)
+        self.assertRegex(text, r"To install: .*xdg-dbus-proxy")
+        self.assertIn("isolation: auto — auto (bwrap) needs xdg-dbus-proxy", text)  # copilot: host credentials
+        self.assertIn('only the "Copilot Requests" permission', text)  # ... so the token is suggested
+        self.assertIn("credentials: token — ok: MISTRAL_API_KEY token from", text)
+        self.assertIn("isolation: auto → bwrap; sees its own credential", text)
+        self.assertIn("Nothing was installed or changed", text)
+
+    def test_doctor_windows(self):
+        self.env["CAPOCANTIERE_PLATFORM"] = "win32"
+        self.assertIn("run the workers inside WSL2", self.server.ok("workers", {"doctor": True}))
+
+    @unittest.skipUnless(shutil.which("bwrap") and subprocess.run(
+        ["bwrap", "--unshare-all", "--ro-bind", "/", "/", "--", "true"], capture_output=True).returncode == 0,
+        "bubblewrap is not usable on this system")
+    def test_real_bwrap(self):
+        """The real bubblewrap around a fake worker: the job works, the rest of the disk is hidden."""
+        decoy = os.path.join(self.tmp, "decoy-secret")
+        with open(decoy, "w") as f:
+            f.write("secret\n")
+        open(self.log, "w").close()
+        self.write_config(copilot={"isolation": "bwrap", "credentials": "token", "isolation_env": ["FAKE_LOG"],
+                                   "isolation_rw": [self.log]})
+        self.token_file("copilot", "gh-fine-grained")
+        main = os.path.join(self.repo, "main.txt")
+        jid, text = self.delegate("add a file FAKE:probe PROBE:%s PROBE:%s" % (decoy, main), worker="copilot",
+                                  fallback=False)
+        self.assertIn("status: done", text)
+        self.assertIn("fake-copilot.txt | 1 +", text)
+        self.assertIn('PROBE {"%s": false, "%s": false}' % (decoy, main), text)
+        self.assertEqual(self.calls("copilot")[0]["env"].get("COPILOT_GITHUB_TOKEN"), "gh-fine-grained")
 
     # ------------------------------------------------------------ session, mode, hook
 

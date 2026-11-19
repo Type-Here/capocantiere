@@ -18,7 +18,7 @@ Supported workers:
 | **Skill `worker-delegation`** | Teaches Claude *when* to delegate, which worker to pick, how to write a task, how to handle fallbacks and how to review the result. Claude loads it on its own when needed |
 | **Agent `worker-reviewer`** (Sonnet) | First-pass review of large diffs, to save the manager's context |
 | **SessionStart hook** | At the start of each session, tells Claude which workers are available, how much budget each has left and whether there are open jobs from previous sessions |
-| **Commands** | `/capocantiere:manager`, `/capocantiere:delegate`, `/capocantiere:analyze`, `/capocantiere:status`, `/capocantiere:review`, `/capocantiere:use`, `/capocantiere:models`, `/capocantiere:mode` |
+| **Commands** | `/capocantiere:manager`, `/capocantiere:delegate`, `/capocantiere:analyze`, `/capocantiere:status`, `/capocantiere:review`, `/capocantiere:use`, `/capocantiere:models`, `/capocantiere:mode`, `/capocantiere:doctor` |
 
 ### How a job works
 
@@ -28,7 +28,7 @@ Supported workers:
 4. When the work is done, the server commits to the job's branch and saves the diff.
 5. Claude reviews it with `jobs`, then either applies it to your working tree (`apply`, no commit) or discards it (`discard`).
 
-**Workers never touch your repo directly.** Inside the worktree they auto-approve their own tool calls (the only way to work headless), with safety limits per worker (see below). `analyze` runs in the real repo **without** auto-approval, with edits disabled, and checks that the repo state doesn't change.
+**Workers never touch your repo directly.** Inside the worktree they auto-approve their own tool calls (the only way to work headless), with safety limits per worker (see below). They still run with your user's permissions unless you turn on [isolation](#isolation-and-credentials). `analyze` runs in the real repo **without** auto-approval, with edits disabled, and checks that the repo state doesn't change.
 
 Each worker has a daily budget (runs per 24h, counted per worker). A worker over budget is skipped; if every worker is out of quota or budget, Claude does the work itself.
 
@@ -155,6 +155,8 @@ Global settings:
 | `order` | `["copilot", "vibe", "agy"]` | preference order when no worker is requested |
 | `fallback` | `true` | on quota/rate-limit errors or exhausted budget, move on to the next worker |
 | `max_parallel` | `4` | jobs running at once, across all workers |
+| `isolation` | `"none"` | `none`, `auto`, `bwrap` or `seatbelt`: see [Isolation and credentials](#isolation-and-credentials) |
+| `keyring_dbus_names` | Secret Service, KWallet 5/6 | Linux: the session D-Bus services an isolated worker with `"host"` credentials can reach |
 
 Settings of every worker:
 
@@ -170,12 +172,69 @@ Settings of every worker:
 | `extra_args` | extra command-line arguments |
 | `env` | extra environment variables for the CLI (e.g. an API key) |
 | `strengths` | tags Claude uses to choose a worker: `tests`, `boilerplate`, `docs`, `refactor`, `analysis`, … |
+| `credentials` | `host` (default) or `token`: see [Isolation and credentials](#isolation-and-credentials) |
+| `isolation` | overrides the global setting for this worker (empty = global) |
+| `isolation_rw`, `isolation_ro`, `isolation_env` | extra paths an isolated worker may write / read, extra environment variables it keeps |
 
 Worker-specific settings: `copilot` — `deny_tools`, `disable_builtin_mcps`, `sandbox`, `max_ai_credits`, `secret_env_vars`; `vibe` — `max_turns`, `max_price`, `max_tokens`, `trust`, `analyze_tools`, `disabled_tools`; `agy` — `auth`, `sandbox`, `skip_permissions`.
 
 **Environment variables** override the file, e.g. in `~/.claude/settings.json` under `"env"`: `CAPOCANTIERE_<WORKER>_<SETTING>` (`CAPOCANTIERE_VIBE_MAX_PRICE=1`, `CAPOCANTIERE_COPILOT_ENABLED=0`; lists are comma-separated), `CAPOCANTIERE_ORDER`, `CAPOCANTIERE_FALLBACK`, `CAPOCANTIERE_MAX_PARALLEL`, plus `CAPOCANTIERE_RUNTIME` (`python`, `node` or `auto`). The old `GEMINI_DELEGATE_*` variables still apply to `agy`.
 
 `MCP_TOOL_TIMEOUT` (in ms) is only needed if long analyses get cut off by Claude Code; jobs are asynchronous and aren't affected.
+
+## Isolation and credentials
+
+By default (`"isolation": "none"`) a worker runs with all your permissions: its own safety rules (Copilot's deny rules, Vibe's `outside_workdir`) are all that keep it inside the job's worktree. With isolation on, the server starts every run of that worker inside a sandbox. **Isolation and `token` credentials are implemented in the Python server only**; the Node server refuses those settings and skips the workers that use them.
+
+```json
+{ "isolation": "auto" }
+```
+
+`auto` picks the backend of the system you're on; you can also name it (`bwrap`, `seatbelt`), globally or per worker. **If the backend can't work** (a missing tool, another OS), **the worker is skipped with a note**: a run never starts without isolation when you asked for it. `/capocantiere:doctor` checks what is missing and shows the install command for your distribution (pacman, apt, dnf, zypper, apk). It never installs anything or runs sudo.
+
+What an isolated run sees:
+
+- the system, read-only; your home folder, other users' homes, `/mnt`, `/media` and the rest of `/tmp` are hidden;
+- the job's worktree, read-write (for an analysis, the repo read-only). Of the main repo's `.git`, only what git needs: everything read-only, except this worktree's own admin folder and the object store. Branches and other refs can't be moved;
+- the worker CLI's own folders (`~/.copilot` and `~/.cache/copilot`, `~/.vibe`, `~/.gemini`) read-write, its install folder read-only, plus `isolation_rw` / `isolation_ro`;
+- the network, which the model APIs need;
+- an environment rebuilt from scratch: locale, proxy and certificate variables, the CLI's own variables, `isolation_env`. Other workers' keys, your tokens and everything else are left out.
+
+| System | Backend | Status |
+|---|---|---|
+| Linux | `bwrap` ([bubblewrap](https://github.com/containers/bubblewrap)), plus `xdg-dbus-proxy` for `host` credentials | tested |
+| macOS | `seatbelt`: `sandbox-exec` with a profile generated for each run | **experimental, untested** |
+| Windows | none yet | run the workers inside **WSL2** to use the Linux backend |
+
+### Credentials
+
+Each worker has `"credentials"`:
+
+- **`host`** (default): the login you already made in the CLI (`copilot login`, your Mistral account in Vibe). Both CLIs keep it in the system keyring. Nothing to configure.
+- **`token`**: a minimal credential the server injects into **that worker only**: Copilot gets `COPILOT_GITHUB_TOKEN` (a [fine-grained personal access token](https://github.com/settings/personal-access-tokens/new) with only the **Copilot Requests** permission), Vibe gets `MISTRAL_API_KEY` and agy gets `GEMINI_API_KEY`. The server reads it from `~/.local/state/capocantiere/credentials/<worker>` (must be `chmod 600`; otherwise the worker is skipped) or from `CAPOCANTIERE_<WORKER>_TOKEN`, never from the config file. Your `host` login is not touched; the two coexist. `CAPOCANTIERE_*_TOKEN` variables are never passed to any child process as they are.
+- `private-home` is reserved for a later version.
+
+With `host` credentials on Linux the CLI must reach the keyring through the session D-Bus. The sandbox never gets the full session bus, because that would allow escaping the sandbox (for example through `systemd --user`). `xdg-dbus-proxy` lets through only the keyring services in `keyring_dbus_names`: `org.freedesktop.secrets` (GNOME Keyring, KeePassXC, KDE Wallet 6) and `org.kde.kwalletd6` / `kwalletd5`. Copilot and Vibe both use `org.freedesktop.secrets`. With `token` credentials, the sandbox has no D-Bus at all.
+
+On macOS, the Keychain checks access item by item, so a CLI reads its own login. Items created by the same program may also be readable: for Vibe, that means other tools run by the same Python.
+
+### Limits (also shown by `workers`)
+
+- **Linux with `host` credentials: the worker can read every secret in your keyring** (the Secret Service has no per-application control). Use `token` credentials to avoid this.
+- **The network is open:** a worker can send data out.
+- **A worker always sees its own credential.** That is why the `token` credentials are as narrow as possible.
+- **macOS is experimental.** `sandbox-exec` is deprecated by Apple, but it is the same mechanism other agent sandboxes use. If Apple removes it, the backend stops working (and the worker is skipped). Windows has no isolation.
+
+### Checking it on your machine
+
+`python3 scripts/sandbox-probe.py` builds the sandboxes with the server's own code and checks what leaks:
+- a decoy file and a decoy variable;
+- `~/.ssh` and `~/.claude`;
+- the main repo;
+- on Linux, other D-Bus services and `systemd-run --user`; on macOS, launchd and LaunchServices;
+- whether DNS, TLS and git work.
+
+With `--prompt` it also sends one tiny prompt per worker (after asking), and lists which D-Bus services each CLI reached and which were blocked. On a Mac, this is how the `seatbelt` backend gets tested.
 
 ## Models
 
@@ -199,7 +258,7 @@ The MCP server exists in two versions in `plugins/capocantiere/server/`: `server
 
 `run.sh` starts the right one: `python3` if it's on your `PATH`, otherwise `node`. To force a choice, set `CAPOCANTIERE_RUNTIME` to `python` or `node`.
 
-The Python version is the reference: it is the one covered by the test suite. The Node version is a port, not tested directly.
+The Python version is the reference: it is the one covered by the test suite. The Node version is a port, not tested directly, and it doesn't support isolation or `token` credentials (it refuses those settings rather than ignoring them).
 
 ## Tests
 
@@ -210,6 +269,8 @@ python3 tests/e2e.py --runtime node
 ```
 
 End-to-end tests over MCP stdio, against fake `copilot`, `vibe` and `agy` binaries in [`tests/fakes`](tests/fakes) (a marker in the task picks the scenario: success with edits, no changes, quota error, generic error, timeout). Every test uses its own temporary repo and state folders; no real worker CLI is ever started.
+
+Isolation is tested in two ways. Fake `bwrap`, `xdg-dbus-proxy` and `sandbox-exec` (in `tests/fakes/sandbox`) check the command lines, the profile and where tokens go. The real `bwrap`, where it works, runs a fake worker and checks that it can't read files outside its sandbox.
 
 ## Where files go
 
@@ -226,7 +287,7 @@ Upgrading from the Gemini-only version (`gemini-delegate`): the old state in `~/
 - **Untracked** files are not copied into the job's worktree: `git add` or commit them first, or mention them in the task.
 - Budgets count runs, not the model's internal requests or tokens (each run makes several). Keep them conservative; the per-run caps (`max_price`, `max_ai_credits`) limit the cost of a single run.
 - Authentication checks don't call any model: Copilot is "authenticated" when its config records a logged-in user (or a token variable is set), Vibe when its cache records a signed-in account or `MISTRAL_API_KEY` is set. An expired login only shows up on the first run.
-- Copilot's shell commands are not limited to the worktree by path checks (only file tools are); the deny rules and, optionally, `sandbox` cover the dangerous ones.
+- Without isolation, Copilot's shell commands are not limited to the worktree by path checks (only file tools are). The deny rules and, optionally, `sandbox` cover the dangerous ones. Turn on [isolation](#isolation-and-credentials) to contain them.
 - After a fallback, the next worker uses its own default model (a model name rarely means the same on another CLI).
 - The CLI flags were checked against GitHub Copilot CLI 1.0.114, Mistral Vibe 3.1.3 (help, config schema and source) and Antigravity CLI 1.5.10. If a CLI changes its output, the server still shows the raw output.
 

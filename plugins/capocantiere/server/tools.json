@@ -206,13 +206,17 @@
   },
   {
     "name": "workers",
-    "description": "List the workers with their state: enabled, installed, authenticated (when checkable), budget used/left in the last 24h, active jobs, models, strengths, warnings; plus the preference order, the fallback setting and the session default. With use=<worker> it also sets the default worker for this session (\"auto\" clears it). Does not use any budget.",
+    "description": "List the workers with their state: enabled, installed, authenticated (when checkable), budget used/left in the last 24h, active jobs, models, strengths, warnings; plus the preference order, the fallback setting and the session default. With use=<worker> it also sets the default worker for this session (\"auto\" clears it). With doctor=true it instead checks this system for what isolation and credentials need, and shows the commands to install what is missing (never runs them). Does not use any budget.",
     "inputSchema": {
       "type": "object",
       "properties": {
         "use": {
           "type": "string",
           "description": "Set the session default worker (a worker id), or \"auto\" to go back to the configured order. Only when the user asks."
+        },
+        "doctor": {
+          "type": "boolean",
+          "description": "Check the system for isolation and credentials (only for /capocantiere:doctor or when the user asks)."
         }
       }
     }

@@ -162,8 +162,23 @@ def kill_tree(child, sig):
         pass
 
 
-def run(cmd, args, cwd=None, input=None, timeout_ms=None, on_spawn=None, binary=False, extra_env=None):
-    """Run a command; never raises. Returns code/stdout/stderr/error/timed_out."""
+TOKEN_VAR_RE = re.compile(r"^CAPOCANTIERE_.*_TOKEN$")
+
+
+def child_env(extra_env=None, full_env=None):
+    """The environment of a child process. Workers' tokens (CAPOCANTIERE_<WORKER>_TOKEN) never pass through:
+    the server injects each one only into its own worker, under the CLI's variable."""
+    if full_env is not None:
+        return dict(full_env)
+    e = {k: v for k, v in os.environ.items() if not TOKEN_VAR_RE.match(k)}
+    e.update(extra_env or {})
+    return e
+
+
+def run(cmd, args, cwd=None, input=None, timeout_ms=None, on_spawn=None, binary=False, extra_env=None, full_env=None):
+    """Run a command; never raises. Returns code/stdout/stderr/error/timed_out.
+
+    extra_env is added to the server's environment; full_env replaces it (isolated runs)."""
     try:
         child = subprocess.Popen(
             [cmd] + list(args),
@@ -171,7 +186,7 @@ def run(cmd, args, cwd=None, input=None, timeout_ms=None, on_spawn=None, binary=
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            env=dict(os.environ, **extra_env) if extra_env else None,
+            env=child_env(extra_env, full_env),
             start_new_session=os.name == "posix",
         )
     except OSError as e:

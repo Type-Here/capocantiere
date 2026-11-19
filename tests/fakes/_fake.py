@@ -10,8 +10,10 @@ The scenario is chosen by a marker in the prompt, so one server can run several 
   FAKE:timeout         hang for a long time (the server must kill it; vibe stops itself at --time-limit)
   FAKE:price           vibe only: stop on --max-price (exit 3, outcome price_limit)
   FAKE:slow            sleep 3 seconds, then edit (to check that jobs run in parallel)
+  FAKE:probe           edit, and report which paths given as PROBE:<path> in the prompt are readable
 
-Every call is appended to $FAKE_LOG as one JSON line: {"bin", "argv", "cwd", "scenario"}.
+Every call is appended to $FAKE_LOG as one JSON line: {"bin", "argv", "cwd", "scenario", "env"}, where env holds
+the variables that matter for credentials and isolation (see WATCHED_ENV).
 """
 
 import json
@@ -31,11 +33,29 @@ def scenario(prompt, worker):
     return "edit"
 
 
-def log(worker, argv, cwd, sc):
+WATCHED_ENV = ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "MISTRAL_API_KEY", "GEMINI_API_KEY", "DBUS_SESSION_BUS_ADDRESS",
+               "TMPDIR", "XDG_CURRENT_DESKTOP")
+
+
+def log(worker, argv, cwd, sc, extra=None):
     path = os.environ.get("FAKE_LOG")
     if path:
+        e = {k: v for k, v in os.environ.items() if k in WATCHED_ENV or k.startswith("CAPOCANTIERE_")}
         with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps({"bin": worker, "argv": argv, "cwd": cwd, "scenario": sc}) + "\n")
+            f.write(json.dumps(dict({"bin": worker, "argv": argv, "cwd": cwd, "scenario": sc, "env": e}, **(extra or {}))) + "\n")
+
+
+def probe(prompt):
+    """FAKE:probe: which PROBE:<path> paths can be read from here."""
+    out = {}
+    for p in re.findall(r"PROBE:(\S+)", prompt or ""):
+        try:
+            with open(p, "rb") as f:
+                f.read(1)
+            out[p] = True
+        except OSError:
+            out[p] = False
+    return out
 
 
 def act(worker, sc, cwd, may_write):
@@ -48,7 +68,7 @@ def act(worker, sc, cwd, may_write):
         return 2, "", "Error: something unexpected happened in the fake %s\n" % worker
     if sc == "slow":
         time.sleep(3)
-    if sc in ("edit", "slow"):
+    if sc in ("edit", "slow", "probe"):
         if not may_write:
             return 0, "I could not edit files: permission denied for write.", "Tool 'write' denied: requires approval\n"
         target = os.path.join(cwd, "fake-%s.txt" % worker)
