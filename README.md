@@ -272,7 +272,7 @@ The MCP server exists in two versions in `plugins/capocantiere/server/`: `server
 
 The Python version is the reference: it is the one covered by the test suite. The Node version is a port, not tested directly, and it doesn't support isolation or `token` credentials (it refuses those settings rather than ignoring them).
 
-**The Node server is frozen:** it keeps working for those who use it, but new features are implemented in the Python server only. Attribution (`blame`, and the records written at `apply`) is the first of them: the Node server does not list the tool and records nothing.
+**The Node server is frozen:** it keeps working for those who use it, but new features are implemented in the Python server only. Changes to the core behavior (how jobs are created, run and applied) still go into both, so a job behaves the same on either. Attribution (`blame`, and the records written at `apply`) is the first of them: the Node server does not list the tool and records nothing.
 
 ## Tests
 
@@ -299,7 +299,7 @@ Upgrading from the Gemini-only version (`gemini-delegate`): the old state in `~/
 
 - The plugin starts the server through `sh run.sh`, so `sh` must be on the `PATH`. It always is on Linux and macOS; on Windows it has only been designed for, not tested.
 - Build artifacts (`__pycache__`, `*.pyc`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `node_modules`, `.DS_Store`) are never included in a job's diff. Workers are also asked to delete the temporary files they create.
-- A job's base is a snapshot of your working tree, built in a temporary copy of the git index: untracked files are included unless `.gitignore` excludes them or they are over 5 MB (the job's notes list those). An untracked file that is not ignored (say, a stray `.env`) is therefore visible to the worker. The Node server still uses `git stash create`, which leaves every untracked file out.
+- A job's base is a snapshot of your working tree, built in a temporary copy of the git index: untracked files are included unless `.gitignore` excludes them or they are over 5 MB (the job's notes list those). An untracked file that is not ignored (say, a stray `.env`) is therefore visible to the worker.
 - Budgets count runs, not the model's internal requests or tokens (each run makes several). Keep them conservative; the per-run caps (`max_price`, `max_ai_credits`) limit the cost of a single run.
 - Authentication checks don't call any model: Copilot is "authenticated" when its config records a logged-in user (or a token variable is set), Vibe when its cache records a signed-in account or `MISTRAL_API_KEY` is set. An expired login only shows up on the first run.
 - Without isolation, Copilot's shell commands are not limited to the worktree by path checks (only file tools are). The deny rules and, optionally, `sandbox` cover the dangerous ones. Turn on [isolation](#isolation-and-credentials) to contain them.
