@@ -141,12 +141,15 @@ class E2E(unittest.TestCase):
             self._server = Server(self.env)
         return self._server
 
-    def write_config(self, **workers):
-        cfg = {"order": ["copilot", "vibe", "agy"], "fallback": True, "max_parallel": 4, "workers": {
+    def write_config(self, glob=None, **workers):
+        # "order": the tests that predate trust scores rely on the preference order; the trust score tests
+        # pass glob={"selection": "scores"}
+        cfg = {"order": ["copilot", "vibe", "agy"], "fallback": True, "max_parallel": 4, "selection": "order", "workers": {
             "copilot": {"bin": os.path.join(FAKES, "copilot")},
             "vibe": {"bin": os.path.join(FAKES, "vibe")},
             "agy": {"enabled": False, "bin": os.path.join(self.tmp, "no-agy")},
         }}
+        cfg.update(glob or {})
         for wid, s in workers.items():
             cfg["workers"][wid].update(s)
         d = os.path.join(self.tmp, "config", "capocantiere")
@@ -177,8 +180,9 @@ class E2E(unittest.TestCase):
 
     def test_tools_list(self):
         names = [t["name"] for t in self.server.request("tools/list", {})["tools"]]
-        expected = ["delegate", "analyze", "jobs", "apply", "discard", "blame", "workers", "mode", "models"]
+        expected = ["delegate", "analyze", "jobs", "apply", "discard", "rate", "blame", "workers", "mode", "models"]
         if RUNTIME == "node":
+            expected.remove("rate")
             expected.remove("blame")  # the Node server is frozen: Python-only tools are not listed
         self.assertEqual(names, expected)
 
@@ -282,7 +286,7 @@ class E2E(unittest.TestCase):
         jid, text = self.delegate("add a file", worker="vibe")
         self.assertIn("cost 0.0123", text)
         out = self.server.ok("analyze", {"question": "FAKE:noop what?", "worker": "vibe"})
-        self.assertIn("tokens 1000]", out)
+        self.assertIn("tokens 1000, id a", out)
 
     def test_vibe_account_login(self):
         del self.env["MISTRAL_API_KEY"]

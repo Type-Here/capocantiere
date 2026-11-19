@@ -334,6 +334,14 @@ function loadConfig() {
     if (s?.credentials && s.credentials !== "host")
       errors.push(`"credentials": "${s.credentials}" (${w}) is only supported by the Python server; the Node server will not run that worker.`);
   }
+  if (userGlobal.selection !== undefined && userGlobal.selection !== "order")
+    errors.push(`"selection": "${userGlobal.selection}" is only supported by the Python server; the Node server always uses the configured order.`);
+  if (Object.prototype.hasOwnProperty.call(userGlobal, "half_life_days"))
+    errors.push(`"half_life_days" is only supported by the Python server (trust scores); ignored.`);
+  for (const [w, s] of Object.entries(userWorkers)) {
+    if (s && typeof s === "object" && Object.prototype.hasOwnProperty.call(s, "tiers"))
+      errors.push(`"tiers" (${w}) is only supported by the Python server; the Node server uses the worker's model setting.`);
+  }
   const order = Array.isArray(cfg.order) ? cfg.order : GLOBAL_DEFAULTS.order;
   cfg.order = [...order.filter((w) => ADAPTERS[w]), ...Object.keys(ADAPTERS).filter((w) => !order.includes(w))];
   cfg.workers = workers;
@@ -1686,11 +1694,31 @@ async function setSessionDefault(value) {
 
 // ---------------------------------------------------------------- tools
 
-// Tool definitions are shared with server.py. The Node server is frozen: tools added after it was frozen
-// exist only in the Python server, so they are not listed here.
-const PYTHON_ONLY_TOOLS = new Set(["blame"]);
+// Tool definitions are shared with server.py. The Node server is frozen: tools and parameters added after
+// it was frozen exist only in the Python server, so they are not listed here.
+const PYTHON_ONLY_TOOLS = new Set(["blame", "rate"]);
+const PYTHON_ONLY_PARAMS = {
+  delegate: ["kind", "tier"],
+  analyze: ["tier"],
+  apply: ["quality"],
+  discard: ["reason"],
+  workers: ["scores"],
+};
 const TOOLS = JSON.parse(fs.readFileSync(new URL("./tools.json", import.meta.url), "utf8"))
-  .filter((t) => !PYTHON_ONLY_TOOLS.has(t.name));
+  .filter((t) => !PYTHON_ONLY_TOOLS.has(t.name))
+  .map((t) => {
+    const params = PYTHON_ONLY_PARAMS[t.name];
+    if (!params || !t.inputSchema?.properties) return t;
+    return {
+      ...t,
+      inputSchema: {
+        ...t.inputSchema,
+        properties: Object.fromEntries(
+          Object.entries(t.inputSchema.properties).filter(([name]) => !params.includes(name)),
+        ),
+      },
+    };
+  });
 
 function getJob(a) {
   const j = jobs.get(a.job_id);
