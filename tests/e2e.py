@@ -456,6 +456,15 @@ class E2E(unittest.TestCase):
 
     # ------------------------------------------------------------ isolation hook
 
+    def test_job_commits_are_never_signed(self):
+        cfg = os.path.join(self.tmp, "gitconfig")
+        with open(cfg, "w") as f:
+            f.write("[commit]\n\tgpgsign = true\n[gpg]\n\tprogram = false\n")  # signing would always fail
+        self.env["GIT_CONFIG_GLOBAL"] = cfg
+        jid, text = self.delegate("add a file", worker="copilot")
+        self.assertIn("status: done", text)
+        self.assertIn("fake-copilot.txt | 1 +", text)
+
     def test_isolation_none_is_the_default(self):
         jid, text = self.delegate("add a file", worker="copilot")
         self.assertIn("status: done", text)

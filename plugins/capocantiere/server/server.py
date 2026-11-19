@@ -575,6 +575,7 @@ def collect_changes(job):
             job["worktree"],
             "-c", "user.name=%s (capocantiere)" % job.get("worker", "worker"),
             "-c", "user.email=capocantiere@localhost",
+            "-c", "commit.gpgsign=false",  # never sign a worker's code with the user's key
             "commit", "-q", "--no-verify", "-m", "%s: %s" % (job.get("worker", "worker"), job["title"]),
             "-m", "job " + job["id"],
         )

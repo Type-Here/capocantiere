@@ -1467,6 +1467,7 @@ async function collectChanges(job) {
   if (staged.code === 1) {
     const who = job.worker || "worker";
     await git(job.worktree, "-c", `user.name=${who} (capocantiere)`, "-c", "user.email=capocantiere@localhost",
+      "-c", "commit.gpgsign=false", // never sign a worker's code with the user's key
       "commit", "-q", "--no-verify", "-m", `${who}: ${job.title}`, "-m", `job ${job.id}`);
   }
   const stat = await git(job.repo, "diff", "--stat", job.base, job.branch);
