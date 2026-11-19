@@ -336,6 +336,8 @@ Upgrading from the Gemini-only version (`gemini-delegate`): the old state in `~/
 - Budgets count runs, not the model's internal requests or tokens (each run makes several). Keep them conservative; the per-run caps (`max_price`, `max_ai_credits`) limit the cost of a single run.
 - Authentication checks don't call any model: Copilot is "authenticated" when its config records a logged-in user (or a token variable is set), Vibe when its cache records a signed-in account or `MISTRAL_API_KEY` is set. An expired login only shows up on the first run.
 - Without isolation, Copilot's shell commands are not limited to the worktree by path checks (only file tools are). The deny rules and, optionally, `sandbox` cover the dangerous ones. Turn on [isolation](#isolation-and-credentials) to contain them.
+- When Vibe runs on its default model, it does not report which model that is (`active_model` is empty in its `export.json`), so all its votes go to the arm `vibe:default` and a change of Vibe's default model is not noticed. Setting `model` for the vibe worker gives each model its own score. Copilot reports the model it used, so it does not have this problem.
+- After the server is updated and reconnected with `/mcp`, Claude Code may keep the old definitions of the tools it already knew (new tools do appear). New parameters still reach the server, but Claude may not know about them until a new session.
 - After a fallback, the next worker uses its own default model (a model name rarely means the same on another CLI).
 - The CLI flags were checked against GitHub Copilot CLI 1.0.114, Mistral Vibe 3.1.3 (help, config schema and source) and Antigravity CLI 1.5.10. If a CLI changes its output, the server still shows the raw output.
 
