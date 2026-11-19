@@ -48,7 +48,9 @@ def export(outcome, stop=None, error=None, cost=0.0123):
         with open(os.path.join(out_dir, "export.json"), "w", encoding="utf-8") as f:
             json.dump({"outcome": outcome, "stop_reason": stop, "error": error, "session_id": "fake",
                        "usage": {"input_tokens": 900, "output_tokens": 100, "cached_input_tokens": 0, "total_tokens": 1000},
-                       "cost_usd": cost, "steps": 2}, f)
+                       "cost_usd": cost, "steps": 2,
+                   "config": {"active_model": "devstral-fake", "models": [
+                       {"name": "devstral-fake-2512", "provider": "mistral", "alias": "devstral-fake"}]}}, f)
 
 
 # --time-limit: vibe stops itself, writes the export and exits 3 (outcome "deadline")
@@ -71,7 +73,7 @@ if sc == "quota":
 # --enabled-tools disables every other tool in headless mode: writing needs write_file or edit
 enabled = values("--enabled-tools")
 may_write = "--auto-approve" in argv and (not enabled or "write_file" in enabled or "edit" in enabled)
-code, out, err = _fake.act("vibe", sc, cwd, may_write)
+code, out, err = _fake.act("vibe", sc, cwd, may_write, prompt)
 if code == 0:
     export("finished")
 else:

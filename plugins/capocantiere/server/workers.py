@@ -810,7 +810,7 @@ class CopilotWorker(Worker):
                 "cleanup": [usage_file], "usage_file": usage_file}
 
     def parse(self, r, spec):
-        usage = cost = None
+        usage = cost = model = None
         try:
             with open(spec["usage_file"], encoding="utf-8") as f:
                 u = json.load(f)
@@ -820,13 +820,17 @@ class CopilotWorker(Worker):
                      "premium_requests": u.get("totalPremiumRequestCost")}
             if u.get("totalNanoAiu"):
                 cost = round(u["totalNanoAiu"] / 1e9, 4)  # AI credits
+            # modelMetrics is keyed by the model that actually answered: take the busiest one
+            mm = u.get("modelMetrics")
+            if isinstance(mm, dict) and mm:
+                model = max(mm, key=lambda k: _sum_keys(mm[k], re.compile(r"tokens$", re.I)))
         except (OSError, ValueError, TypeError, AttributeError, KeyError):
             pass
         response = r["stdout"].strip()
         ok = r["code"] == 0 and not r["timed_out"]
         return {"ok": ok, "status": "SUCCESS" if ok else "ERROR (exit %s)" % r["code"], "response": response,
                 "error": "" if ok else (r["stderr"].strip()[-1500:] or response[-1500:]), "usage": usage,
-                "cost": cost, "turns": 0, "conversation_id": None, "duration": None}
+                "cost": cost, "turns": 0, "conversation_id": None, "duration": None, "model": model}
 
 
 # ---------------------------------------------------------------- vibe (Mistral Vibe CLI)
@@ -846,7 +850,8 @@ class CopilotWorker(Worker):
 # project config. Exit codes: 0 finished, 1 usage/config error, 2 infrastructure failure (the model API
 # after its retries: HTTP 429 = rate limit, 402 = the account has no credit left), 3 stopped on a limit
 # (turn_limit, token_limit, price_limit, deadline, ...). export.json: outcome, stop_reason,
-# error {message, code}, usage {input_tokens, output_tokens, ...}, cost_usd.
+# error {message, code}, usage {input_tokens, output_tokens, ...}, cost_usd, config (the resolved config:
+# active_model is an alias of one of config.models, "" when not pinned).
 # The cost is computed from the prices in the config, so --max-price is only an extra guard: the real
 # budget is the number of runs per worker.
 
@@ -973,7 +978,7 @@ class VibeWorker(Worker):
         except (OSError, ValueError):
             e = None
         if not isinstance(e, dict):
-            return {"outcome": "", "stop": "", "error": "", "usage": None, "cost": None}
+            return {"outcome": "", "stop": "", "error": "", "usage": None, "cost": None, "model": None}
         u = e.get("usage") if isinstance(e.get("usage"), dict) else {}
         inp, out = u.get("input_tokens") or 0, u.get("output_tokens") or 0
         usage = {"input_tokens": inp, "output_tokens": out, "total_tokens": u.get("total_tokens") or inp + out} if u else None
@@ -981,7 +986,22 @@ class VibeWorker(Worker):
         error = " ".join(str(x) for x in (err.get("code"), err.get("message")) if x)
         cost = e.get("cost_usd")
         return {"outcome": str(e.get("outcome") or ""), "stop": str(e.get("stop_reason") or ""), "error": error,
-                "usage": usage, "cost": cost if isinstance(cost, (int, float)) and not isinstance(cost, bool) else None}
+                "usage": usage, "cost": cost if isinstance(cost, (int, float)) and not isinstance(cost, bool) else None,
+                "model": VibeWorker._export_model(e.get("config"))}
+
+    @staticmethod
+    def _export_model(config):
+        """The model the run used: export.json's resolved config names the active model's alias ("" = not
+        pinned, i.e. vibe's default, which the config does not spell out)."""
+        if not isinstance(config, dict):
+            return None
+        alias = config.get("active_model")
+        if not isinstance(alias, str) or not alias:
+            return None
+        for m in config.get("models") or []:
+            if isinstance(m, dict) and m.get("alias") == alias and m.get("name"):
+                return str(m["name"])
+        return alias
 
     def parse(self, r, spec):
         messages = self._messages(r["stdout"])
@@ -1010,7 +1030,7 @@ class VibeWorker(Worker):
         if not ok and (x["outcome"] or x["stop"]):
             error += "\noutcome: %s%s" % (x["outcome"] or "?", " / stop reason: " + x["stop"] if x["stop"] else "")
         return {"ok": ok, "status": status, "response": response, "error": error.strip(), "usage": x["usage"],
-                "cost": x["cost"], "turns": turns, "conversation_id": None, "duration": None}
+                "cost": x["cost"], "turns": turns, "conversation_id": None, "duration": None, "model": x["model"]}
 
 
 # Registry. The preference order comes from the config ("order").

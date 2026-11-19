@@ -205,6 +205,34 @@
     }
   },
   {
+    "name": "blame",
+    "description": "Which worker and model wrote a file's lines: matches each line by content against the jobs applied in this repo, so it survives commits, rebases and moved lines; a line edited after the apply counts as not from a worker. Returns compact line ranges with job id, worker/model, date and task title. Use it when a bug lands in code a worker may have written, then reread that job's task.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "File path, relative to the repo root (or absolute)"
+        },
+        "start": {
+          "type": "integer",
+          "description": "First line (1-based, default 1)"
+        },
+        "end": {
+          "type": "integer",
+          "description": "Last line, inclusive (default: end of file)"
+        },
+        "repo_dir": {
+          "type": "string",
+          "description": "Repo path (default: the project directory)"
+        }
+      },
+      "required": [
+        "path"
+      ]
+    }
+  },
+  {
     "name": "workers",
     "description": "List the workers with their state: enabled, installed, authenticated (when checkable), budget used/left in the last 24h, active jobs, models, strengths, warnings; plus the preference order, the fallback setting and the session default. With use=<worker> it also sets the default worker for this session (\"auto\" clears it). With doctor=true it instead checks this system for what isolation and credentials need, and shows the commands to install what is missing (never runs them). Does not use any budget.",
     "inputSchema": {

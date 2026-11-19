@@ -1642,8 +1642,11 @@ async function setSessionDefault(value) {
 
 // ---------------------------------------------------------------- tools
 
-// Tool definitions are shared with server.py.
-const TOOLS = JSON.parse(fs.readFileSync(new URL("./tools.json", import.meta.url), "utf8"));
+// Tool definitions are shared with server.py. The Node server is frozen: tools added after it was frozen
+// exist only in the Python server, so they are not listed here.
+const PYTHON_ONLY_TOOLS = new Set(["blame"]);
+const TOOLS = JSON.parse(fs.readFileSync(new URL("./tools.json", import.meta.url), "utf8"))
+  .filter((t) => !PYTHON_ONLY_TOOLS.has(t.name));
 
 function getJob(a) {
   const j = jobs.get(a.job_id);

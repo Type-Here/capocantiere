@@ -14,11 +14,11 @@ Supported workers:
 
 | Component | Purpose |
 |---|---|
-| **MCP server `capocantiere`** (Python or Node, zero dependencies) | The tools `delegate`, `analyze`, `jobs`, `apply`, `discard`, `workers`, `mode`, `models` |
+| **MCP server `capocantiere`** (Python or Node, zero dependencies) | The tools `delegate`, `analyze`, `jobs`, `apply`, `discard`, `blame`, `workers`, `mode`, `models` |
 | **Skill `worker-delegation`** | Teaches Claude *when* to delegate, which worker to pick, how to write a task, how to handle fallbacks and how to review the result. Claude loads it on its own when needed |
 | **Agent `worker-reviewer`** (Sonnet) | First-pass review of large diffs, to save the manager's context |
 | **SessionStart hook** | At the start of each session, tells Claude which workers are available, how much budget each has left and whether there are open jobs from previous sessions |
-| **Commands** | `/capocantiere:manager`, `/capocantiere:delegate`, `/capocantiere:analyze`, `/capocantiere:status`, `/capocantiere:review`, `/capocantiere:use`, `/capocantiere:models`, `/capocantiere:mode`, `/capocantiere:doctor` |
+| **Commands** | `/capocantiere:manager`, `/capocantiere:delegate`, `/capocantiere:analyze`, `/capocantiere:status`, `/capocantiere:review`, `/capocantiere:use`, `/capocantiere:models`, `/capocantiere:mode`, `/capocantiere:doctor`, `/capocantiere:blame` |
 
 ### How a job works
 
@@ -108,6 +108,7 @@ Other `auth` values: `"adc"` (Google Cloud Application Default Credentials, sets
 - `/capocantiere:use vibe` → use that worker by default for this session (`/capocantiere:use auto` goes back to the configured order).
 - `/capocantiere:mode` → shows or changes how much Claude delegates (see [Delegation mode](#delegation-mode)).
 - `/capocantiere:models` → the models of a worker (model groups for `agy`).
+- `/capocantiere:blame src/app.js:10-40` → which worker and model wrote those lines (see [Attribution](#attribution-blame)).
 
 Even without the commands, Claude can use the tools and the skill on its own when it finds them useful.
 
@@ -252,6 +253,17 @@ For `agy` the plugin reads `agy models` (only what your account can use, refresh
 
 `/capocantiere:models` shows the list and changes the `agy` defaults: a group follows new models automatically, an exact slug pins a model, `exclude` keeps models from ever being picked automatically, `auto` goes back to the default choice.
 
+## Attribution (blame)
+
+Every `apply` records which worker and model produced the code, so you can later ask who wrote a line. The record is kept **per repo, outside the git history**: in `.git/capocantiere/attribution.jsonl` (the common git dir, shared by worktrees). It never enters a commit or a push, and it goes away with the repo.
+
+- **What is recorded:** one line per applied job, in the [Agent Trace](https://agent-trace.dev) record format (v0.1.0): the files and line ranges the job added, as they sit in the working tree right after the apply, with `model_id` = `<worker>/<model>`. Fields outside that schema (job id, task title, worker, model, base commit, patch hash, and one content fingerprint per added line) go under `metadata["dev.capocantiere"]`.
+- **Which model:** the one the CLI reports having used, when it reports it (Copilot: the usage file's `modelMetrics`; Vibe: the resolved config in `export.json`). Otherwise the model the server asked for, or `default`. `jobs` shows it as "ran as ..." when it differs from the requested one.
+- **How `blame` answers:** each line of the file is matched **by content** (the line with leading and trailing whitespace removed) against the fingerprints of the jobs applied to that file, newest first. So it keeps working after commits, rebases and moved code, and a line edited after the apply is no longer attributed to the worker. Trivial lines (blank, brackets, fewer than 3 letters or digits) are never recorded; in the output they join the lines around them. Consecutive lines with the same author are grouped into one range.
+- **Limits:** a file renamed after the apply loses its attribution (records are per path), and two jobs adding an identical line both "own" it: the newest wins.
+
+`blame` is a tool Claude can call on its own (for example when a bug lands in code a worker wrote) and the `/capocantiere:blame <file>[:start-end]` command.
+
 ## Python or Node
 
 The MCP server exists in two versions in `plugins/capocantiere/server/`: `server.py` (with `common.py` and `workers.py`, standard library only) and `server.mjs` (no npm packages). They have the same tools and behavior, share `tools.json`, `modes.json` and `model-groups.json`, and use the same state files, so you can switch between them at any time without losing jobs.
@@ -259,6 +271,8 @@ The MCP server exists in two versions in `plugins/capocantiere/server/`: `server
 `run.sh` starts the right one: `python3` if it's on your `PATH`, otherwise `node`. To force a choice, set `CAPOCANTIERE_RUNTIME` to `python` or `node`.
 
 The Python version is the reference: it is the one covered by the test suite. The Node version is a port, not tested directly, and it doesn't support isolation or `token` credentials (it refuses those settings rather than ignoring them).
+
+**The Node server is frozen:** it keeps working for those who use it, but new features are implemented in the Python server only. Attribution (`blame`, and the records written at `apply`) is the first of them: the Node server does not list the tool and records nothing.
 
 ## Tests
 
@@ -277,6 +291,7 @@ Isolation is tested in two ways. Fake `bwrap`, `xdg-dbus-proxy` and `sandbox-exe
 - State, jobs, patches, usage log (per worker), `agy` model list, mode settings: `~/.local/state/capocantiere/`
 - Temporary worktrees: `~/.cache/capocantiere/worktrees/` (removed after apply/discard)
 - Config: `~/.config/capocantiere/workers.json`
+- Attribution records: `.git/capocantiere/attribution.jsonl` inside each repo (see [Attribution](#attribution-blame))
 
 Upgrading from the Gemini-only version (`gemini-delegate`): the old state in `~/.local/state/gemini-delegate/` is moved on first start; old jobs and old usage count as `agy`. Worktrees of old jobs stay where they were until those jobs are applied or discarded.
 

@@ -26,6 +26,7 @@ import time
 import common
 from common import (JOBS_DIR, PATCH_DIR, SETTINGS_FILE, USAGE_FILE, CONFIG_FILE, HERE, SIGKILL, iso_now, kill_tree,
                     new_id, not_found, now_ms, read_json, run, tail, truncate, write_json)
+import attribution
 import isolation
 import workers as W
 
@@ -234,6 +235,7 @@ def run_worker(w, role, prompt, cwd, model, effort, timeout_min, auto_approve, j
         "response": p.get("response") or "",
         "error": err_text,
         "conversationId": p.get("conversation_id"),
+        "effectiveModel": p.get("model") or None,  # the model the CLI says it used, when it says
         "turns": p.get("turns") or 0,
         "usage": p.get("usage"),
         "cost": p.get("cost"),
@@ -529,6 +531,7 @@ def execute_job(job):
         "workerStatus": res["status"],
         "response": res["response"],
         "conversationId": res["conversationId"],
+        "effectiveModel": res["effectiveModel"],
         "turns": res["turns"],
         "usage": res["usage"],
         "cost": res["cost"],
@@ -623,9 +626,11 @@ def job_detail(j, include_diff=True, max_diff_chars=15000):
         "worker: %s" % j.get("worker"),
         "branch: %s   worktree: %s" % (j["branch"], j["worktree"]),
         "base: %s (%s)" % (j.get("baseLabel"), (j.get("base") or "")[:10]),
-        "model: %s%s%s" % (j.get("model") or "CLI default",
-                           " (%s)" % j["modelSource"] if j.get("modelSource") not in (None, "", "CLI default") else "",
-                           ", effort " + j["effort"] if j.get("effort") else ""),
+        "model: %s%s%s%s" % (j.get("model") or "CLI default",
+                             " (%s)" % j["modelSource"] if j.get("modelSource") not in (None, "", "CLI default") else "",
+                             ", effort " + j["effort"] if j.get("effort") else "",
+                             ", ran as " + j["effectiveModel"]
+                             if j.get("effectiveModel") and j["effectiveModel"] != j.get("model") else ""),
     ]
     if j.get("durationSeconds") is not None:
         turns = j.get("turns")
@@ -977,11 +982,16 @@ def call_tool(name, a):
         j["status"] = "applied"
         j["appliedAt"] = iso_now()
         save_job(j)
+        try:
+            attribution.record_apply(j["repo"], j, a.get("quality"), VERSION)
+            note = ""
+        except Exception as e:  # attribution is a record, never a reason to fail an apply
+            note = "(attribution not recorded: %s)\n" % e
         if not a.get("keep_worktree"):
             remove_worktree(j)
         warn = r["stderr"].strip()
-        return "Applied (%s) to the working tree of %s. Changes are NOT committed.\n%s%s\nNow: run tests/typecheck and polish if needed." % (
-            how, j["repo"], warn + "\n" if warn else "", j.get("diffStat") or "")
+        return "Applied (%s) to the working tree of %s. Changes are NOT committed.\n%s%s%s\nNow: run tests/typecheck and polish if needed." % (
+            how, j["repo"], warn + "\n" if warn else "", note, j.get("diffStat") or "")
 
     if name == "discard":
         j = _get_job(a)
@@ -1002,6 +1012,11 @@ def call_tool(name, a):
             time.sleep(1.5)
         remove_worktree(j)
         return "Job %s discarded." % j["id"]
+
+    if name == "blame":
+        if not (a.get("path") or "").strip():
+            raise RuntimeError("path is required")
+        return attribution.blame(repo_root(a.get("repo_dir")), a["path"].strip(), a.get("start"), a.get("end"))
 
     if name == "workers":
         if a.get("doctor"):
