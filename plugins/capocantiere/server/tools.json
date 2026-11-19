@@ -84,7 +84,7 @@
         },
         "wait_seconds": {
           "type": "number",
-          "description": "If > 0, wait up to N seconds (max 600) and return the result directly"
+          "description": "If > 0, wait up to N seconds (max 600) and return the result directly Some clients (Claude Code) move a tool call running over 120 s to the background, so keep it at 110 or less and call again."
         },
         "force": {
           "type": "boolean",
@@ -181,7 +181,7 @@
         },
         "wait_seconds": {
           "type": "number",
-          "description": "Wait up to N seconds (max 600) for the job / all active jobs to finish"
+          "description": "Wait up to N seconds (max 600) for the job / all active jobs to finish Some clients (Claude Code) move a tool call running over 120 s to the background, so keep it at 110 or less and call again."
         },
         "include_diff": {
           "type": "boolean",

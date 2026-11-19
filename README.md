@@ -75,7 +75,8 @@ How it is run: `copilot -p <prompt> -s --no-ask-user --usage-output-file <tmp>`.
 
 How it is run: `vibe --prompt-file <tmp> --output json --output-dir <tmp> --workdir <worktree> --max-turns 40 --max-price 0.5 --time-limit <s>`.
 
-- In the worktree: `--auto-approve`. For `analyze`: only `--enabled-tools read_file --enabled-tools grep` (without auto-approve Vibe's default agent would still edit files).
+- In the worktree: `--auto-approve`. **Vibe then runs every command, git included:** its `[tools.bash] denylist` is ignored when auto-approving (checked with vibe 3.1.3), so unlike Copilot it cannot be told to keep away from `git branch`, `git push` and the like. Only [isolation](#isolation-and-credentials) keeps a job off the main repo's branches and your credentials; `workers` warns while vibe runs without it.
+- For `analyze`: only `--enabled-tools read_file --enabled-tools bash`, without auto-approve (Vibe's default agent would still edit files). Vibe 3.1 has no `grep` tool and searches through bash; without auto-approve bash runs only its read-only allowlist (`rg`, `grep`, `ls`, `git diff/log/status`, ...) and denies everything else, since a headless run cannot ask. Analyses are also capped at `analyze_max_tokens` (200000 by default).
 - `--max-price` (USD) and `--max-tokens` cap each run; reaching them fails the job but does **not** trigger the fallback. The cost vibe reports is computed from the prices in its config, so `--max-price` is only an extra guard: the real budget is `daily_budget` (runs per 24h).
 - `--time-limit` is passed too (the job's timeout), so vibe stops itself cleanly and still writes its report.
 - When the plan's credit is used up (HTTP 402, `usage_limit`) or vibe is rate-limited (HTTP 429), the job counts as a quota error and moves to the next worker. The reason is read from `export.json`, where vibe writes it even when stderr is empty.
@@ -181,7 +182,7 @@ Settings of every worker:
 | `tiers` | models per capability tier, e.g. `{"fast": "<model>", "strong": ["<model>", "<model>"]}` (empty = every tier uses `model`) |
 | `isolation_rw`, `isolation_ro`, `isolation_env` | extra paths an isolated worker may write / read, extra environment variables it keeps |
 
-Worker-specific settings: `copilot` — `deny_tools`, `disable_builtin_mcps`, `sandbox`, `max_ai_credits`, `secret_env_vars`; `vibe` — `max_turns`, `max_price`, `max_tokens`, `trust`, `analyze_tools`, `disabled_tools`; `agy` — `auth`, `sandbox`, `skip_permissions`.
+Worker-specific settings: `copilot` — `deny_tools`, `disable_builtin_mcps`, `sandbox`, `max_ai_credits`, `secret_env_vars`; `vibe` — `max_turns`, `max_price`, `max_tokens`, `analyze_max_tokens`, `trust`, `analyze_tools`, `disabled_tools`; `agy` — `auth`, `sandbox`, `skip_permissions`.
 
 **Environment variables** override the file, e.g. in `~/.claude/settings.json` under `"env"`: `CAPOCANTIERE_<WORKER>_<SETTING>` (`CAPOCANTIERE_VIBE_MAX_PRICE=1`, `CAPOCANTIERE_COPILOT_ENABLED=0`; lists are comma-separated), `CAPOCANTIERE_ORDER`, `CAPOCANTIERE_FALLBACK`, `CAPOCANTIERE_MAX_PARALLEL`, `CAPOCANTIERE_SELECTION`, `CAPOCANTIERE_HALF_LIFE_DAYS`, plus `CAPOCANTIERE_RUNTIME` (`python`, `node` or `auto`). The old `GEMINI_DELEGATE_*` variables still apply to `agy`.
 
@@ -335,6 +336,8 @@ Upgrading from the Gemini-only version (`gemini-delegate`): the old state in `~/
 - Budgets count runs, not the model's internal requests or tokens (each run makes several). Keep them conservative; the per-run caps (`max_price`, `max_ai_credits`) limit the cost of a single run.
 - Authentication checks don't call any model: Copilot is "authenticated" when its config records a logged-in user (or a token variable is set), Vibe when its cache records a signed-in account or `MISTRAL_API_KEY` is set. An expired login only shows up on the first run.
 - Without isolation, Copilot's shell commands are not limited to the worktree by path checks (only file tools are). The deny rules and, optionally, `sandbox` cover the dangerous ones. Turn on [isolation](#isolation-and-credentials) to contain them.
+- When Vibe runs on its default model, it does not report which model that is (`active_model` is empty in its `export.json`), so all its votes go to the arm `vibe:default` and a change of Vibe's default model is not noticed. Setting `model` for the vibe worker gives each model its own score. Copilot reports the model it used, so it does not have this problem.
+- After the server is updated and reconnected with `/mcp`, Claude Code may keep the old definitions of the tools it already knew (new tools do appear). New parameters still reach the server, but Claude may not know about them until a new session.
 - After a fallback, the next worker uses its own default model (a model name rarely means the same on another CLI).
 - The CLI flags were checked against GitHub Copilot CLI 1.0.114, Mistral Vibe 3.1.3 (help, config schema and source) and Antigravity CLI 1.5.10. If a CLI changes its output, the server still shows the raw output.
 

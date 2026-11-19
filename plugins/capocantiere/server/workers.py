@@ -886,7 +886,9 @@ class CopilotWorker(Worker):
 #   --auto-approve              approve every tool call (the auto-approve agent)
 #   --enabled-tools <t>         repeatable; in headless mode it disables every other tool
 # Without --auto-approve the default agent is "accept-edits", which still edits files: analyses therefore
-# run with read-only tools only. Paths outside the working directory follow `outside_workdir` in
+# run with read_file and bash only, and bash then runs only its read-only allowlist (anything else needs an
+# approval a headless run cannot give, so it is denied). With --auto-approve every command runs: vibe 3.1.3
+# ignores [tools.bash] denylist then (checked), so only isolation keeps a job's git commands off the main repo. Paths outside the working directory follow `outside_workdir` in
 # ~/.vibe/config.toml ("ask" by default, which --auto-approve approves): "deny" is recommended.
 # An untrusted working directory is still usable; --trust only makes vibe load the repo's AGENTS.md and
 # project config. Exit codes: 0 finished, 1 usage/config error, 2 infrastructure failure (the model API
@@ -909,7 +911,11 @@ class VibeWorker(Worker):
         "max_price": 0.5,  # USD cap per run (--max-price); 0 = no cap
         "max_tokens": 0,  # prompt + completion tokens cap per run (--max-tokens); 0 = no cap
         "trust": True,  # --trust: trust the worktree for this run only (loads the repo's AGENTS.md and Vibe config)
-        "analyze_tools": ["read_file", "grep"],  # the only tools enabled for analyses
+        # The only tools enabled for analyses. vibe 3.1 has no grep tool: it searches with bash, which in a run
+        # without --auto-approve only runs its read-only allowlist (rg, grep, ls, git diff/log/status, ...) and
+        # denies anything else, since a headless run cannot ask for approval.
+        "analyze_tools": ["read_file", "bash"],
+        "analyze_max_tokens": 200000,  # prompt + completion tokens cap per analysis (--max-tokens); 0 = max_tokens
         "disabled_tools": [],  # tools disabled in implementation runs (--disabled-tools)
         "strengths": ["analysis", "docs", "boilerplate", "tests"],
     }
@@ -957,6 +963,13 @@ class VibeWorker(Worker):
         if not re.search(r'^\s*outside_workdir\s*=\s*"deny"', text, re.M):
             out.append('%s/config.toml does not set outside_workdir = "deny": with auto-approve, vibe may touch files '
                        'outside the job\'s worktree. Add that line (it also applies to your interactive sessions).' % self.home())
+        if "grep" in (self.s.get("analyze_tools") or []):
+            out.append('analyze_tools lists "grep", which vibe 3.1+ no longer has (it searches with bash): use '
+                       '["read_file", "bash"]; without auto-approval bash only runs read-only commands.')
+        if (self.s.get("isolation") or "none") == "none":
+            out.append("vibe auto-approves every command in a job, git included (it ignores its bash denylist when "
+                       'auto-approving): only isolation keeps it from changing the main repo\'s branches or pushing. '
+                       'See /capocantiere:doctor.')
         if re.search(r"^\s*auto_worktree\s*=\s*true", text, re.M):
             out.append("%s/config.toml sets auto_worktree = true: vibe would edit its own worktree instead of the "
                        "job's, and every job would end with no changes. Set it to false." % self.home())
@@ -973,8 +986,9 @@ class VibeWorker(Worker):
              "--max-turns", str(self.s["max_turns"])]
         if self.s.get("max_price"):
             a += ["--max-price", str(self.s["max_price"])]
-        if self.s.get("max_tokens"):
-            a += ["--max-tokens", str(self.s["max_tokens"])]
+        max_tokens = (not spec.get("auto_approve") and self.s.get("analyze_max_tokens")) or self.s.get("max_tokens")
+        if max_tokens:
+            a += ["--max-tokens", str(max_tokens)]
         if spec.get("timeout_min"):
             a += ["--time-limit", str(max(1, int(round(spec["timeout_min"] * 60))))]
         if spec.get("model"):

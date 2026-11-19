@@ -97,10 +97,11 @@
       "max_turns": 40,
       "max_price": 0.5,
       "max_tokens": 0,
+      "analyze_max_tokens": 200000,
       "trust": true,
       "analyze_tools": [
         "read_file",
-        "grep"
+        "bash"
       ],
       "disabled_tools": [],
       "credentials": "host",
