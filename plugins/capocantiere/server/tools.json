@@ -13,6 +13,26 @@
           "type": "string",
           "description": "Short job title (optional)"
         },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "implement",
+            "tests",
+            "refactor",
+            "docs"
+          ],
+          "description": "Kind of task, for the trust scores that choose the worker (default implement). Always pass it."
+        },
+        "tier": {
+          "type": "string",
+          "enum": [
+            "fast",
+            "standard",
+            "strong",
+            "frontier"
+          ],
+          "description": "Capability tier (default standard for delegate, fast for analyze). Pass it only when the task is clearly simple (fast) or hard (strong, frontier). A worker serves a tier with its \"tiers\" config (for agy: the model group of that name)."
+        },
         "files": {
           "type": "array",
           "items": {
@@ -101,6 +121,16 @@
           "type": "number",
           "description": "Maximum response length in words (default 600)"
         },
+        "tier": {
+          "type": "string",
+          "enum": [
+            "fast",
+            "standard",
+            "strong",
+            "frontier"
+          ],
+          "description": "Capability tier (default standard for delegate, fast for analyze). Pass it only when the task is clearly simple (fast) or hard (strong, frontier). A worker serves a tier with its \"tiers\" config (for agy: the model group of that name)."
+        },
         "worker": {
           "type": "string",
           "description": "Worker to use (see the workers tool). Omit it to use the session default or the configured preference order."
@@ -182,6 +212,15 @@
         "keep_worktree": {
           "type": "boolean",
           "description": "Do not delete the worktree/branch (default false)"
+        },
+        "quality": {
+          "type": "string",
+          "enum": [
+            "good",
+            "minor_fixes",
+            "major_fixes"
+          ],
+          "description": "How usable the result was, for the worker's trust score: good (default, as is), minor_fixes (you touch it up a little), major_fixes (useful, but much of it must be redone)."
         }
       },
       "required": [
@@ -197,10 +236,45 @@
       "properties": {
         "job_id": {
           "type": "string"
+        },
+        "reason": {
+          "type": "string",
+          "enum": [
+            "bad",
+            "obsolete"
+          ],
+          "description": "bad (default for a finished job: counts against the worker's trust score) or obsolete (the plan changed, not the worker's fault: no vote)."
         }
       },
       "required": [
         "job_id"
+      ]
+    }
+  },
+  {
+    "name": "rate",
+    "description": "Rate a job or an analysis (id from its footer) for the worker's trust score. Rate an analysis only when it was clearly useful (good) or useless (bad). For a job it replaces the vote of apply/discard, e.g. when bugs show up later; obsolete withdraws the vote.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Job id or analysis id"
+        },
+        "quality": {
+          "type": "string",
+          "enum": [
+            "good",
+            "minor_fixes",
+            "major_fixes",
+            "bad",
+            "obsolete"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "quality"
       ]
     }
   },
@@ -245,6 +319,10 @@
         "doctor": {
           "type": "boolean",
           "description": "Check the system for isolation and credentials (only for /capocantiere:doctor or when the user asks)."
+        },
+        "scores": {
+          "type": "boolean",
+          "description": "Show the trust scores per worker:model and kind (only for /capocantiere:scores or when the user asks)."
         }
       }
     }

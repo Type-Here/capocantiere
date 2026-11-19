@@ -14,11 +14,11 @@ Supported workers:
 
 | Component | Purpose |
 |---|---|
-| **MCP server `capocantiere`** (Python or Node, zero dependencies) | The tools `delegate`, `analyze`, `jobs`, `apply`, `discard`, `blame`, `workers`, `mode`, `models` |
+| **MCP server `capocantiere`** (Python or Node, zero dependencies) | The tools `delegate`, `analyze`, `jobs`, `apply`, `discard`, `rate`, `blame`, `workers`, `mode`, `models` |
 | **Skill `worker-delegation`** | Teaches Claude *when* to delegate, which worker to pick, how to write a task, how to handle fallbacks and how to review the result. Claude loads it on its own when needed |
 | **Agent `worker-reviewer`** (Sonnet) | First-pass review of large diffs, to save the manager's context |
 | **SessionStart hook** | At the start of each session, tells Claude which workers are available, how much budget each has left and whether there are open jobs from previous sessions |
-| **Commands** | `/capocantiere:manager`, `/capocantiere:delegate`, `/capocantiere:analyze`, `/capocantiere:status`, `/capocantiere:review`, `/capocantiere:use`, `/capocantiere:models`, `/capocantiere:mode`, `/capocantiere:doctor`, `/capocantiere:blame` |
+| **Commands** | `/capocantiere:manager`, `/capocantiere:delegate`, `/capocantiere:analyze`, `/capocantiere:status`, `/capocantiere:review`, `/capocantiere:use`, `/capocantiere:models`, `/capocantiere:mode`, `/capocantiere:doctor`, `/capocantiere:blame`, `/capocantiere:scores` |
 
 ### How a job works
 
@@ -108,6 +108,7 @@ Other `auth` values: `"adc"` (Google Cloud Application Default Credentials, sets
 - `/capocantiere:use vibe` → use that worker by default for this session (`/capocantiere:use auto` goes back to the configured order).
 - `/capocantiere:mode` → shows or changes how much Claude delegates (see [Delegation mode](#delegation-mode)).
 - `/capocantiere:models` → the models of a worker (model groups for `agy`).
+- `/capocantiere:scores` → the trust scores of each worker and model (see [Trust scores](#trust-scores-and-tiers)).
 - `/capocantiere:blame src/app.js:10-40` → which worker and model wrote those lines (see [Attribution](#attribution-blame)).
 
 Even without the commands, Claude can use the tools and the skill on its own when it finds them useful.
@@ -154,6 +155,8 @@ Global settings:
 | Setting | Default | Meaning |
 |---|---|---|
 | `order` | `["copilot", "vibe", "agy"]` | preference order when no worker is requested |
+| `selection` | `"scores"` | `scores`: choose by trust score (the order only breaks ties while there is no history); `order`: always the preference order. See [Trust scores](#trust-scores-and-tiers) |
+| `half_life_days` | `30` | trust score events lose half their weight every N days |
 | `fallback` | `true` | on quota/rate-limit errors or exhausted budget, move on to the next worker |
 | `max_parallel` | `4` | jobs running at once, across all workers |
 | `isolation` | `"none"` | `none`, `auto`, `bwrap` or `seatbelt`: see [Isolation and credentials](#isolation-and-credentials) |
@@ -175,11 +178,12 @@ Settings of every worker:
 | `strengths` | tags Claude uses to choose a worker: `tests`, `boilerplate`, `docs`, `refactor`, `analysis`, … |
 | `credentials` | `host` (default) or `token`: see [Isolation and credentials](#isolation-and-credentials) |
 | `isolation` | overrides the global setting for this worker (empty = global) |
+| `tiers` | models per capability tier, e.g. `{"fast": "<model>", "strong": ["<model>", "<model>"]}` (empty = every tier uses `model`) |
 | `isolation_rw`, `isolation_ro`, `isolation_env` | extra paths an isolated worker may write / read, extra environment variables it keeps |
 
 Worker-specific settings: `copilot` — `deny_tools`, `disable_builtin_mcps`, `sandbox`, `max_ai_credits`, `secret_env_vars`; `vibe` — `max_turns`, `max_price`, `max_tokens`, `trust`, `analyze_tools`, `disabled_tools`; `agy` — `auth`, `sandbox`, `skip_permissions`.
 
-**Environment variables** override the file, e.g. in `~/.claude/settings.json` under `"env"`: `CAPOCANTIERE_<WORKER>_<SETTING>` (`CAPOCANTIERE_VIBE_MAX_PRICE=1`, `CAPOCANTIERE_COPILOT_ENABLED=0`; lists are comma-separated), `CAPOCANTIERE_ORDER`, `CAPOCANTIERE_FALLBACK`, `CAPOCANTIERE_MAX_PARALLEL`, plus `CAPOCANTIERE_RUNTIME` (`python`, `node` or `auto`). The old `GEMINI_DELEGATE_*` variables still apply to `agy`.
+**Environment variables** override the file, e.g. in `~/.claude/settings.json` under `"env"`: `CAPOCANTIERE_<WORKER>_<SETTING>` (`CAPOCANTIERE_VIBE_MAX_PRICE=1`, `CAPOCANTIERE_COPILOT_ENABLED=0`; lists are comma-separated), `CAPOCANTIERE_ORDER`, `CAPOCANTIERE_FALLBACK`, `CAPOCANTIERE_MAX_PARALLEL`, `CAPOCANTIERE_SELECTION`, `CAPOCANTIERE_HALF_LIFE_DAYS`, plus `CAPOCANTIERE_RUNTIME` (`python`, `node` or `auto`). The old `GEMINI_DELEGATE_*` variables still apply to `agy`.
 
 `MCP_TOOL_TIMEOUT` (in ms) is only needed if long analyses get cut off by Claude Code; jobs are asynchronous and aren't affected.
 
@@ -253,6 +257,33 @@ For `agy` the plugin reads `agy models` (only what your account can use, refresh
 
 `/capocantiere:models` shows the list and changes the `agy` defaults: a group follows new models automatically, an exact slug pins a model, `exclude` keeps models from ever being picked automatically, `auto` goes back to the default choice.
 
+## Trust scores and tiers
+
+Capocantiere learns which worker and model does which kind of task well, and uses it to choose the worker when none is requested. It costs Claude no extra calls: the signals come from calls it makes anyway.
+
+- **Arm:** the unit that is scored is `worker:model`, with the model the CLI reports it used (Copilot's usage file, Vibe's `export.json`; for `agy` the model the server resolved). A worker running on its CLI's default model is scored under the model it last reported for that default, so when the CLI changes its default, the new model starts fresh. If the CLI never says, the arm is `worker:default`.
+- **Kinds:** `implement` (default), `tests`, `refactor`, `docs` (the `kind` of `delegate`) and `analysis` (every `analyze`).
+- **Votes (0..1):**
+
+  | Event | Vote |
+  |---|---|
+  | `apply` (`quality`: `good`, the default / `minor_fixes` / `major_fixes`) | 1.0 / 0.6 / 0.3 |
+  | `discard` of a finished job (`reason`: `bad`, the default) | 0.0 |
+  | `discard` with `reason: "obsolete"` (the plan changed) | no vote |
+  | job failed (not on a quota), timed out, or ended with no changes | 0.0 |
+  | quota / rate limit, isolation or install problems | no vote |
+  | `analyze` | only with an explicit `rate` (its id is in the footer) |
+
+  Only the latest event of each job counts: applying a failed job's partial work replaces its 0, and `rate` (`good`, `minor_fixes`, `major_fixes`, `bad`, or `obsolete` to withdraw) corrects any vote.
+- **Score:** a Beta distribution per arm and kind. Each vote weighs `0.5 ** (age_days / half_life_days)`. The prior of a kind is the arm's overall score (`alpha0 = 1 + 4p`, `beta0 = 1 + 4(1 - p)`), so a kind with few votes stays close to how the model does in general. An arm never seen starts slightly optimistic (mean 0.6, a little higher for workers earlier in `order`), so new arms get tried.
+- **Choice:** only when neither the user nor Claude asks for a worker (an explicit `worker`, the session default from `/capocantiere:use` and the delegation mode always win). Each candidate arm draws `theta ~ Beta(alpha, beta)` for the task's kind and the arms are tried in decreasing `theta` (Thompson sampling): strong arms come first almost always, uncertain ones sometimes, weak ones almost never. The fallback on quota walks down the same list. `jobs` shows the draws in one line.
+- **Where:** raw events are appended to `scores.jsonl` in the state folder and the scores are computed when read, so the formula can change without losing the history.
+- **Seeing them:** `workers` shows one line per arm (mean and weighted number of votes for its most used kind); `/capocantiere:scores` shows the detail. The session-start message leaves them out.
+
+The trust score doesn't replace the review: a worker with a high score is reviewed like the others.
+
+**Tiers.** `delegate` and `analyze` take an optional `tier` (`fast`, `standard`, `strong`, `frontier`; default `standard` for jobs and `fast` for analyses). A worker with `"tiers"` in its config serves the tiers it lists, with those models (a list means one arm per model) and is skipped for a requested tier it doesn't list; a worker without `"tiers"` serves every tier with its `model` setting, so nothing changes until you configure them. For `agy` a tier is the model group of the same name. An explicit `model` wins over the tier. `effort` is a separate setting.
+
 ## Attribution (blame)
 
 Every `apply` records which worker and model produced the code, so you can later ask who wrote a line. The record is kept **per repo, outside the git history**: in `.git/capocantiere/attribution.jsonl` (the common git dir, shared by worktrees). It never enters a commit or a push, and it goes away with the repo.
@@ -272,7 +303,7 @@ The MCP server exists in two versions in `plugins/capocantiere/server/`: `server
 
 The Python version is the reference: it is the one covered by the test suite. The Node version is a port, not tested directly, and it doesn't support isolation or `token` credentials (it refuses those settings rather than ignoring them).
 
-**The Node server is frozen:** it keeps working for those who use it, but new features are implemented in the Python server only. Changes to the core behavior (how jobs are created, run and applied) still go into both, so a job behaves the same on either. Attribution (`blame`, and the records written at `apply`) is the first of them: the Node server does not list the tool and records nothing.
+**The Node server is frozen:** it keeps working for those who use it, but new features are implemented in the Python server only. Changes to the core behavior (how jobs are created, run and applied) still go into both, so a job behaves the same on either. Attribution (`blame`, and the records written at `apply`) is the first of them: the Node server does not list the tool and records nothing. Trust scores and tiers are the second: the Node server always follows `order`, does not list `rate` nor the `kind`, `tier`, `quality`, `reason` and `scores` parameters, and reports `selection`, `half_life_days` and `tiers` in its config as unsupported (in `workers`).
 
 ## Tests
 
@@ -291,6 +322,7 @@ Isolation is tested in two ways. Fake `bwrap`, `xdg-dbus-proxy` and `sandbox-exe
 - State, jobs, patches, usage log (per worker), `agy` model list, mode settings: `~/.local/state/capocantiere/`
 - Temporary worktrees: `~/.cache/capocantiere/worktrees/` (removed after apply/discard)
 - Config: `~/.config/capocantiere/workers.json`
+- Trust score events: `scores.jsonl` in the state folder
 - Attribution records: `.git/capocantiere/attribution.jsonl` inside each repo (see [Attribution](#attribution-blame))
 
 Upgrading from the Gemini-only version (`gemini-delegate`): the old state in `~/.local/state/gemini-delegate/` is moved on first start; old jobs and old usage count as `agy`. Worktrees of old jobs stay where they were until those jobs are applied or discarded.

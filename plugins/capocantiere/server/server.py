@@ -28,6 +28,7 @@ from common import (JOBS_DIR, PATCH_DIR, SETTINGS_FILE, USAGE_FILE, CONFIG_FILE,
                     new_id, not_found, now_ms, read_json, run, tail, truncate, write_json)
 import attribution
 import isolation
+import scores
 import workers as W
 
 VERSION = "2.0.0"
@@ -135,42 +136,112 @@ def candidate_order(requested, fallback):
     return [first] + (rest if fallback else [])
 
 
-def pick_worker(requested=None, force=False, fallback=None, exclude=()):
-    """Choose the worker for a run. Returns (worker, notes). Raises if none is usable.
+def arms_of(w, role, tier, model, effort, events, strict=False):
+    """The worker's candidate arms for this run: dicts with worker, model, effort, source, arm.
 
-    Skips workers that are disabled, not installed, or out of budget (unless force); every skipped
-    worker that was asked for explicitly, or that sits before the chosen one, is explained in notes.
+    strict (the worker was asked for by name): a model it rejects is an error, and a tier it doesn't
+    list falls back to its usual model instead of leaving it out.
+    """
+    out = []
+    reqs = w.arm_models(role, tier, model) or (w.arm_models(role, None, model) if strict else [])
+    for req in reqs:
+        try:
+            m, e, src = w.resolve_model(role, req, effort)
+        except Exception:
+            if strict:
+                raise
+            continue
+        out.append({"worker": w.id, "model": m, "effort": e, "source": src,
+                    "arm": "%s:%s" % (w.id, scores.learned_model(w.id, m, events))})
+    return out
+
+
+def plan(role, kind=None, tier=None, requested=None, model=None, effort=None, fallback=None):
+    """The candidate arms in the order they are tried, plus how that order was made.
+
+    An explicit worker (argument or session default) and "selection": "order" keep the preference order;
+    otherwise the arms of every enabled worker are ranked by Thompson sampling on their trust scores.
     """
     cfg = W.load_config()
     if requested and requested not in W.ADAPTERS:
         raise RuntimeError('Unknown worker "%s". Workers: %s.' % (requested, ", ".join(W.ADAPTERS)))
+    if tier and tier not in scores.TIERS:
+        raise RuntimeError('Unknown tier "%s" (use %s).' % (tier, ", ".join(scores.TIERS)))
     fallback = cfg["fallback"] if fallback is None else fallback
+    events = scores.read_events()
+    explicit = requested or SESSION["default"]
+    cands = []
+    if explicit or cfg["selection"] == "order":
+        for i, wid in enumerate(candidate_order(requested, fallback)):
+            w = W.get_worker(wid)
+            if not w.enabled and wid != explicit:
+                continue
+            # a model given with no worker means the first one's model: names differ between CLIs
+            cands += arms_of(w, role, tier, model if (i == 0 or not explicit) else None, effort, events,
+                             strict=(i == 0 and bool(explicit)))[:1]
+        how = ("requested" if requested else "session default") if explicit else "configured order"
+        return cands, how
+    for wid in cfg["order"]:
+        w = W.get_worker(wid)
+        if w.enabled:
+            cands += arms_of(w, role, tier, model, effort, events)
+    table = scores.Table(events, cfg["half_life_days"], order=cfg["order"])
+    ranked = scores.rank(cands, kind or ("analysis" if role == "analyze" else "implement"), table)
+    return ranked, scores.explain(ranked)
+
+
+def pick(cands, force=False, exclude=(), requested=None):
+    """The first usable arm of cands. Returns (worker, arm, notes). Raises if none is usable.
+
+    Skips workers that are disabled, not installed, or out of budget (unless force); every skipped
+    worker that was asked for explicitly, or that sits before the chosen one, is explained in notes.
+    """
     usage = usage_by_worker(24)
-    notes = []
-    for wid in candidate_order(requested, fallback):
+    notes, checked = [], {}
+    for c in cands:
+        wid = c["worker"]
         if wid in exclude:
             continue
-        w = W.get_worker(wid)
-        if not w.enabled:
-            if wid == requested or wid == SESSION["default"]:
-                notes.append("%s is disabled in %s." % (wid, CONFIG_FILE))
-            continue
-        installed, _ = w.version()
-        if not installed:
-            notes.append('%s skipped: command "%s" not found.' % (wid, w.bin))
-            continue
-        problem = w.blocker()
-        if problem:
-            notes.append("%s skipped: %s." % (wid, problem))
-            continue
-        b = budget_state(w, usage)
-        if b["left"] <= 0 and not force:
-            notes.append("%s skipped: daily budget used up (%d/%s runs in 24h, including active jobs)."
-                         % (wid, b["committed"], b["budget"]))
-            continue
-        return w, notes
+        if wid not in checked:
+            w = W.get_worker(wid)
+            problem = None
+            if not w.enabled:
+                problem = "disabled"
+                if wid == requested or wid == SESSION["default"]:
+                    notes.append("%s is disabled in %s." % (wid, CONFIG_FILE))
+            elif not w.version()[0]:
+                problem = 'command "%s" not found' % w.bin
+            elif w.blocker():
+                problem = w.blocker()
+            else:
+                b = budget_state(w, usage)
+                if b["left"] <= 0 and not force:
+                    problem = "daily budget used up (%d/%s runs in 24h, including active jobs)" % (b["committed"], b["budget"])
+            if problem and problem != "disabled":
+                notes.append("%s skipped: %s." % (wid, problem))
+            checked[wid] = (w, problem)
+        w, problem = checked[wid]
+        if not problem:
+            return w, c, notes
+    if not cands:
+        notes.append("no enabled worker serves this tier/model.")
     raise RuntimeError("No worker available. %s Do the work yourself, or retry with force=true if only the budget "
                        "is the problem. See the workers tool." % (" ".join(notes) or "All workers are disabled."))
+
+
+def vote(entry, event, reward, kind=None, tier=None, model=None, effective=None):
+    """Append a trust score event for a job or analysis (never fails the caller)."""
+    try:
+        scores.record({"id": entry["id"], "repo": entry.get("repo"), "worker": entry.get("worker"),
+                       "requested": model or "", "effective": effective or None,
+                       "model": scores.arm_model(model, effective), "kind": kind or "implement",
+                       "tier": tier, "event": event, "reward": reward})
+    except Exception:
+        pass
+
+
+def job_vote(job, event, reward):
+    vote(job, event, reward, job.get("kind"), job.get("tier"), job.get("model"), job.get("effectiveModel"))
 
 
 # ---------------------------------------------------------------- running a worker
@@ -481,8 +552,13 @@ def snapshot_commit(repo, jid):
 def create_job(args):
     repo = repo_root(args.get("repo_dir"))
     ensure_enabled(repo)
-    w, notes = pick_worker(args.get("worker"), args.get("force"), args.get("fallback"))
-    model, effort, model_source = w.resolve_model("implement", args.get("model"), args.get("effort"))
+    kind = args.get("kind") or "implement"
+    if kind not in scores.KINDS:
+        raise RuntimeError('Unknown kind "%s" (use %s).' % (kind, ", ".join(scores.KINDS)))
+    tier = args.get("tier") or None
+    cands, how = plan("implement", kind, tier, args.get("worker"), args.get("model"), args.get("effort"), args.get("fallback"))
+    w, arm, notes = pick(cands, args.get("force"), requested=args.get("worker"))
+    model, effort, model_source = arm["model"], arm["effort"], arm["source"]
     jid = new_id()
     branch = "capocantiere/" + jid
     worktree = os.path.join(common.WORKTREE_DIR, "%s-%s" % (os.path.basename(repo), jid))
@@ -522,6 +598,11 @@ def create_job(args):
         "model": model,
         "modelSource": model_source,
         "effort": effort,
+        "kind": kind,
+        "tier": tier or scores.DEFAULT_TIER["implement"],
+        "requestedTier": tier,
+        "selection": how,
+        "candidates": cands,
         "timeoutMin": args.get("timeout_minutes") or w.timeout_min("implement"),
         "notes": notes,
         "attempts": [],
@@ -533,6 +614,24 @@ def create_job(args):
         queue.append(jid)
     pump()
     return job
+
+
+def fallback_candidates(job, role):
+    """The job's candidate arms for a fallback, in their original order. A model given in the request
+    is dropped: a model name rarely means the same on another CLI."""
+    cands = job.get("candidates")
+    if cands is None:  # a job created before trust scores
+        cands, _ = plan(role, job.get("kind"), job.get("requestedTier"), None, None, job.get("requestedEffort"), True)
+    if not job.get("requestedModel"):
+        return cands
+    events = scores.read_events()
+    out = []
+    for c in cands:
+        try:
+            out += arms_of(W.get_worker(c["worker"]), role, job.get("requestedTier"), None, job.get("requestedEffort"), events)[:1]
+        except Exception:
+            pass
+    return out
 
 
 def reset_worktree(job):
@@ -554,8 +653,10 @@ def execute_job(job):
         if res["ok"] or not res["quota"] or not job.get("fallback"):
             break
         # quota / rate limit: move on to the next worker, if any is usable
+        job_vote(dict(job, effectiveModel=res["effectiveModel"]), "quota", None)  # availability, not quality
         try:
-            nxt, notes = pick_worker(None, job.get("force"), True, exclude=[a["worker"] for a in job["attempts"]] + [w.id])
+            nxt, arm, notes = pick(fallback_candidates(job, "implement"), job.get("force"),
+                                   exclude=[a["worker"] for a in job["attempts"]] + [w.id])
         except RuntimeError:
             break
         job["attempts"].append({"worker": w.id, "model": job["model"], "status": res["status"],
@@ -564,8 +665,7 @@ def execute_job(job):
             "%s hit a quota/rate limit: relaunched on %s." % (w.id, nxt.id)]
         reset_worktree(job)
         job["worker"] = nxt.id
-        job["model"], job["effort"], job["modelSource"] = nxt.resolve_model(
-            "implement", None, job.get("requestedEffort"))  # a model name rarely means the same on another CLI
+        job["model"], job["effort"], job["modelSource"] = arm["model"], arm["effort"], arm["source"]
         job["timeoutMin"] = nxt.timeout_min("implement")
         save_job(job)
 
@@ -599,6 +699,16 @@ def execute_job(job):
     else:
         job["status"] = "done" if job.get("filesChanged", 0) > 0 else "no_changes"
     save_job(job)
+    if job["status"] == "discarded" or res["notFound"] or res["status"] == "ISOLATION_ERROR":
+        pass  # availability, not quality
+    elif res["quota"]:
+        job_vote(job, "quota", None)
+    elif job["status"] == "failed":
+        job_vote(job, "timeout" if res["timedOut"] else "failed", 0.0)
+    elif job["status"] == "no_changes":
+        job_vote(job, "no_changes", 0.0)
+    else:
+        job_vote(job, "done", None)  # the vote comes with apply or discard
     # nothing to review: free the worktree and branch right away
     if not job.get("filesChanged"):
         try:
@@ -675,6 +785,8 @@ def job_detail(j, include_diff=True, max_diff_chars=15000):
                              ", ran as " + j["effectiveModel"]
                              if j.get("effectiveModel") and j["effectiveModel"] != j.get("model") else ""),
     ]
+    if j.get("kind"):
+        lines.append("kind: %s, tier: %s; worker %s" % (j["kind"], j.get("tier"), j.get("selection") or "chosen"))
     if j.get("durationSeconds") is not None:
         turns = j.get("turns")
         extra = ", cost %s" % j["cost"] if j.get("cost") else ""
@@ -728,11 +840,13 @@ def analyze(a):
         return hashlib.sha1((s["stdout"] + d["stdout"]).encode("utf-8")).hexdigest()
 
     fallback = W.load_config()["fallback"] if a.get("fallback") is None else bool(a.get("fallback"))
-    w, notes = pick_worker(a.get("worker"), a.get("force"), fallback)
-    requested_model = a.get("model")
+    tier = a.get("tier") or None
+    cands, how = plan("analyze", "analysis", tier, a.get("worker"), a.get("model"), a.get("effort"), fallback)
+    w, arm, notes = pick(cands, a.get("force"), requested=a.get("worker"))
+    aid = "a" + new_id()[1:]
     tried = []
     while True:
-        model, effort, model_source = w.resolve_model("analyze", requested_model, a.get("effort"))
+        model, effort, model_source = arm["model"], arm["effort"], arm["source"]
         before = snapshot()
         res = run_worker(w, "analyze", prompt, repo, model, effort,
                          a.get("timeout_minutes") or w.timeout_min("analyze"),
@@ -744,11 +858,17 @@ def analyze(a):
         if res["ok"] or not res["quota"] or not fallback:
             break
         try:
-            nxt, more = pick_worker(None, a.get("force"), True, exclude=tried)
+            job = {"candidates": cands, "requestedModel": a.get("model"), "requestedTier": tier,
+                   "requestedEffort": a.get("effort"), "kind": "analysis"}
+            nxt, arm, more = pick(fallback_candidates(job, "analyze"), a.get("force"), exclude=tried)
         except RuntimeError:
             break
         notes += more + ["%s hit a quota/rate limit: asked %s instead." % (w.id, nxt.id)]
-        w, requested_model = nxt, None
+        w = nxt
+    if not res["notFound"] and res["status"] != "ISOLATION_ERROR":
+        # no vote: an analysis is rated only explicitly, with rate (this event keeps what rate needs)
+        vote({"id": aid, "repo": repo, "worker": w.id}, "analysis", None, "analysis",
+             tier or scores.DEFAULT_TIER["analyze"], model, res["effectiveModel"])
     out = ["NOTES: " + " ".join(notes)] if notes else []
     if not res["ok"]:
         out.append("ERROR from %s (%s)%s:\n%s%s" % (w.id, res["status"], " — QUOTA/RATE LIMIT" if res["quota"] else "",
@@ -757,9 +877,9 @@ def analyze(a):
         out.append("⚠️ WARNING: the repo state changed during the analysis. Check `git status` / `git diff`.")
     out.append(truncate(res["response"] or "(no response)", 16000))
     total = (res["usage"] or {}).get("total_tokens")
-    out.append("\n[analyze: %s, %s (%s), %ss, turns %s, tokens %s]" % (
-        w.id, model or "CLI default", model_source, round(res["durationSeconds"]), res["turns"],
-        "?" if total is None else total))
+    out.append("\n[analyze: %s, %s (%s), %ss, turns %s, tokens %s, id %s]" % (
+        w.id, res["effectiveModel"] or model or "CLI default", model_source, round(res["durationSeconds"]), res["turns"],
+        "?" if total is None else total, aid))
     return {"text": "\n\n".join(out), "isError": not res["ok"] and not res["response"]}
 
 
@@ -800,6 +920,9 @@ def workers_report():
             lines.append("  ⚠️ " + warning)
     lines += ["", "Fallback on quota/budget: %s. Max parallel jobs overall: %s." % (
         "on" if cfg["fallback"] else "off", cfg["max_parallel"])]
+    table = scores.Table(None, cfg["half_life_days"], order=cfg["order"])
+    lines.append("Selection: %s%s" % (cfg["selection"], " (trust scores, details: workers scores=true)" if cfg["selection"] == "scores" else ""))
+    lines += scores.summary_lines(table)
     lines.append("Session default: %s." % (SESSION["default"] or "none (preference order)"))
     lines.append(mode_line(current_repo()))
     for e in cfg["errors"]:
@@ -952,6 +1075,31 @@ def _get_job(a):
     return j
 
 
+APPLY_QUALITY = ("good", "minor_fixes", "major_fixes")
+RATE_QUALITY = ("good", "minor_fixes", "major_fixes", "bad", "obsolete")
+
+
+def rate(a):
+    """An explicit vote on a job or an analysis; it replaces the job's earlier vote ("obsolete" withdraws it)."""
+    rid, q = (a.get("id") or "").strip(), a.get("quality")
+    if q not in RATE_QUALITY:
+        raise RuntimeError("quality must be one of %s" % ", ".join(RATE_QUALITY))
+    j = jobs.get(rid)
+    last = scores.last_event(rid)
+    if j:
+        if j["status"] in ("running", "queued"):
+            raise RuntimeError("The job is still running: rate it after it finishes.")
+        job_vote(j, "rate:" + q, scores.QUALITY.get(q))
+        who = "%s:%s" % (j.get("worker"), scores.arm_model(j.get("model"), j.get("effectiveModel")))
+    elif last:
+        vote(last, "rate:" + q, scores.QUALITY.get(q), last.get("kind"), last.get("tier"), last.get("requested"),
+             last.get("effective"))
+        who = "%s:%s" % (last["worker"], last.get("model") or "default")
+    else:
+        raise RuntimeError("Unknown job or analysis id %s" % rid)
+    return "Rated %s (%s): %s." % (rid, who, "vote withdrawn" if q == "obsolete" else q)
+
+
 def call_tool(name, a):
     if name == "delegate":
         if not (a.get("task") or "").strip():
@@ -1002,6 +1150,9 @@ def call_tool(name, a):
 
     if name == "apply":
         j = _get_job(a)
+        quality = a.get("quality") or "good"
+        if quality not in APPLY_QUALITY:
+            raise RuntimeError('quality must be one of %s' % ", ".join(APPLY_QUALITY))
         if j["status"] in ("running", "queued"):
             raise RuntimeError("The job is still running.")
         if j["status"] == "applied":
@@ -1024,7 +1175,9 @@ def call_tool(name, a):
                 }
         j["status"] = "applied"
         j["appliedAt"] = iso_now()
+        j["quality"] = quality
         save_job(j)
+        job_vote(j, "apply:" + quality, scores.QUALITY[quality])
         try:
             attribution.record_apply(j["repo"], j, a.get("quality"), VERSION)
             note = ""
@@ -1038,9 +1191,21 @@ def call_tool(name, a):
 
     if name == "discard":
         j = _get_job(a)
+        reason = a.get("reason")
+        if reason not in (None, "", "bad", "obsolete"):
+            raise RuntimeError('reason must be "bad" or "obsolete"')
         was_running = j["status"] == "running"
+        before = j["status"]
         j["status"] = "discarded"
         save_job(j)
+        # A job that never finished (or stopped on a quota) counts only with an explicit "bad";
+        # an applied one keeps its vote.
+        last = scores.last_event(j["id"]) or {}
+        if reason == "obsolete" and before != "applied":
+            job_vote(j, "discard:obsolete", None)
+        elif before != "applied" and (reason == "bad" or (
+                before in ("done", "failed", "no_changes") and last.get("event") != "quota")):
+            job_vote(j, "discard:bad", 0.0)
         c = children.get(j["id"])
         if c:
             kill_tree(c, signal.SIGTERM)
@@ -1056,6 +1221,9 @@ def call_tool(name, a):
         remove_worktree(j)
         return "Job %s discarded." % j["id"]
 
+    if name == "rate":
+        return rate(a)
+
     if name == "blame":
         if not (a.get("path") or "").strip():
             raise RuntimeError("path is required")
@@ -1064,6 +1232,9 @@ def call_tool(name, a):
     if name == "workers":
         if a.get("doctor"):
             return doctor_report()
+        if a.get("scores"):
+            cfg = W.load_config()
+            return scores.report(scores.Table(None, cfg["half_life_days"], order=cfg["order"]), cfg["half_life_days"])
         head = set_session_default(a["use"]) + "\n\n" if "use" in a else ""
         return head + workers_report()
 

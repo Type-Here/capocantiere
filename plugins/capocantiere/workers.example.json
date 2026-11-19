@@ -18,6 +18,10 @@
     "org.kde.kwalletd5"
   ],
   "_keyring_dbus_names": "Linux, \"host\" credentials: the only session D-Bus services an isolated worker can reach (through xdg-dbus-proxy), i.e. the system keyring.",
+  "selection": "scores",
+  "_selection": "How a worker is chosen when none is requested (and no session default): \"scores\" ranks every worker:model by its trust score with Thompson sampling (the order only breaks ties while there is no history), \"order\" always follows the preference order. See /capocantiere:scores.",
+  "half_life_days": 30,
+  "_half_life_days": "Trust score events lose half their weight every N days (models and CLIs change).",
   "workers": {
     "copilot": {
       "_comment": "GitHub Copilot CLI. Logs in with `copilot login`. daily_budget counts runs (each run costs AI credits / premium requests). deny_tools are always denied while auto-approving in the job's worktree.",
@@ -67,7 +71,9 @@
       "isolation_ro": [],
       "isolation_env": [],
       "_credentials": "\"host\": the login of the CLI itself (copilot login, in the system keyring). \"token\": a fine-grained personal access token with only the \"Copilot Requests\" permission, read from ~/.local/state/capocantiere/credentials/copilot (chmod 600) or CAPOCANTIERE_COPILOT_TOKEN and given to this worker only, as COPILOT_GITHUB_TOKEN. Same for vibe (MISTRAL_API_KEY) and agy (GEMINI_API_KEY).",
-      "_isolation": "Empty = the global setting. isolation_rw / isolation_ro: extra paths the isolated worker may write / read; isolation_env: extra environment variables it keeps (names, or prefixes ending in \"_\")."
+      "_isolation": "Empty = the global setting. isolation_rw / isolation_ro: extra paths the isolated worker may write / read; isolation_env: extra environment variables it keeps (names, or prefixes ending in \"_\").",
+      "tiers": {},
+      "_tiers": "Models per capability tier, e.g. {\"fast\": \"<model>\", \"standard\": \"<model>\", \"strong\": [\"<model>\", \"<model>\"]}: delegate/analyze pick one with tier. Each model is a separate arm for the trust scores. Empty = this worker serves every tier with its model setting. For agy, without tiers a tier is the model group of the same name."
     },
     "vibe": {
       "_comment": "Mistral Vibe CLI. Signs in with your Mistral account (run `vibe` once; the Free plan works) or MISTRAL_API_KEY. max_price is a USD cap per run computed from vibe's configured prices: an extra guard only. Set outside_workdir = \"deny\" in ~/.vibe/config.toml.",
@@ -101,7 +107,8 @@
       "isolation": "",
       "isolation_rw": [],
       "isolation_ro": [],
-      "isolation_env": []
+      "isolation_env": [],
+      "tiers": {}
     },
     "agy": {
       "_comment": "Antigravity CLI. DISABLED by default: running `agy -p` inside third-party agents is not supported on consumer plans and can get the account suspended. Enable it only with an API key, never with the subscription login.",
@@ -130,7 +137,8 @@
       "isolation": "",
       "isolation_rw": [],
       "isolation_ro": [],
-      "isolation_env": []
+      "isolation_env": [],
+      "tiers": {}
     }
   }
 }

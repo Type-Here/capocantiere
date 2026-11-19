@@ -13,6 +13,7 @@ import time
 from datetime import datetime
 
 import isolation
+from scores import DEFAULT_TIER, TIERS
 from common import (CONFIG_FILE, HERE, SETTINGS_FILE, STATE_DIR, boolean, env, iso_now, not_found, now_ms, num,
                     read_json, run, write_json)
 
@@ -25,6 +26,10 @@ GLOBAL_DEFAULTS = {
     "isolation": "none",  # none | auto | bwrap (Linux) | seatbelt (macOS, experimental); see isolation.py
     # D-Bus names that reach the system keyring, let into the sandbox with "host" credentials (Linux)
     "keyring_dbus_names": list(isolation.DEFAULT_KEYRING_NAMES),
+    # How a worker is chosen when none is requested: "scores" (trust scores, Thompson sampling; `order` only
+    # breaks ties while there is no history) or "order" (always the preference order). See scores.py.
+    "selection": "scores",
+    "half_life_days": 30,  # trust score events lose half their weight every N days
 }
 
 # Settings every worker has. Adapters add their own on top.
@@ -49,9 +54,13 @@ COMMON_DEFAULTS = {
     "isolation_rw": [],  # extra paths the worker may write when isolated
     "isolation_ro": [],  # extra paths the worker may read when isolated
     "isolation_env": [],  # extra environment variables kept when isolated (names, or prefixes ending in "_")
+    # Models per capability tier, e.g. {"fast": "m1", "standard": "m2", "strong": ["m3", "m4"]}; each model is
+    # a separate arm for the trust scores. Empty = the worker serves every tier with its model setting.
+    "tiers": {},
 }
 
 CREDENTIALS = ("host", "token", "private-home")
+SELECTIONS = ("scores", "order")
 CREDENTIALS_DIR = os.path.join(STATE_DIR, "credentials")
 
 # Old environment variables of the gemini-delegate server, mapped to agy settings.
@@ -147,6 +156,16 @@ def load_config():
                     s[key] = coerce(v, like)
             s["isolation"] = s.get("isolation") or cfg["isolation"]  # effective value
             workers[wid] = s
+        if cfg["selection"] not in SELECTIONS:
+            errors.append('"selection": "%s" is not valid (use %s): using "scores".' % (cfg["selection"], " or ".join(SELECTIONS)))
+            cfg["selection"] = "scores"
+        for wid, s in workers.items():
+            t = s.get("tiers")
+            if not isinstance(t, dict) or any(k not in TIERS for k in t if not k.startswith("_")):
+                errors.append('"tiers" of %s must be an object with keys among %s: ignored.' % (wid, ", ".join(TIERS)))
+                s["tiers"] = {}
+            else:
+                s["tiers"] = {k: v for k, v in t.items() if not k.startswith("_") and v}
         cfg["order"] = [w for w in cfg["order"] if w in ADAPTERS] + [w for w in ADAPTERS if w not in cfg["order"]]
         cfg["workers"] = workers
         cfg["errors"] = errors
@@ -341,6 +360,23 @@ class Worker:
                 return value, effort or self.s.get("effort") or "", src
         return "", effort or self.s.get("effort") or "", "CLI default"
 
+    def arm_models(self, role, tier=None, model=None):
+        """The model requests (for resolve_model) this worker offers for a tier, one arm each.
+
+        None = the worker's usual rules. An explicit model wins. A worker with "tiers" serves only the tiers it
+        lists when one is requested; without "tiers" it serves every tier with its model setting.
+        """
+        if model:
+            return [model]
+        tiers = self.s.get("tiers") or {}
+        if tiers:
+            v = tiers.get(tier or DEFAULT_TIER.get(role, "standard"))
+            if v:
+                return [str(x) for x in v] if isinstance(v, list) else [str(v)]
+            if tier:
+                return []
+        return [None]
+
     def timeout_min(self, role):
         return self.s["analyze_timeout_min"] if role == "analyze" else self.s["timeout_min"]
 
@@ -525,6 +561,12 @@ class AgyWorker(Worker):
         if not self.enabled or self.s.get("auth") == "login":
             return [self.WARNING]
         return []
+
+    def arm_models(self, role, tier=None, model=None):
+        """Without "tiers" in the config, a tier is the agy group of the same name."""
+        if not model and tier and not self.s.get("tiers") and tier in GROUP_IDS:
+            return [tier]
+        return super().arm_models(role, tier, model)
 
     # -- models
 
