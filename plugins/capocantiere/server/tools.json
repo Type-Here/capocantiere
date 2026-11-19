@@ -34,7 +34,7 @@
         },
         "include_uncommitted": {
           "type": "boolean",
-          "description": "Start from the current state including uncommitted changes (default true). Untracked files are not included."
+          "description": "Start from the current state including uncommitted changes and untracked files not ignored by .gitignore (default true). Untracked files over 5 MB are left out."
         },
         "worker": {
           "type": "string",

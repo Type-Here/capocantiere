@@ -512,7 +512,7 @@ class E2E(unittest.TestCase):
 
     def test_blame_two_jobs_on_one_file(self):
         first = self.apply_job({"src/app.js": self.APP}, worker="copilot", title="add and mul")
-        self.commit()  # a job's base leaves out untracked files (git stash create)
+        # no commit in between: the file the first job created is untracked, and the second job still sees it
         more = self.APP + "\nfunction sub(a, b) {\n  return a - b;\n}\n"
         second = self.apply_job({"src/app.js": more}, worker="vibe", title="sub")
         text = self.blame(os.path.join(self.repo, "src", "app.js"))  # an absolute path works too
@@ -522,6 +522,33 @@ class E2E(unittest.TestCase):
         self.assertEqual(len(self.records()), 2)
         meta = self.records()[1]["metadata"]["dev.capocantiere"]
         self.assertEqual(len(meta["fingerprints"]["src/app.js"]), 2)  # only what the second job added
+
+    def test_base_includes_untracked_files(self):
+        self.write_file(".gitignore", "secret.txt\n")
+        self.write_file("notes.txt", "untracked notes\n")
+        self.write_file("secret.txt", "ignored\n")
+        with open(os.path.join(self.repo, "big.bin"), "wb") as f:
+            f.write(b"x" * (6 * 2**20))
+        self.write_file("main.txt", "hello, edited\n")
+        before = subprocess.run(["git", "status", "--porcelain"], cwd=self.repo, capture_output=True, text=True).stdout
+        jid, text = self.delegate("add a file FAKE:probe PROBE:notes.txt PROBE:.gitignore PROBE:secret.txt PROBE:big.bin",
+                                  worker="copilot", fallback=False)
+        self.assertIn('PROBE {"notes.txt": true, ".gitignore": true, "secret.txt": false, "big.bin": false}', text)
+        self.assertIn("Untracked files over 5 MB left out of the job's base: big.bin.", text)
+        self.assertIn("base: HEAD + uncommitted changes", text)
+        # only the worker's own change is in the diff, not the files of the base
+        self.assertIn("fake-copilot.txt | 1 +", text)
+        self.assertNotIn("notes.txt |", text)
+        # the user's index, files and stashes are untouched
+        after = subprocess.run(["git", "status", "--porcelain"], cwd=self.repo, capture_output=True, text=True).stdout
+        self.assertEqual(before, after)
+        stash = subprocess.run(["git", "stash", "list"], cwd=self.repo, capture_output=True, text=True).stdout
+        self.assertEqual(stash, "")
+        self.assertIn("Applied (clean)", self.server.ok("apply", {"job_id": jid}))
+
+    def test_clean_repo_starts_from_head(self):
+        jid, text = self.delegate("add a file", worker="copilot", fallback=False)
+        self.assertIn("base: HEAD (", text)
 
     def test_ranges_follow_edits_made_before_apply(self):
         if RUNTIME == "node":

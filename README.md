@@ -23,7 +23,7 @@ Supported workers:
 ### How a job works
 
 1. `delegate` picks a worker: the one requested, else the session default (`/capocantiere:use`), else the first in the configured order that is enabled, installed, authenticated and within its daily budget.
-2. It creates an **isolated git worktree** on a `capocantiere/<id>` branch, starting from the current state of the repo (uncommitted changes included), and runs the worker's CLI inside it, in the background. Several jobs can run in parallel, on the same or different workers (with a queue and per-worker limits).
+2. It creates an **isolated git worktree** on a `capocantiere/<id>` branch, starting from the current state of the repo (uncommitted changes and untracked files included, except those `.gitignore` excludes and those over 5 MB), and runs the worker's CLI inside it, in the background. Several jobs can run in parallel, on the same or different workers (with a queue and per-worker limits).
 3. If the worker hits a **quota / rate limit**, the job's edits are thrown away and it is relaunched on the next available worker (fallback). The job records every attempt.
 4. When the work is done, the server commits to the job's branch and saves the diff.
 5. Claude reviews it with `jobs`, then either applies it to your working tree (`apply`, no commit) or discards it (`discard`).
@@ -299,7 +299,7 @@ Upgrading from the Gemini-only version (`gemini-delegate`): the old state in `~/
 
 - The plugin starts the server through `sh run.sh`, so `sh` must be on the `PATH`. It always is on Linux and macOS; on Windows it has only been designed for, not tested.
 - Build artifacts (`__pycache__`, `*.pyc`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `node_modules`, `.DS_Store`) are never included in a job's diff. Workers are also asked to delete the temporary files they create.
-- **Untracked** files are not copied into the job's worktree: `git add` or commit them first, or mention them in the task.
+- A job's base is a snapshot of your working tree, built in a temporary copy of the git index: untracked files are included unless `.gitignore` excludes them or they are over 5 MB (the job's notes list those). An untracked file that is not ignored (say, a stray `.env`) is therefore visible to the worker. The Node server still uses `git stash create`, which leaves every untracked file out.
 - Budgets count runs, not the model's internal requests or tokens (each run makes several). Keep them conservative; the per-run caps (`max_price`, `max_ai_credits`) limit the cost of a single run.
 - Authentication checks don't call any model: Copilot is "authenticated" when its config records a logged-in user (or a token variable is set), Vibe when its cache records a signed-in account or `MISTRAL_API_KEY` is set. An expired login only shows up on the first run.
 - Without isolation, Copilot's shell commands are not limited to the worktree by path checks (only file tools are). The deny rules and, optionally, `sandbox` cover the dangerous ones. Turn on [isolation](#isolation-and-credentials) to contain them.

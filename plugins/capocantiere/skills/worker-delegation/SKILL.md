@@ -97,7 +97,7 @@ test_command: "npm test -- users"
 
 ## Technical notes
 
-- Every job starts from the current state of the repo, including uncommitted changes (but not untracked files: if they're needed, mention them in the task or commit first).
+- Every job starts from the current state of the working tree: uncommitted changes and untracked files included (also the files created by jobs you just applied), except files ignored by `.gitignore` and untracked files over 5 MB (the job's notes list them).
 - The main repo is never touched until you call `apply`. If the apply fails due to conflicts, the repo has changed too much: relaunch the task on the new state.
 - Inside the worktree, workers auto-approve their tool calls, with dangerous commands (e.g. `git push`) denied. `analyze` runs in the main repo without auto-approval and with edits denied; if it reports that the repo state changed, check `git status`.
 - **`blame`** tells which applied job (worker, model, date, task title) wrote the lines of a file, matching them by content, so it still works after commits and moved code; lines edited after the apply count as not from a worker. Use it when a bug lands in code a worker may have written: reread that job's task (`jobs` with its id, if still listed) to see whether the spec or the worker was at fault. Don't call it routinely.
