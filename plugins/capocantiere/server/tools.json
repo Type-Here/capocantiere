@@ -189,13 +189,20 @@
         },
         "max_diff_chars": {
           "type": "number",
-          "description": "Default 15000"
+          "description": "Budget for the diff, default 15000. A larger diff is not cut: every file is listed with +/- and flags, sensitive files (CI, hooks, build/package manifests, scripts, symlinks, mode changes) are always shown whole, the others whole while they fit; the rest is listed as not shown."
         },
         "all_repos": {
           "type": "boolean"
         },
         "repo_dir": {
           "type": "string"
+        },
+        "files": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Show the diff of only these paths (or folders), whole, ignoring the budget"
         }
       }
     }
@@ -221,6 +228,10 @@
             "major_fixes"
           ],
           "description": "How usable the result was, for the worker's trust score: good (default, as is), minor_fixes (you touch it up a little), major_fixes (useful, but much of it must be redone)."
+        },
+        "unreviewed_ok": {
+          "type": "boolean",
+          "description": "Apply even if the diff of a sensitive file (CI, hooks, build/package manifests, scripts, symlinks, mode changes) was never shown to you by jobs. Default false: apply refuses and names those files."
         }
       },
       "required": [

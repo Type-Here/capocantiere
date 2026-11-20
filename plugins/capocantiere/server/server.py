@@ -28,6 +28,7 @@ from common import (JOBS_DIR, PATCH_DIR, SETTINGS_FILE, USAGE_FILE, CONFIG_FILE,
                     new_id, not_found, now_ms, read_json, run, tail, truncate, write_json)
 import attribution
 import isolation
+import review
 import scores
 import workers as W
 
@@ -832,6 +833,7 @@ def collect_changes(job):
     job["filesChanged"] = len(job["changedFiles"])
     job["patchFile"] = patch_file
     job["patchBytes"] = len(p["stdout"])
+    job["shownFiles"] = []  # a new patch: nothing of it has been shown yet
 
 
 def remove_worktree(job):
@@ -859,7 +861,7 @@ def job_summary(j):
     }
 
 
-def job_detail(j, include_diff=True, max_diff_chars=15000):
+def job_detail(j, include_diff=True, max_diff_chars=15000, files=None):
     ws = j.get("workerStatus") or j.get("agyStatus")
     lines = [
         "JOB %s — %s" % (j["id"], j["title"]),
@@ -895,7 +897,11 @@ def job_detail(j, include_diff=True, max_diff_chars=15000):
     if include_diff and j.get("patchBytes") and j.get("patchFile") and os.path.exists(j["patchFile"]):
         with open(j["patchFile"], encoding="utf-8", errors="replace") as f:
             patch = f.read()
-        lines += ["", "DIFF (full patch: %s):" % j["patchFile"], truncate(patch, max_diff_chars)]
+        text, shown = review.render(patch, max_diff_chars, files)
+        lines += ["", "DIFF (full patch: %s):" % j["patchFile"], text]
+        if set(shown) - set(j.get("shownFiles") or []):
+            j["shownFiles"] = sorted(set(j.get("shownFiles") or []) | set(shown))  # apply checks what was seen
+            save_job(j)
     if j["status"] == "done":
         lines += ["", "Next step: review the diff, then apply or discard (or a new delegate with the fixes)."]
     return "\n".join(lines)
@@ -1216,7 +1222,8 @@ def call_tool(name, a):
             j = _get_job(a)
             if a.get("wait_seconds"):
                 wait_for([j["id"]], min(a["wait_seconds"], 600))
-            return job_detail(j, include_diff=a.get("include_diff") is not False, max_diff_chars=a.get("max_diff_chars") or 15000)
+            return job_detail(j, include_diff=a.get("include_diff") is not False,
+                              max_diff_chars=a.get("max_diff_chars") or 15000, files=a.get("files") or None)
         repo = None
         if not a.get("all_repos"):
             try:
@@ -1249,6 +1256,16 @@ def call_tool(name, a):
             collect_changes(j)
         if not j.get("patchFile") or not os.path.exists(j["patchFile"]) or not j.get("patchBytes"):
             return "No changes to apply."
+        with open(j["patchFile"], encoding="utf-8", errors="replace") as f:
+            hidden_sensitive, hidden = review.unseen(f.read(), j.get("shownFiles"))
+        if hidden_sensitive and not a.get("unreviewed_ok"):
+            return {
+                "isError": True,
+                "text": "Not applied: these files decide what gets run and you were never shown their diff:\n%s\n"
+                        'Look at them with jobs job_id="%s" files=[...] (or have the worker-reviewer agent review the '
+                        "job), then apply again; or pass unreviewed_ok=true if they were reviewed another way." % (
+                            "\n".join("  %s (%s)" % (p, why) for p, why in hidden_sensitive), j["id"]),
+            }
         r = run("git", ["apply", "--whitespace=nowarn", j["patchFile"]], cwd=j["repo"])
         how = "clean"
         if r["code"] != 0:
@@ -1274,6 +1291,9 @@ def call_tool(name, a):
         if not a.get("keep_worktree"):
             remove_worktree(j)
         warn = r["stderr"].strip()
+        unseen = [p for p, _ in hidden_sensitive] + hidden
+        if unseen:
+            note += "Applied without their diff ever being shown to you: %s\n" % ", ".join(unseen)
         return "Applied (%s) to the working tree of %s. Changes are NOT committed.\n%s%s%s\nNow: run tests/typecheck and polish if needed." % (
             how, j["repo"], warn + "\n" if warn else "", note, j.get("diffStat") or "")
 
