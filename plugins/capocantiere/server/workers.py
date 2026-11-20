@@ -20,7 +20,7 @@ from common import (CONFIG_FILE, HERE, SETTINGS_FILE, STATE_DIR, boolean, env, i
 # ---------------------------------------------------------------- config
 
 GLOBAL_DEFAULTS = {
-    "order": ["copilot", "vibe", "agy"],  # preference order when no worker is requested
+    "order": ["copilot", "vibe", "codex", "agy"],  # preference order when no worker is requested
     "fallback": True,  # on quota/rate-limit errors or exhausted budget, move on to the next worker
     "max_parallel": 4,  # jobs running at once, across all workers
     "isolation": "none",  # none | auto | bwrap (Linux) | seatbelt (macOS, experimental); see isolation.py
@@ -49,7 +49,8 @@ COMMON_DEFAULTS = {
     "isolation": "",  # empty = the global setting
     # How the CLI authenticates: "host" = its own login (e.g. `copilot login`, the keyring), "token" = a minimal
     # credential the server injects into this worker only, read from <state>/credentials/<worker> (mode 600) or
-    # from CAPOCANTIERE_<WORKER>_TOKEN. "private-home" is reserved for a later version.
+    # from CAPOCANTIERE_<WORKER>_TOKEN, "private-home" = a config/auth folder of the CLI's own kept for capocantiere
+    # only (<state>/homes/<worker>), with a login made there (workers that support it: codex).
     "credentials": "host",
     "isolation_rw": [],  # extra paths the worker may write when isolated
     "isolation_ro": [],  # extra paths the worker may read when isolated
@@ -62,6 +63,7 @@ COMMON_DEFAULTS = {
 CREDENTIALS = ("host", "token", "private-home")
 SELECTIONS = ("scores", "order")
 CREDENTIALS_DIR = os.path.join(STATE_DIR, "credentials")
+HOMES_DIR = os.path.join(STATE_DIR, "homes")
 
 # Old environment variables of the gemini-delegate server, mapped to agy settings.
 LEGACY_AGY_ENV = {
@@ -211,6 +213,7 @@ class Worker:
     CONFIG_DIRS = []  # (environment variable that overrides it, default): the CLI's own config/auth folders
     PASS_ENV = []  # variables the CLI reads, kept when isolated ("host" credentials only for HOST_ENV)
     HOST_ENV = []  # variables that carry the user's own login (kept with "host" credentials only)
+    PRIVATE_HOME_ENV = ""  # the variable that points the CLI at another config/auth folder ("private-home")
     _version_cache = {}  # bin -> (checked_at, installed, text)
 
     def __init__(self, settings):
@@ -269,12 +272,33 @@ class Worker:
             return None, "cannot read %s: %s" % (path, e)
         return (v, path) if v else (None, "%s is empty" % path)
 
+    def private_home(self):
+        return os.path.join(HOMES_DIR, self.id)
+
+    def login_command(self):
+        """How the user logs the CLI in inside its private home."""
+        return "%s=%s %s login" % (self.PRIVATE_HOME_ENV, self.private_home(), self.bin)
+
+    def private_home_problem(self):
+        """Why the private home cannot be used (not set up, not logged in), or None. Adapters override it."""
+        return None
+
+    def uses_keyring(self):
+        """True if the login lives in the system keyring: an isolated run then reaches it through the D-Bus proxy."""
+        return self.credentials == "host"
+
+    def sandbox_credentials(self):
+        """What isolation.py is told: "host" (keyring, D-Bus proxy) or "file" (no D-Bus at all)."""
+        return "host" if self.uses_keyring() else "file"
+
     def credentials_problem(self):
         c = self.credentials
         if c not in CREDENTIALS:
-            return 'unknown credentials "%s" (use host or token)' % c
+            return 'unknown credentials "%s" (use %s)' % (c, ", ".join(CREDENTIALS))
         if c == "private-home":
-            return 'credentials "private-home" is not available yet (use host or token)'
+            if not self.PRIVATE_HOME_ENV:
+                return 'credentials "private-home" is not supported by %s (use host or token)' % self.id
+            return self.private_home_problem()
         if c == "token":
             if not self.TOKEN_ENV:
                 return 'credentials "token" is not supported by %s' % self.id
@@ -290,9 +314,14 @@ class Worker:
             t, _ = self.token()
             if t:
                 e[self.TOKEN_ENV] = t
+        elif self.credentials == "private-home" and self.PRIVATE_HOME_ENV:
+            e[self.PRIVATE_HOME_ENV] = self.private_home()
         return e
 
     def config_dirs(self):
+        """The CLI's config/auth folders, made writable when isolated. With "private-home", only that folder."""
+        if self.credentials == "private-home" and self.PRIVATE_HOME_ENV:
+            return [self.private_home()]
         return [env.get(var) or os.path.expanduser(default) if var else os.path.expanduser(default)
                 for var, default in self.CONFIG_DIRS]
 
@@ -304,7 +333,7 @@ class Worker:
             keep += self.HOST_ENV
         return {
             "cmd": self.bin, "args": inv["argv"], "cwd": spec["cwd"], "writable": bool(spec.get("auto_approve")),
-            "env": self.run_env(), "pass_env": keep, "credentials": self.credentials,
+            "env": self.run_env(), "pass_env": keep, "credentials": self.sandbox_credentials(),
             "rw": self.config_dirs() + list(inv.get("cleanup") or []) + list(self.s.get("isolation_rw") or []),
             "ro": list(self.s.get("isolation_ro") or []),
             "keyring_names": load_config().get("keyring_dbus_names") or isolation.DEFAULT_KEYRING_NAMES,
@@ -317,8 +346,13 @@ class Worker:
             p = self.credentials_problem()
             if p:
                 return False, p
+            if self.credentials == "private-home":
+                return self.private_home_status()
             return True, "%s token from %s" % (self.TOKEN_ENV, self.token()[1])
         return self.host_auth_status()
+
+    def private_home_status(self):
+        return None, "private home %s: not verifiable without a real call" % self.private_home()
 
     def host_auth_status(self):
         return None, "not verifiable without a real call"
@@ -329,7 +363,7 @@ class Worker:
 
     def blocker(self):
         """A reason why runs would certainly fail (the server then skips this worker), or None."""
-        return self.credentials_problem() or isolation.problem(self.s.get("isolation") or "none", self.credentials)
+        return self.credentials_problem() or isolation.problem(self.s.get("isolation") or "none", self.sandbox_credentials())
 
     def isolation_notes(self):
         """The limits of the current isolation setup, one line for `workers`."""
@@ -342,7 +376,7 @@ class Worker:
             return "none (the worker runs with all your permissions)"
         parts = ["%s%s%s" % ("auto → " if setting == "auto" else "", b,
                              " (EXPERIMENTAL, untested)" if b in isolation.EXPERIMENTAL else "")]
-        if self.credentials == "host":
+        if self.uses_keyring():
             parts.append("can read the secrets of your system keyring" if b == "bwrap"
                          else "can read the Keychain items its own program is allowed to read")
         parts.append("sees its own credential, has free network access")
@@ -1091,5 +1125,225 @@ class VibeWorker(Worker):
                 "cost": x["cost"], "turns": turns, "conversation_id": None, "duration": None, "model": x["model"]}
 
 
+# ---------------------------------------------------------------- codex (OpenAI Codex CLI)
+#
+# Flags checked against `codex exec --help` of codex-cli 0.171.0:
+#   exec -                       non-interactive run, the prompt read from stdin (no argv length limit)
+#   --json                       events as JSONL on stdout: thread.started {thread_id}, item.completed {item: {type:
+#                                agent_message|command_execution|file_change|..., text}}, turn.completed {usage:
+#                                {input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens}},
+#                                turn.failed {error: {message}}, error {message}
+#   -o, --output-last-message <f> the agent's last message
+#   -s, --sandbox read-only|workspace-write|danger-full-access   Codex's own sandbox for the commands it runs
+#   -m, --model; -c key=value (TOML) for any config setting (model_reasoning_effort, ...)
+#   --ephemeral                  no session files written; --ignore-rules skips user/project execpolicy .rules
+# exec never asks for approval: a command its sandbox blocks just fails. workspace-write makes the working directory
+# and /tmp writable, keeps .git read-only and turns the network off (network_access below). A project's own
+# .codex/config.toml is only read for projects the user trusted: worktrees are never trusted (no --trust).
+#
+# Codex's sandbox nests inside ours (bwrap): checked on Arch Linux, kernel 7.2, both work together, so both stay
+# on. Where the kernel forbids nested user namespaces Codex's sandbox cannot start: "sandbox": false then runs it
+# with danger-full-access, which is only allowed when the server's own isolation is on.
+#
+# Why both sandboxes: Codex's limits what its commands WRITE (workspace and /tmp only, so not ~/.codex either) and
+# their network, but lets them read the whole disk; ours hides the home folder, /run and the main repo's objects.
+#
+# Credentials: "host" (the default) uses your own login in ~/.codex (or $CODEX_HOME), mounted read-write so Codex can
+# refresh its token. With cli_auth_credentials_store = "file" the login is auth.json and an isolated run needs no
+# D-Bus; with "keyring"/"auto" it goes through the keyring proxy like the other workers. "private-home" gives Codex
+# a CODEX_HOME of its own (<state>/homes/codex) with a separate login there, file-based. "token" gives it
+# CODEX_API_KEY (an OpenAI API key, honored by `codex exec`).
+
+
+class CodexWorker(Worker):
+    id = "codex"
+    label = "OpenAI Codex CLI"
+    DEFAULTS = {
+        "enabled": False,  # opt-in
+        "bin": "codex",
+        "daily_budget": 30,
+        "max_parallel": 1,  # conservative: one run at a time per ChatGPT login (raise it if you like)
+        "credentials": "host",
+        "sandbox": True,  # Codex's own sandbox (read-only for analyses, workspace-write for jobs)
+        "network_access": False,  # network for the commands Codex runs in a job (workspace-write)
+        "strengths": ["refactor", "tests", "analysis"],
+    }
+    QUOTA_RE = re.compile(r"(\b429\b|rate.?limit|quota|too many requests|usage.?limit|usage_limit_reached|"
+                          r"insufficient_quota|hit your usage limit)", re.I)
+    INSTALL_HINT = "Install OpenAI Codex CLI (https://developers.openai.com/codex/cli) and log in (see the workers tool)."
+    TOKEN_ENV = "CODEX_API_KEY"
+    TOKEN_HINT = "Use an OpenAI API key (https://platform.openai.com/api-keys)."
+    CONFIG_DIRS = [("CODEX_HOME", "~/.codex")]
+    PASS_ENV = []
+    HOST_ENV = ["CODEX_HOME", "CODEX_API_KEY", "OPENAI_API_KEY"]
+    PRIVATE_HOME_ENV = "CODEX_HOME"
+    EFFORTS = {"max": "xhigh"}  # capocantiere's levels that Codex names differently
+
+    def home(self):
+        if self.credentials == "private-home":
+            return self.private_home()
+        return env.get("CODEX_HOME") or os.path.join(os.path.expanduser("~"), ".codex")
+
+    def _config_text(self):
+        try:
+            with open(os.path.join(self.home(), "config.toml"), encoding="utf-8") as f:
+                return f.read()
+        except OSError:
+            return ""
+
+    def login_command(self):
+        # the -c makes sure the login goes to auth.json even before config.toml exists
+        return "CODEX_HOME=%s %s -c 'cli_auth_credentials_store=\"file\"' login" % (self.private_home(), self.bin)
+
+    def file_store(self):
+        return bool(re.search(r'^\s*cli_auth_credentials_store\s*=\s*"file"', self._config_text(), re.M))
+
+    def uses_keyring(self):
+        return self.credentials == "host" and not self.file_store()
+
+    def ensure_private_home(self):
+        """Create the private home with the one setting it needs. Never touches an existing config."""
+        home = self.private_home()
+        os.makedirs(home, mode=0o700, exist_ok=True)
+        cfg = os.path.join(home, "config.toml")
+        if not os.path.exists(cfg):
+            fd = os.open(cfg, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write('# Codex config for capocantiere runs only (CODEX_HOME). Log in with:\n#   %s\n'
+                        'cli_auth_credentials_store = "file"\n' % self.login_command())
+
+    def private_home_problem(self):
+        home = self.private_home()
+        if not os.path.isdir(home) and not self.enabled:
+            return "private home %s not set up: run `mkdir -p -m 700 %s && %s`" % (home, home, self.login_command())
+        try:
+            self.ensure_private_home()  # only once the worker is enabled: nothing is created for unused workers
+        except OSError as e:
+            return "cannot create the private home %s: %s" % (home, e)
+        if not self.file_store():
+            return ('%s/config.toml must set cli_auth_credentials_store = "file" (an isolated run cannot reach the '
+                    'keyring): add it, then log in again with `%s`' % (home, self.login_command()))
+        auth = os.path.join(home, "auth.json")
+        try:
+            st = os.stat(auth)
+        except OSError:
+            return ("not logged in: run `%s` (a ChatGPT account, any plan; add --device-auth without a browser, or "
+                    "use --with-api-key)" % self.login_command())
+        if os.name == "posix" and st.st_mode & 0o077:
+            return "%s is readable by other users: run chmod 600 on it" % auth
+        return None
+
+    def private_home_status(self):
+        try:
+            with open(os.path.join(self.private_home(), "auth.json"), encoding="utf-8") as f:
+                mode = json.load(f).get("auth_mode")  # never read the tokens
+        except (OSError, ValueError, AttributeError):
+            mode = None
+        what = {"chatgpt": "ChatGPT login", "apikey": "API key", "api_key": "API key"}.get(str(mode).lower(), "login")
+        return True, "%s in private home %s" % (what, self.private_home())
+
+    def host_auth_status(self):
+        for var in ("CODEX_API_KEY", "OPENAI_API_KEY"):
+            if env.get(var) or self.env().get(var):
+                return True, "%s set" % var
+        if os.path.exists(os.path.join(self.home(), "auth.json")):
+            return True, "logged in, per %s/auth.json" % self.home()
+        if self.file_store():
+            return False, "not logged in: run `codex login` (no %s/auth.json)" % self.home()
+        return None, "no %s/auth.json: the login may be in the keyring, or missing (`codex login status`)" % self.home()
+
+    def blocker(self):
+        base = super().blocker()
+        if base:
+            return base
+        if not self.s.get("sandbox") and (self.s.get("isolation") or "none") == "none":
+            return '"sandbox": false needs the server\'s isolation (set "isolation"): Codex would run unsandboxed'
+        return None
+
+    def warnings(self):
+        out = []
+        if self.uses_keyring() and (self.s.get("isolation") or "none") != "none":
+            out.append('the codex login is in the keyring: isolated runs reach it through the D-Bus proxy, and can read '
+                       'the rest of the keyring. Add cli_auth_credentials_store = "file" to %s/config.toml and run '
+                       '`codex login` again to keep D-Bus out of the sandbox.' % self.home())
+        return out
+
+    def config_model(self):
+        m = re.search(r'^\s*model\s*=\s*"([^"]+)"', self._config_text(), re.M)
+        return m.group(1) if m else None
+
+    def invocation(self, spec):
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix="capocantiere-codex-")
+        last = os.path.join(tmp, "last-message.md")
+        job = bool(spec.get("auto_approve"))
+        sandbox = ("workspace-write" if job else "read-only") if self.s.get("sandbox") else "danger-full-access"
+        a = ["exec", "--json", "-o", last, "--sandbox", sandbox, "--cd", spec["cwd"], "--ephemeral",
+             "--color", "never", "--skip-git-repo-check"]
+        if self.credentials == "private-home":
+            a += ["-c", 'cli_auth_credentials_store="file"']
+        if job and self.s.get("sandbox"):
+            a += ["-c", "sandbox_workspace_write.network_access=%s" % ("true" if self.s.get("network_access") else "false")]
+        if spec.get("model"):
+            a += ["--model", spec["model"]]
+        if spec.get("effort"):
+            a += ["-c", 'model_reasoning_effort="%s"' % self.EFFORTS.get(spec["effort"], spec["effort"])]
+        a += list(self.s.get("extra_args") or []) + ["-"]
+        return {"argv": a, "env": self.run_env(), "input": spec["prompt"], "cleanup": [tmp], "last_file": last}
+
+    @staticmethod
+    def _events(stdout):
+        out = []
+        for line in (stdout or "").split("\n"):
+            line = line.strip()
+            if line.startswith("{"):
+                try:
+                    v = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(v, dict):
+                    out.append(v)
+        return out
+
+    def parse(self, r, spec):
+        events = self._events(r["stdout"])
+        response, errors, thread, turns = "", [], None, 0
+        inp = cached = outp = 0
+        for e in events:
+            t = e.get("type")
+            if t == "thread.started":
+                thread = e.get("thread_id")
+            elif t == "item.completed" and isinstance(e.get("item"), dict):
+                it = e["item"]
+                if it.get("type") == "agent_message" and it.get("text"):
+                    response = it["text"]
+                    turns += 1
+            elif t == "turn.completed" and isinstance(e.get("usage"), dict):
+                u = e["usage"]
+                inp += u.get("input_tokens") or 0
+                cached += u.get("cached_input_tokens") or 0
+                outp += u.get("output_tokens") or 0
+            elif t == "turn.failed":
+                err = e.get("error")
+                errors.append(str(err.get("message") if isinstance(err, dict) else err or "turn failed"))
+            elif t == "error" and e.get("message"):
+                errors.append(str(e["message"]))
+        try:
+            with open(spec.get("last_file") or "", encoding="utf-8") as f:
+                response = f.read().strip() or response
+        except OSError:
+            pass
+        ok = r["code"] == 0 and not r["timed_out"] and not any(e.get("type") == "turn.failed" for e in events)
+        usage = {"input_tokens": inp, "cached_input_tokens": cached, "output_tokens": outp,
+                 "total_tokens": inp + outp} if (inp or outp) else None
+        error = ""
+        if not ok:
+            error = "\n".join(dict.fromkeys(errors)) or r["stderr"].strip()[-1500:] or (
+                "no events from codex" if not events else "")
+        return {"ok": ok, "status": "SUCCESS" if ok else "ERROR (exit %s)" % r["code"], "response": response,
+                "error": error, "usage": usage, "cost": None, "turns": turns, "conversation_id": thread,
+                "duration": None, "model": spec.get("model") or self.config_model()}
+
+
 # Registry. The preference order comes from the config ("order").
-ADAPTERS = {"copilot": CopilotWorker, "vibe": VibeWorker, "agy": AgyWorker}
+ADAPTERS = {"copilot": CopilotWorker, "vibe": VibeWorker, "codex": CodexWorker, "agy": AgyWorker}

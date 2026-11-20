@@ -38,7 +38,7 @@ def scenario(prompt, worker):
 
 
 WATCHED_ENV = ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "MISTRAL_API_KEY", "GEMINI_API_KEY", "DBUS_SESSION_BUS_ADDRESS",
-               "TMPDIR", "XDG_CURRENT_DESKTOP", "GIT_OBJECT_DIRECTORY")
+               "TMPDIR", "XDG_CURRENT_DESKTOP", "GIT_OBJECT_DIRECTORY", "CODEX_HOME", "CODEX_API_KEY")
 
 
 def log(worker, argv, cwd, sc, extra=None):
@@ -131,6 +131,7 @@ QUOTA_MESSAGES = {
     "copilot": "Error: You have used all premium requests in your plan (Plan: 100% used, resets 2026-12-01). "
                "Upgrade at https://github.com/settings/copilot\n",
     "vibe": "Error: API error 429 Too Many Requests: rate limit exceeded for the Experiment plan\n",
+    "codex": "You've hit your usage limit. Upgrade to Plus to continue using Codex, or try again later.\n",
 }
 
 

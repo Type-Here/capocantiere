@@ -5,7 +5,7 @@ description: How to delegate work to external coding-agent CLIs ("workers" such 
 
 # Delegating to workers
 
-Workers are external coding agents (GitHub Copilot CLI, Mistral Vibe, optionally Antigravity CLI) that run on the user's own subscriptions or API keys. They are **one option**, next to doing the work yourself or handing it to a Claude subagent: pick whichever fits each piece of work best.
+Workers are external coding agents (GitHub Copilot CLI, Mistral Vibe, optionally OpenAI Codex CLI and Antigravity CLI) that run on the user's own subscriptions or API keys. They are **one option**, next to doing the work yourself or handing it to a Claude subagent: pick whichever fits each piece of work best.
 
 **Who decides.** The user's instructions come first, whether they are in the conversation or in CLAUDE.md: if they say to use workers more, less, only for some kinds of work, only a specific worker, or not at all, follow them. Without instructions, use your own judgment:
 
