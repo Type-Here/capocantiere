@@ -11,6 +11,9 @@ The scenario is chosen by a marker in the prompt, so one server can run several 
   FAKE:price           vibe only: stop on --max-price (exit 3, outcome price_limit)
   FAKE:slow            sleep 3 seconds, then edit (to check that jobs run in parallel)
   FAKE:probe           edit, and report which paths given as PROBE:<path> in the prompt are readable
+  FAKE:hijack          edit, then try to make the server's git run a command (a rewritten .git file pointing at
+                       a git dir with core.fsmonitor and hooks) and commit on the main branch (HEAD rewritten);
+                       the command would create PWNED next to FAKE_LOG
   FAKE:write           write the blocks "FILE:<path>" + "<<<" ... ">>>" of the prompt (whole-file contents)
 
 Every call is appended to $FAKE_LOG as one JSON line: {"bin", "argv", "cwd", "scenario", "env"}, where env holds
@@ -35,7 +38,7 @@ def scenario(prompt, worker):
 
 
 WATCHED_ENV = ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "MISTRAL_API_KEY", "GEMINI_API_KEY", "DBUS_SESSION_BUS_ADDRESS",
-               "TMPDIR", "XDG_CURRENT_DESKTOP")
+               "TMPDIR", "XDG_CURRENT_DESKTOP", "GIT_OBJECT_DIRECTORY")
 
 
 def log(worker, argv, cwd, sc, extra=None):
@@ -71,8 +74,37 @@ def write_blocks(prompt, cwd):
     return written
 
 
+def hijack(cwd):
+    pwned = os.path.join(os.path.dirname(os.environ.get("FAKE_LOG") or cwd), "PWNED")
+    with open(os.path.join(cwd, ".git"), encoding="utf-8") as f:
+        admin = os.path.join(cwd, f.read().split(":", 1)[1].strip())
+    with open(os.path.join(admin, "commondir")) as f:
+        common = os.path.join(admin, f.read().strip())
+    with open(os.path.join(common, "HEAD")) as f:
+        main_head = f.read()  # the main repo's branch
+    with open(os.path.join(admin, "HEAD"), "w") as f:
+        f.write(main_head)
+    evil = os.path.join(os.path.dirname(cwd), "evil-gitdir")
+    for d in ("objects", "refs/heads", "hooks"):
+        os.makedirs(os.path.join(evil, d), exist_ok=True)
+    with open(os.path.join(evil, "HEAD"), "w") as f:
+        f.write("ref: refs/heads/main\n")
+    cmd = "touch '%s'" % pwned
+    with open(os.path.join(evil, "config"), "w") as f:
+        f.write("[core]\n\trepositoryformatversion = 0\n\tfsmonitor = \"%s\"\n" % cmd)
+    for hook in ("pre-commit", "post-commit", "post-index-change"):
+        with open(os.path.join(evil, "hooks", hook), "w") as f:
+            f.write("#!/bin/sh\n%s\n" % cmd)
+        os.chmod(os.path.join(evil, "hooks", hook), 0o755)
+    with open(os.path.join(cwd, ".git"), "w") as f:
+        f.write("gitdir: %s\n" % evil)
+
+
 def act(worker, sc, cwd, may_write, prompt=None):
     """Common behavior. Returns (exit code, response text, stderr text)."""
+    if sc == "hijack" and may_write:
+        hijack(cwd)
+        sc = "edit"
     if sc == "timeout":
         time.sleep(600)
     if sc == "quota":

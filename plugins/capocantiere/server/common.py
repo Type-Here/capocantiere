@@ -83,10 +83,23 @@ def migrate_legacy_state():
         write_json(p, j)
 
 
+def private_dir(d):
+    """A folder only the user can read: jobs hold tasks, responses and patches; worktrees hold the code."""
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    try:
+        if os.name == "posix" and os.stat(d).st_mode & 0o077:
+            os.chmod(d, 0o700)
+    except OSError:
+        pass
+
+
 def ensure_dirs():
     migrate_legacy_state()
+    private_dir(STATE_DIR)
+    if not (env.get("CAPOCANTIERE_WORKTREE_DIR") or env.get("GEMINI_DELEGATE_WORKTREE_DIR")):
+        private_dir(os.path.dirname(WORKTREE_DIR))  # ~/.cache/capocantiere, ours (a folder you chose stays as it is)
     for d in (JOBS_DIR, PATCH_DIR, WORKTREE_DIR):
-        os.makedirs(d, exist_ok=True)
+        private_dir(d)
 
 
 # ---------------------------------------------------------------- time / text

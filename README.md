@@ -28,6 +28,8 @@ Supported workers:
 4. When the work is done, the server commits to the job's branch and saves the diff.
 5. Claude reviews it with `jobs`, then either applies it to your working tree (`apply`, no commit) or discards it (`discard`).
 
+**Large diffs.** `jobs` shows a job's diff within a budget (`max_diff_chars`, 15000 by default) without cutting it blindly: every file is listed with its `+/-` lines and flags (new, deleted, binary, symlink, mode change). **Sensitive files** — the ones where a few lines change what gets run: CI (`.github/`, `.gitlab-ci.yml`, ...), git and agent config (`.gitattributes`, `.gitmodules`, `.mcp.json`, `.claude/`, `AGENTS.md`, ...), build and package manifests (`Makefile`, `package.json`, `pyproject.toml`, `Dockerfile`, ...), scripts, symlinks and executable bits — are always shown whole. The other files are shown whole while they fit, and the rest is listed as not shown (`jobs` with `files=[...]` shows just those). The server remembers what Claude was shown: **`apply` refuses a job with a sensitive file whose diff Claude never saw** (unless `unreviewed_ok: true`), and names any ordinary file it applied unseen. A worker can't slip a change to a build script past the review by placing it after 15000 characters of tests.
+
 **Workers never touch your repo directly.** Inside the worktree they auto-approve their own tool calls (the only way to work headless), with safety limits per worker (see below). They still run with your user's permissions unless you turn on [isolation](#isolation-and-credentials). `analyze` runs in the real repo **without** auto-approval, with edits disabled, and checks that the repo state doesn't change.
 
 Each worker has a daily budget (runs per 24h, counted per worker). A worker over budget is skipped; if every worker is out of quota or budget, Claude does the work itself.
@@ -81,7 +83,7 @@ How it is run: `vibe --prompt-file <tmp> --output json --output-dir <tmp> --work
 - `--time-limit` is passed too (the job's timeout), so vibe stops itself cleanly and still writes its report.
 - When the plan's credit is used up (HTTP 402, `usage_limit`) or vibe is rate-limited (HTTP 429), the job counts as a quota error and moves to the next worker. The reason is read from `export.json`, where vibe writes it even when stderr is empty.
 - The answer is the last assistant message of the JSON output; outcome, usage and cost come from `export.json`.
-- `--trust` is passed by default: it trusts the worktree for that run only, so vibe reads the repo's `AGENTS.md` and project config (an untrusted folder would still work, without them). Set `"trust": false` for repos whose Vibe config you don't want applied.
+- `--trust` is **not** passed by default: with it vibe would read the repo's `AGENTS.md` and project config, which come from the repo (or from an earlier worker in the same worktree) rather than from you. Set `"trust": true` for repos you trust, so that vibe follows their `AGENTS.md`.
 
 ### agy (Antigravity CLI)
 
@@ -200,8 +202,8 @@ By default (`"isolation": "none"`) a worker runs with all your permissions: its 
 
 What an isolated run sees:
 
-- the system, read-only; your home folder, other users' homes, `/mnt`, `/media` and the rest of `/tmp` are hidden;
-- the job's worktree, read-write (for an analysis, the repo read-only). Of the main repo's `.git`, only what git needs: everything read-only, except this worktree's own admin folder and the object store. Branches and other refs can't be moved;
+- the system, read-only; your home folder, other users' homes, `/mnt`, `/media`, `/run` and the rest of `/tmp` are hidden. Hiding `/run` keeps the worker away from the sockets of local services (Docker, the system D-Bus, systemd); only the folder of `/etc/resolv.conf` stays, when systemd-resolved keeps it there;
+- the job's worktree, read-write (for an analysis, the repo read-only), except its `.git` file. Of the main repo's `.git`, only what git needs: everything read-only, except this worktree's own admin folder. Branches, refs and the repo's objects can't be changed: the worker's git writes new objects to a throwaway store of its own, deleted after the run;
 - the worker CLI's own folders (`~/.copilot` and `~/.cache/copilot`, `~/.vibe`, `~/.gemini`) read-write, its install folder read-only, plus `isolation_rw` / `isolation_ro`;
 - the network, which the model APIs need;
 - an environment rebuilt from scratch: locale, proxy and certificate variables, the CLI's own variables, `isolation_env`. Other workers' keys, your tokens and everything else are left out.
@@ -227,7 +229,7 @@ On macOS, the Keychain checks access item by item, so a CLI reads its own login.
 ### Limits (also shown by `workers`)
 
 - **Linux with `host` credentials: the worker can read every secret in your keyring** (the Secret Service has no per-application control). Use `token` credentials to avoid this.
-- **The network is open:** a worker can send data out.
+- **The network is open:** a worker can send data out. Sharing the network also shares the loopback, so **services listening on `127.0.0.1`** (databases, dev servers) and abstract Unix sockets (X11, a session D-Bus at an abstract address) are reachable from the sandbox.
 - **A worker always sees its own credential.** That is why the `token` credentials are as narrow as possible.
 - **macOS is experimental.** `sandbox-exec` is deprecated by Apple, but it is the same mechanism other agent sandboxes use. If Apple removes it, the backend stops working (and the worker is skipped). Windows has no isolation.
 
@@ -322,6 +324,8 @@ Isolation is tested in two ways. Fake `bwrap`, `xdg-dbus-proxy` and `sandbox-exe
 
 - State, jobs, patches, usage log (per worker), `agy` model list, mode settings: `~/.local/state/capocantiere/`
 - Temporary worktrees: `~/.cache/capocantiere/worktrees/` (removed after apply/discard)
+- Both folders are made private (`700`): jobs hold your tasks, the workers' answers and the patches, and worktrees hold your code.
+- The server's own git commands on a job's worktree (collecting the changes, resetting it for a fallback) don't trust anything the worker could have written there: the worktree's `.git` file, its HEAD, index and worktree config are put back to the server's, and hooks and `core.fsmonitor` are off. A worker can't make the server run a command or commit to another branch.
 - Config: `~/.config/capocantiere/workers.json`
 - Trust score events: `scores.jsonl` in the state folder
 - Attribution records: `.git/capocantiere/attribution.jsonl` inside each repo (see [Attribution](#attribution-blame))

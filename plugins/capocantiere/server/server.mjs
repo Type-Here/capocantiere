@@ -89,9 +89,20 @@ function migrateLegacyState() {
   }
 }
 
+// A folder only the user can read: jobs hold tasks, responses and patches; worktrees hold the code.
+function privateDir(d) {
+  fs.mkdirSync(d, { recursive: true, mode: 0o700 });
+  try {
+    if (process.platform !== "win32" && fs.statSync(d).mode & 0o077) fs.chmodSync(d, 0o700);
+  } catch {}
+}
+
 function ensureDirs() {
   migrateLegacyState();
-  for (const d of [JOBS_DIR, PATCH_DIR, WORKTREE_DIR]) fs.mkdirSync(d, { recursive: true });
+  privateDir(STATE_DIR);
+  // ~/.cache/capocantiere is ours; a worktree folder you chose stays as it is
+  if (!(env.CAPOCANTIERE_WORKTREE_DIR || env.GEMINI_DELEGATE_WORKTREE_DIR)) privateDir(path.dirname(WORKTREE_DIR));
+  for (const d of [JOBS_DIR, PATCH_DIR, WORKTREE_DIR]) privateDir(d);
 }
 
 const isoNow = () => new Date().toISOString();
@@ -115,6 +126,14 @@ function killTree(child, sig) {
   }
 }
 
+// The environment of a child process. Workers' tokens (CAPOCANTIERE_<WORKER>_TOKEN) never pass through.
+const TOKEN_VAR_RE = /^CAPOCANTIERE_.*_TOKEN$/;
+function childEnv(extraEnv) {
+  const e = {};
+  for (const [k, v] of Object.entries(process.env)) if (!TOKEN_VAR_RE.test(k)) e[k] = v;
+  return { ...e, ...(extraEnv || {}) };
+}
+
 // Run a command; never throws. Resolves to { code, stdout, stderr, error, timedOut }.
 function run(cmd, args, { cwd, input, timeoutMs, onSpawn, binary = false, extraEnv } = {}) {
   return new Promise((resolve) => {
@@ -124,7 +143,7 @@ function run(cmd, args, { cwd, input, timeoutMs, onSpawn, binary = false, extraE
     try {
       child = spawn(cmd, args, {
         cwd,
-        env: extraEnv && Object.keys(extraEnv).length ? { ...process.env, ...extraEnv } : process.env,
+        env: childEnv(extraEnv),
         stdio: ["pipe", "pipe", "pipe"],
         detached: process.platform !== "win32",
       });
@@ -895,7 +914,9 @@ class VibeWorker extends Worker {
     max_turns: 40,
     max_price: 0.5, // USD cap per run (--max-price); 0 = no cap
     max_tokens: 0, // prompt + completion tokens cap per run (--max-tokens); 0 = no cap
-    trust: true, // --trust: trust the worktree for this run only (loads the repo's AGENTS.md and Vibe config)
+    // --trust: trust the worktree for this run only. Off: it would load the repo's AGENTS.md and Vibe config,
+    // which come from the repo (or from an earlier worker in the same worktree), not from you.
+    trust: false,
     analyze_tools: ["read_file", "grep"], // the only tools enabled for analyses
     disabled_tools: [], // tools disabled in implementation runs (--disabled-tools)
     strengths: ["analysis", "docs", "boilerplate", "tests"],
@@ -1534,6 +1555,7 @@ async function collectChanges(job) {
   job.filesChanged = job.changedFiles.length;
   job.patchFile = patchFile;
   job.patchBytes = p.stdout.length;
+  job.shownFiles = []; // a new patch: nothing of it has been shown yet
 }
 
 async function removeWorktree(job) {
@@ -1542,6 +1564,141 @@ async function removeWorktree(job) {
     await run("git", ["worktree", "prune"], { cwd: job.repo });
     await run("git", ["branch", "-D", job.branch], { cwd: job.repo });
   });
+}
+
+// ---------------------------------------------------------------- diff review (same logic as review.py)
+//
+// A patch larger than the budget (max_diff_chars) is not cut at a character count: every file is listed with its
+// flags; files where a few lines change what runs (CI, hooks, build and package manifests, scripts, symlinks, mode
+// changes) are always shown whole; the others whole, while they fit; the rest is listed as not shown. The job
+// remembers which files the manager was shown: apply refuses a patch with a sensitive file it never saw, unless
+// told to go ahead (unreviewed_ok), and names the ordinary files it applied unseen.
+
+const SENSITIVE_PREFIXES = [".github/", ".gitlab/", ".circleci/", ".buildkite/", ".githooks/", ".husky/", ".devcontainer/",
+  ".vscode/", ".idea/", ".claude/", ".cursor/", ".vibe/", ".copilot/", ".gemini/"];
+const SENSITIVE_NAMES = new Set([
+  ".gitlab-ci.yml", ".travis.yml", "azure-pipelines.yml", "Jenkinsfile", "bitbucket-pipelines.yml",
+  ".gitattributes", ".gitmodules", ".gitignore", ".pre-commit-config.yaml", ".mcp.json", "AGENTS.md", "CLAUDE.md",
+  "Makefile", "GNUmakefile", "makefile", "CMakeLists.txt", "justfile", "Justfile", "Taskfile.yml", "Rakefile",
+  "Dockerfile", "Containerfile", "docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml",
+  "package.json", ".npmrc", ".yarnrc", ".yarnrc.yml", "pyproject.toml", "setup.py", "setup.cfg", "tox.ini",
+  "noxfile.py", "conftest.py", "pytest.ini", "Pipfile", "Cargo.toml", "build.rs", "go.mod", "build.gradle",
+  "build.gradle.kts", "settings.gradle", "pom.xml", "Gemfile", ".envrc", "flake.nix", "shell.nix", "default.nix",
+]);
+const SENSITIVE_EXT = [".sh", ".bash", ".zsh", ".fish", ".ps1", ".bat", ".cmd"];
+
+// git quotes paths with unusual characters: "a/caf\303\251"
+function unquotePath(p) {
+  if (p.length < 2 || p[0] !== '"' || p[p.length - 1] !== '"') return p;
+  const bytes = [];
+  const s = p.slice(1, -1);
+  const esc = { n: 10, t: 9, r: 13, '"': 34, "\\": 92, a: 7, b: 8, f: 12, v: 11 };
+  for (let i = 0; i < s.length; i++) {
+    if (s[i] === "\\" && /[0-7]{3}/.test(s.slice(i + 1, i + 4))) { bytes.push(parseInt(s.slice(i + 1, i + 4), 8)); i += 3; }
+    else if (s[i] === "\\" && esc[s[i + 1]] !== undefined) { bytes.push(esc[s[i + 1]]); i += 1; }
+    else bytes.push(...Buffer.from(s[i], "utf8"));
+  }
+  return Buffer.from(bytes).toString("utf8");
+}
+const stripPrefix = (p) => { p = unquotePath(p.trim()); return p.startsWith("a/") || p.startsWith("b/") ? p.slice(2) : p; };
+
+function sensitiveWhy(p, flags = []) {
+  if (flags.includes("symlink")) return "symlink";
+  if (flags.some((f) => f.startsWith("mode ")) || flags.includes("executable")) return "executable bit";
+  p = p.replace(/\\/g, "/");
+  const base = p.split("/").pop();
+  for (const pre of SENSITIVE_PREFIXES) if (p.startsWith(pre) || p.includes("/" + pre)) return pre.replace(/\/$/, "");
+  if (SENSITIVE_NAMES.has(base) || /^requirements.*\.txt$/.test(base)) return base;
+  if (SENSITIVE_EXT.some((e) => base.endsWith(e))) return "script";
+  return null;
+}
+
+function parsePatch(patch) {
+  const starts = [];
+  const re = /^diff --git /gm;
+  let m;
+  while ((m = re.exec(patch))) starts.push(m.index);
+  return starts.map((s, i) => {
+    const text = patch.slice(s, i + 1 < starts.length ? starts[i + 1] : patch.length);
+    const lines = text.split("\n");
+    let p = null, oldPath = null, added = 0, removed = 0, inHunk = false;
+    const flags = [];
+    for (const ln of lines.slice(1)) {
+      if (ln.startsWith("@@")) { inHunk = true; continue; }
+      if (inHunk) { if (ln.startsWith("+")) added++; else if (ln.startsWith("-")) removed++; continue; }
+      if (ln.startsWith("+++ ") && ln.slice(4) !== "/dev/null") p = stripPrefix(ln.slice(4));
+      else if (ln.startsWith("--- ") && ln.slice(4) !== "/dev/null") oldPath = stripPrefix(ln.slice(4));
+      else if (ln.startsWith("rename to ")) p = unquotePath(ln.slice(10));
+      else if (ln.startsWith("rename from ")) { oldPath = unquotePath(ln.slice(12)); flags.push("renamed"); }
+      else if (ln.startsWith("new file mode ")) {
+        flags.push("new");
+        if (ln.endsWith("755")) flags.push("executable");
+        if (ln.endsWith("120000")) flags.push("symlink");
+      } else if (ln.startsWith("deleted file mode ")) flags.push("deleted");
+      else if (ln.startsWith("new mode ")) { flags.push(`mode ${ln.slice(9)}`); if (ln.endsWith("120000")) flags.push("symlink"); }
+      else if (ln.startsWith("index ") && ln.endsWith(" 120000")) flags.push("symlink");
+      else if (ln.startsWith("GIT binary patch") || (ln.startsWith("Binary files ") && ln.endsWith(" differ"))) flags.push("binary");
+    }
+    if (!p) p = oldPath;
+    if (!p) {
+      const mm = /^diff --git ("?a\/.*?"?) ("?b\/.*"?)$/.exec(lines[0]);
+      p = mm ? stripPrefix(mm[2]) : lines[0].slice(11);
+    }
+    return { path: p, text, added, removed, flags, sensitive: sensitiveWhy(p, flags) };
+  });
+}
+
+// A binary file's section without its base85 payload: nothing a reviewer can read.
+function binaryText(f) {
+  const head = [];
+  for (const ln of f.text.split("\n")) { if (ln.startsWith("GIT binary patch")) break; head.push(ln); }
+  return head.join("\n").replace(/\n+$/, "") + "\n(binary content not shown)\n";
+}
+
+function fileRow(f) {
+  const tags = [...f.flags];
+  if (f.sensitive) tags.push("SENSITIVE: " + f.sensitive);
+  return `  ${f.path}  +${f.added} -${f.removed}${tags.length ? `  [${tags.join(", ")}]` : ""}`;
+}
+
+// [text, paths shown whole]. only: paths (or folders) to show, whole, ignoring the budget.
+function renderDiff(patch, budget, only = null) {
+  const files = parsePatch(patch);
+  const bodyOf = (f) => (f.flags.includes("binary") ? binaryText(f) : f.text);
+  if (only?.length) {
+    const want = only.map((o) => o.replace(/\/+$/, ""));
+    const pick = files.filter((f) => want.some((w) => f.path === w || f.path.startsWith(w + "/")));
+    if (!pick.length)
+      return [`No file of this job's diff matches ${only.join(", ")}. Files: ${files.map((f) => f.path).join(", ")}`, []];
+    return [pick.map(bodyOf).join("\n"), pick.map((f) => f.path)];
+  }
+  if (patch.length <= budget && !files.some((f) => f.flags.includes("binary"))) return [patch, files.map((f) => f.path)];
+  const shown = [], parts = [];
+  let used = 0;
+  const order = files.map((f, i) => i).sort((a, b) => (!files[a].sensitive - !files[b].sensitive) || a - b);
+  for (const i of order) {
+    const f = files[i];
+    const body = bodyOf(f);
+    if (f.sensitive || f.flags.includes("binary") || used + body.length <= budget) {
+      parts.push(body);
+      used += body.length;
+      shown.push(f.path);
+    }
+  }
+  const hidden = files.filter((f) => !shown.includes(f.path));
+  const head = [`FILES (${files.length}; sensitive ones are always shown whole):`, ...files.map(fileRow)];
+  const tail = hidden.length
+    ? ["", `NOT SHOWN (${hidden.length}, over the ${budget}-character budget): ${hidden.map((f) => `${f.path} (+${f.added} -${f.removed})`).join(", ")}`,
+       'See them with jobs job_id=... files=["path", ...], or a larger max_diff_chars.']
+    : [];
+  return [[...head, "", parts.join("").replace(/\n+$/, ""), ...tail].join("\n"), shown];
+}
+
+// [sensitive files never shown as [path, why], ordinary files never shown]
+function unseenFiles(patch, seen) {
+  const s = new Set(seen || []);
+  const files = parsePatch(patch).filter((f) => !s.has(f.path));
+  return [files.filter((f) => f.sensitive).map((f) => [f.path, f.sensitive]), files.filter((f) => !f.sensitive).map((f) => f.path)];
 }
 
 function jobSummary(j) {
@@ -1556,7 +1713,7 @@ function jobSummary(j) {
   };
 }
 
-function jobDetail(j, { includeDiff = true, maxDiffChars = 15000 } = {}) {
+function jobDetail(j, { includeDiff = true, maxDiffChars = 15000, files = null } = {}) {
   const ws = j.workerStatus || j.agyStatus;
   const lines = [
     `JOB ${j.id} — ${j.title}`,
@@ -1577,7 +1734,13 @@ function jobDetail(j, { includeDiff = true, maxDiffChars = 15000 } = {}) {
   if (j.diffStat) lines.push("", "DIFF STAT:", j.diffStat);
   if (includeDiff && j.patchBytes && j.patchFile && fs.existsSync(j.patchFile)) {
     const patch = fs.readFileSync(j.patchFile, "utf8");
-    lines.push("", `DIFF (full patch: ${j.patchFile}):`, truncate(patch, maxDiffChars));
+    const [text, shown] = renderDiff(patch, maxDiffChars, files);
+    lines.push("", `DIFF (full patch: ${j.patchFile}):`, text);
+    const before = new Set(j.shownFiles || []);
+    if (shown.some((p) => !before.has(p))) {
+      j.shownFiles = [...new Set([...before, ...shown])].sort(); // apply checks what was seen
+      saveJob(j);
+    }
   }
   if (j.status === "done") lines.push("", "Next step: review the diff, then apply or discard (or a new delegate with the fixes).");
   return lines.join("\n");
@@ -1755,7 +1918,7 @@ async function callTool(name, a = {}) {
       if (a.job_id) {
         const j = getJob(a);
         if (a.wait_seconds) await waitFor([j.id], Math.min(a.wait_seconds, 600));
-        return jobDetail(j, { includeDiff: a.include_diff !== false, maxDiffChars: a.max_diff_chars || 15000 });
+        return jobDetail(j, { includeDiff: a.include_diff !== false, maxDiffChars: a.max_diff_chars || 15000, files: a.files || null });
       }
       let repo = null;
       if (!a.all_repos) repo = await repoRoot(a.repo_dir).catch(() => null);
@@ -1777,6 +1940,16 @@ async function callTool(name, a = {}) {
       if (j.status === "applied") return "Already applied.";
       if (j.status === "interrupted" && fs.existsSync(j.worktree)) await collectChanges(j);
       if (!j.patchFile || !fs.existsSync(j.patchFile) || !j.patchBytes) return "No changes to apply.";
+      const [hiddenSensitive, hidden] = unseenFiles(fs.readFileSync(j.patchFile, "utf8"), j.shownFiles);
+      if (hiddenSensitive.length && !a.unreviewed_ok) {
+        return {
+          isError: true,
+          text:
+            `Not applied: these files decide what gets run and you were never shown their diff:\n${hiddenSensitive.map(([p, why]) => `  ${p} (${why})`).join("\n")}\n` +
+            `Look at them with jobs job_id="${j.id}" files=[...] (or have the worker-reviewer agent review the job), then apply again; ` +
+            "or pass unreviewed_ok=true if they were reviewed another way.",
+        };
+      }
       let r = await run("git", ["apply", "--whitespace=nowarn", j.patchFile], { cwd: j.repo });
       let how = "clean";
       if (r.code !== 0) {
@@ -1796,7 +1969,9 @@ async function callTool(name, a = {}) {
       saveJob(j);
       if (!a.keep_worktree) await removeWorktree(j);
       const warn = r.stderr.trim();
-      return `Applied (${how}) to the working tree of ${j.repo}. Changes are NOT committed.\n${warn ? warn + "\n" : ""}${j.diffStat || ""}\nNow: run tests/typecheck and polish if needed.`;
+      const unseen = [...hiddenSensitive.map(([p]) => p), ...hidden];
+      const note = unseen.length ? `Applied without their diff ever being shown to you: ${unseen.join(", ")}\n` : "";
+      return `Applied (${how}) to the working tree of ${j.repo}. Changes are NOT committed.\n${warn ? warn + "\n" : ""}${note}${j.diffStat || ""}\nNow: run tests/typecheck and polish if needed.`;
     }
 
     case "discard": {

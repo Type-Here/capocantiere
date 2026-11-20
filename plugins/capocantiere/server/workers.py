@@ -910,7 +910,9 @@ class VibeWorker(Worker):
         "max_turns": 40,
         "max_price": 0.5,  # USD cap per run (--max-price); 0 = no cap
         "max_tokens": 0,  # prompt + completion tokens cap per run (--max-tokens); 0 = no cap
-        "trust": True,  # --trust: trust the worktree for this run only (loads the repo's AGENTS.md and Vibe config)
+        # --trust: trust the worktree for this run only. Off: it would load the repo's AGENTS.md and Vibe config,
+        # which come from the repo (or from an earlier worker in the same worktree), not from you.
+        "trust": False,
         # The only tools enabled for analyses. vibe 3.1 has no grep tool: it searches with bash, which in a run
         # without --auto-approve only runs its read-only allowlist (rg, grep, ls, git diff/log/status, ...) and
         # denies anything else, since a headless run cannot ask for approval.
