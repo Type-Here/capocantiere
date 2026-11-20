@@ -246,7 +246,7 @@ class E2E(unittest.TestCase):
         self.assertIn("--prompt-file", v["argv"])
         self.assertEqual(v["argv"][v["argv"].index("--time-limit") + 1], "1200")  # timeout_min 20
         self.assertIn("--output-dir", v["argv"])
-        self.assertIn("--trust", v["argv"])
+        self.assertNotIn("--trust", v["argv"])  # the repo's AGENTS.md and Vibe config are not loaded
         self.assertNotIn("--enabled-tools", v["argv"])
         prompt_file = v["argv"][v["argv"].index("--prompt-file") + 1]
         self.assertFalse(os.path.exists(prompt_file), "the prompt file was not deleted")
@@ -661,6 +661,25 @@ class E2E(unittest.TestCase):
         self.assertIn("status: done", text)
         self.assertIn("fake-copilot.txt | 1 +", text)
 
+    def test_worker_cannot_make_the_server_run_commands_through_git(self):
+        head = lambda: subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.repo, capture_output=True, text=True).stdout
+        main = head()
+        jid, text = self.delegate("add a file FAKE:hijack", worker="copilot")
+        self.assertFalse(os.path.exists(os.path.join(os.path.dirname(self.env["FAKE_LOG"]), "PWNED")),
+                         "the server's git ran a command chosen by the worker")
+        self.assertIn("status: done", text)
+        self.assertIn("fake-copilot.txt | 1 +", text)
+        self.assertEqual(head(), main)  # nothing committed on the main branch
+        self.server.ok("apply", {"job_id": jid})
+        self.assertTrue(os.path.exists(os.path.join(self.repo, "fake-copilot.txt")))
+        self.assertFalse(os.path.exists(os.path.join(os.path.dirname(self.env["FAKE_LOG"]), "PWNED")))
+
+    def test_state_folders_are_private(self):
+        self.delegate("add a file", worker="copilot")
+        state = os.path.join(self.env["XDG_STATE_HOME"], "capocantiere")
+        for d in (state, os.path.join(state, "jobs"), os.path.join(self.env["XDG_CACHE_HOME"], "capocantiere")):
+            self.assertEqual(os.stat(d).st_mode & 0o777, 0o700, d)
+
     def test_isolation_none_is_the_default(self):
         jid, text = self.delegate("add a file", worker="copilot")
         self.assertIn("status: done", text)
@@ -742,10 +761,14 @@ class E2E(unittest.TestCase):
         bw = self.calls("bwrap")[0]
         opts, wt = bw["argv"], self.calls("copilot")[0]["cwd"]
         joined = " ".join(opts)
-        for expected in ("--unshare-all --share-net", "--ro-bind / /", "--tmpfs /tmp", "--bind %s %s" % (wt, wt),
-                         "--ro-bind {0} {0}".format(os.path.realpath(os.path.join(self.repo, ".git"))),
-                         "--bind {0} {0}".format(os.path.realpath(os.path.join(self.repo, ".git", "objects")))):
+        for expected in ("--unshare-all --share-net", "--ro-bind / /", "--tmpfs /tmp", "--tmpfs /run",
+                         "--bind %s %s" % (wt, wt), "--ro-bind {0}/.git {0}/.git".format(wt),
+                         "--ro-bind {0} {0}".format(os.path.realpath(os.path.join(self.repo, ".git")))):
             self.assertIn(expected, joined)
+        # the main repo's objects stay read-only: the worker's git writes to a throwaway store
+        self.assertNotIn("--bind {0} {0}".format(os.path.realpath(os.path.join(self.repo, ".git", "objects"))), joined)
+        tmpdir = self.calls("copilot")[0]["env"]["TMPDIR"]
+        self.assertEqual(self.calls("copilot")[0]["env"].get("GIT_OBJECT_DIRECTORY"), os.path.join(tmpdir, "git-objects"))
         self.assertIn("--tmpfs " + os.path.realpath(os.path.expanduser("~")).rsplit("/", 1)[0], joined)
         self.assertEqual(bw["command"][0], os.path.join(FAKES, "copilot"))
         env = self.calls("copilot")[0]["env"]

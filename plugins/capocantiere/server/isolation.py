@@ -12,10 +12,15 @@
 #
 # What a sandboxed run sees:
 #   - the system read-only; the user's home folder and other users' data hidden
-#   - the job's worktree read-write (an analysis's repo read-only); of the main repo's .git only what git needs:
-#     read-only, except this worktree's admin dir and the object store (refs stay read-only)
+#   - the job's worktree read-write (an analysis's repo read-only), except its .git file; of the main repo's .git
+#     only what git needs, read-only, except this worktree's admin dir. The worker's git writes new objects to a
+#     throwaway object store (the main repo's objects stay read-only, readable as an alternate)
+#   - none of /run (the system's and other services' sockets: docker, the system D-Bus, systemd), except the
+#     folder of /etc/resolv.conf when it lives there (systemd-resolved)
 #   - the worker CLI's own config/auth folders read-write, its install folder read-only
-#   - the network (the model APIs need it)
+#   - the network (the model APIs need it). Sharing it also shares the host's loopback (services listening on
+#     127.0.0.1) and its abstract Unix sockets (X11, a session D-Bus at an abstract address): the sandbox does not
+#     hide those
 #   - an environment rebuilt from scratch: only what the CLI needs
 #   - credentials: "host" (the CLI's own login, in the system keyring) reaches the keyring only. On Linux through
 #     xdg-dbus-proxy, which lets through the keyring services and nothing else of the session D-Bus; with
@@ -248,6 +253,32 @@ def git_paths(cwd):
         return None, None
 
 
+def git_files(cwd, admin):
+    """The files that tell git where a worktree's repo is: read-only, even in a writable worktree."""
+    return [p for p in (os.path.join(cwd, ".git"), os.path.join(admin, "commondir"), os.path.join(admin, "gitdir"))
+            if os.path.isfile(p)]
+
+
+def object_store_env(tmp, common):
+    """The worker's git writes objects to a folder of its own, deleted after the run, and reads the repo's as an
+    alternate: it cannot change or delete the main repo's objects. The server rebuilds the index before it
+    commits, so nothing the worker staged is needed afterwards."""
+    objects = os.path.join(tmp, "git-objects")
+    os.makedirs(os.path.join(objects, "info"), exist_ok=True)
+    os.makedirs(os.path.join(objects, "pack"), exist_ok=True)
+    return {"GIT_OBJECT_DIRECTORY": objects, "GIT_ALTERNATE_OBJECT_DIRECTORIES": os.path.join(common, "objects")}
+
+
+RUN_LINKS = ["/run/current-system", "/run/booted-system"]  # NixOS: the system profile, in PATH
+
+
+def run_keep():
+    """What of /run stays visible: the folder of /etc/resolv.conf when it is there (systemd-resolved,
+    NetworkManager). RUN_LINKS are recreated as symlinks."""
+    d = os.path.dirname(_real("/etc/resolv.conf"))
+    return [d] if d.startswith("/run/") and os.path.isdir(d) else []
+
+
 def _runtime_dir():
     d = os.environ.get("XDG_RUNTIME_DIR")
     return d if d and os.path.isdir(d) else None
@@ -295,7 +326,7 @@ class DbusProxy:
 def _bwrap(req):
     home = _real("~")
     runtime = _runtime_dir()
-    hidden = ["/home", "/root", "/mnt", "/media", "/run/media", "/srv", "/var/tmp", os.path.dirname(home), home]
+    hidden = ["/home", "/root", "/mnt", "/media", "/run", "/var/run", "/srv", "/var/tmp", os.path.dirname(home), home]
     if runtime:
         hidden.append(runtime)
     a = ["--die-with-parent", "--unshare-all", "--share-net", "--new-session",
@@ -309,15 +340,18 @@ def _bwrap(req):
     binds = []  # (path, writable)
     for d in install_dirs(req.get("bin_path")):
         binds.append((d, False))
+    for d in run_keep():
+        binds.append((d, False))
     for d in req.get("ro") or []:
         binds.append((_real(d), False))
     cwd = _real(req["cwd"])
     binds.append((cwd, bool(req.get("writable"))))
     admin, common = git_paths(cwd)
     if common:
-        binds += [(common, False), (os.path.join(common, "objects"), True)]
+        binds.append((common, False))
         if admin:
             binds.append((admin, bool(req.get("writable"))))
+            binds += [(f, False) for f in git_files(cwd, admin)]
     for d in req.get("rw") or []:
         binds.append((_real(d), True))
     tmp = tempfile.mkdtemp(prefix="capocantiere-run-")
@@ -329,6 +363,8 @@ def _bwrap(req):
 
     env = _keep_env(req, DESKTOP_ENV if req.get("credentials") == "host" else ())
     env["TMPDIR"] = tmp
+    if common:
+        env.update(object_store_env(tmp, common))
     cleanup = [lambda: shutil.rmtree(tmp, ignore_errors=True)]
     if runtime:
         env["XDG_RUNTIME_DIR"] = runtime
@@ -338,6 +374,9 @@ def _bwrap(req):
         bus = os.path.join(runtime or "/tmp", "bus")
         a += ["--bind", proxy.path, bus]
         env["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=" + bus
+    for link in RUN_LINKS:
+        if os.path.islink(link):
+            a += ["--symlink", os.readlink(link), link]
     a += ["--chdir", req["cwd"], "--", req["cmd"]] + list(req["args"])
     return Prepared(_which("bwrap"), a, env=env, cleanup=cleanup)
 
@@ -360,7 +399,6 @@ def seatbelt_profile(req, tmp):
         writable.append(cwd)
     if common:
         readable.append(common)
-        writable.append(os.path.join(common, "objects"))
         if admin and req.get("writable"):
             writable.append(admin)
     if req.get("credentials") == "host":
@@ -385,6 +423,11 @@ def seatbelt_profile(req, tmp):
         "(allow file-read-metadata (literal \"/Users\") (literal %s))" % _sb_str(home),
         "(allow file-read* %s)" % " ".join("(subpath %s)" % _sb_str(d) for d in readable + writable),
         "(allow file-write* %s)" % " ".join("(subpath %s)" % _sb_str(d) for d in writable),
+        "(deny file-write* %s)" % " ".join("(literal %s)" % _sb_str(f) for f in git_files(cwd, admin)) if admin else "",
+        "; local services' sockets: docker, and anything in the home folder",
+        "(deny network-outbound (remote unix-socket (path-literal \"/var/run/docker.sock\")) "
+        "(remote unix-socket (path-literal \"/private/var/run/docker.sock\")) "
+        "(remote unix-socket (path-regex #\"^%s/\")))" % re.escape(home).replace('"', '\\"'),
         "(allow file-write-data (literal \"/dev/null\") (literal \"/dev/zero\") (literal \"/dev/tty\") (literal \"/dev/dtracehelper\"))",
         "(allow file-write* (regex #\"^/dev/fd/\") (regex #\"^/dev/ttys\"))",
         "(allow mach-lookup %s)" % " ".join("(global-name %s)" % _sb_str(n) for n in SEATBELT_MACH),
@@ -398,5 +441,8 @@ def _seatbelt(req):
     profile = seatbelt_profile(req, tmp)
     env = _keep_env(req, ("__CF_USER_TEXT_ENCODING",))
     env["TMPDIR"] = tmp
+    _, common = git_paths(_real(req["cwd"]))
+    if common:
+        env.update(object_store_env(tmp, common))
     a = ["-p", profile, req["cmd"]] + list(req["args"])
     return Prepared(seatbelt_bin(), a, env=env, cleanup=[lambda: shutil.rmtree(tmp, ignore_errors=True)])

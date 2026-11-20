@@ -89,9 +89,20 @@ function migrateLegacyState() {
   }
 }
 
+// A folder only the user can read: jobs hold tasks, responses and patches; worktrees hold the code.
+function privateDir(d) {
+  fs.mkdirSync(d, { recursive: true, mode: 0o700 });
+  try {
+    if (process.platform !== "win32" && fs.statSync(d).mode & 0o077) fs.chmodSync(d, 0o700);
+  } catch {}
+}
+
 function ensureDirs() {
   migrateLegacyState();
-  for (const d of [JOBS_DIR, PATCH_DIR, WORKTREE_DIR]) fs.mkdirSync(d, { recursive: true });
+  privateDir(STATE_DIR);
+  // ~/.cache/capocantiere is ours; a worktree folder you chose stays as it is
+  if (!(env.CAPOCANTIERE_WORKTREE_DIR || env.GEMINI_DELEGATE_WORKTREE_DIR)) privateDir(path.dirname(WORKTREE_DIR));
+  for (const d of [JOBS_DIR, PATCH_DIR, WORKTREE_DIR]) privateDir(d);
 }
 
 const isoNow = () => new Date().toISOString();
@@ -115,6 +126,14 @@ function killTree(child, sig) {
   }
 }
 
+// The environment of a child process. Workers' tokens (CAPOCANTIERE_<WORKER>_TOKEN) never pass through.
+const TOKEN_VAR_RE = /^CAPOCANTIERE_.*_TOKEN$/;
+function childEnv(extraEnv) {
+  const e = {};
+  for (const [k, v] of Object.entries(process.env)) if (!TOKEN_VAR_RE.test(k)) e[k] = v;
+  return { ...e, ...(extraEnv || {}) };
+}
+
 // Run a command; never throws. Resolves to { code, stdout, stderr, error, timedOut }.
 function run(cmd, args, { cwd, input, timeoutMs, onSpawn, binary = false, extraEnv } = {}) {
   return new Promise((resolve) => {
@@ -124,7 +143,7 @@ function run(cmd, args, { cwd, input, timeoutMs, onSpawn, binary = false, extraE
     try {
       child = spawn(cmd, args, {
         cwd,
-        env: extraEnv && Object.keys(extraEnv).length ? { ...process.env, ...extraEnv } : process.env,
+        env: childEnv(extraEnv),
         stdio: ["pipe", "pipe", "pipe"],
         detached: process.platform !== "win32",
       });
@@ -895,7 +914,9 @@ class VibeWorker extends Worker {
     max_turns: 40,
     max_price: 0.5, // USD cap per run (--max-price); 0 = no cap
     max_tokens: 0, // prompt + completion tokens cap per run (--max-tokens); 0 = no cap
-    trust: true, // --trust: trust the worktree for this run only (loads the repo's AGENTS.md and Vibe config)
+    // --trust: trust the worktree for this run only. Off: it would load the repo's AGENTS.md and Vibe config,
+    // which come from the repo (or from an earlier worker in the same worktree), not from you.
+    trust: false,
     analyze_tools: ["read_file", "grep"], // the only tools enabled for analyses
     disabled_tools: [], // tools disabled in implementation runs (--disabled-tools)
     strengths: ["analysis", "docs", "boilerplate", "tests"],

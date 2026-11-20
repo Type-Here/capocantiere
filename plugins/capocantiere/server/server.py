@@ -577,6 +577,18 @@ def create_job(args):
 
     job = {
         "id": jid,
+        "worktree": worktree,
+    }
+    try:
+        record_worktree(job)
+    except Exception:
+        with GIT_LOCK:
+            shutil.rmtree(worktree, ignore_errors=True)
+            run("git", ["worktree", "prune"], cwd=repo)
+            run("git", ["branch", "-D", branch], cwd=repo)
+        raise
+    job.update({
+        "id": jid,
         "title": args.get("title") or args["task"].strip().split("\n")[0][:80],
         "status": "queued",
         "repo": repo,
@@ -607,7 +619,7 @@ def create_job(args):
         "notes": notes,
         "attempts": [],
         "createdAt": iso_now(),
-    }
+    })
     with STATE_LOCK:
         jobs[jid] = job
         save_job(job)
@@ -634,10 +646,76 @@ def fallback_candidates(job, role):
     return out
 
 
+INDEX_DIR = os.path.join(common.STATE_DIR, "index")  # each job's index as git wrote it, before any worker ran
+
+
+def record_worktree(job):
+    """Right after `git worktree add`, while only git has written there: where the worktree's git files are, and
+    a copy of its index. The worker can rewrite the worktree's .git file and its admin dir; the server's own git
+    commands on the worktree use what is recorded here instead."""
+    admin, common_dir = isolation.git_paths(job["worktree"])
+    if not admin:
+        raise RuntimeError("git worktree add left no worktree admin dir for %s" % job["worktree"])
+    job["gitAdmin"], job["gitCommon"] = admin, common_dir
+    os.makedirs(INDEX_DIR, mode=0o700, exist_ok=True)
+    shutil.copyfile(os.path.join(admin, "index"), os.path.join(INDEX_DIR, job["id"]))
+
+
+def worktree_git_dirs(job):
+    if job.get("gitAdmin") and job.get("gitCommon"):
+        return job["gitAdmin"], job["gitCommon"]
+    # a job created before these were recorded: git names the admin dir after the worktree's folder
+    common_dir = os.path.realpath(git(job["repo"], "rev-parse", "--path-format=absolute", "--git-common-dir").strip())
+    return os.path.join(common_dir, "worktrees", os.path.basename(job["worktree"])), common_dir
+
+
+def _replace_file(path, data, src=None):
+    """Write a file without following a symlink a worker may have left in its place."""
+    tmp = "%s.capocantiere-%s" % (path, os.getpid())
+    if src:
+        shutil.copyfile(src, tmp)
+    else:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(data)
+    os.replace(tmp, path)
+
+
+def take_back_worktree(job):
+    """Before the server's git touches a worktree a worker ran in: HEAD and the index put back to the server's,
+    a worktree-only config removed (read when the repo enables extensions.worktreeConfig)."""
+    admin, _ = worktree_git_dirs(job)
+    _replace_file(os.path.join(admin, "HEAD"), "ref: refs/heads/%s\n" % job["branch"])
+    saved = os.path.join(INDEX_DIR, job["id"])
+    if os.path.exists(saved):
+        # the worker's git may have staged objects that only exist in its own (throwaway) object store
+        _replace_file(os.path.join(admin, "index"), None, src=saved)
+    try:
+        os.unlink(os.path.join(admin, "config.worktree"))
+    except OSError:
+        pass
+
+
+def worktree_git(job, *args, quiet_check=False):
+    """git on a job's worktree, with nothing the worker could have written deciding which repo, config or hooks it
+    uses: the git dirs are passed explicitly (the worktree's .git file and the admin dir's commondir are ignored),
+    hooks and fsmonitor (a command git would run) are off. Call take_back_worktree() first."""
+    admin, common_dir = worktree_git_dirs(job)
+    env = {"GIT_DIR": admin, "GIT_COMMON_DIR": common_dir, "GIT_WORK_TREE": job["worktree"]}
+    a = ["-c", "core.fsmonitor=false", "-c", "core.hooksPath=" + os.devnull, "-c", "diff.external=",
+         "-c", "commit.gpgsign=false"] + list(args)
+    if quiet_check:
+        return run("git", a, cwd=job["worktree"], extra_env=env)
+    return git(job["worktree"], *a, env=env)
+
+
 def reset_worktree(job):
     """Throw away a failed attempt's edits before the next worker starts."""
-    git(job["worktree"], "reset", "-q", "--hard", "HEAD")
-    git(job["worktree"], "clean", "-qfd")
+    take_back_worktree(job)
+    worktree_git(job, "reset", "-q", "--hard", "HEAD")
+    worktree_git(job, "clean", "-qfd")
+    admin, _ = worktree_git_dirs(job)
+    if os.path.isdir(INDEX_DIR):
+        shutil.copyfile(os.path.join(admin, "index"), os.path.join(INDEX_DIR, job["id"]))
 
 
 def execute_job(job):
@@ -724,17 +802,22 @@ JUNK_PATHSPECS = [":(exclude,glob)" + p for p in ['**/__pycache__/**', '**/*.py[
 def collect_changes(job):
     if not os.path.exists(job["worktree"]):
         return
-    git(job["worktree"], "add", "-A", "--", ".", *JUNK_PATHSPECS)
-    staged = run("git", ["diff", "--cached", "--quiet"], cwd=job["worktree"])
+    take_back_worktree(job)
+    worktree_git(job, "add", "-A", "--", ".", *JUNK_PATHSPECS)
+    staged = worktree_git(job, "diff", "--cached", "--quiet", "--no-ext-diff", quiet_check=True)
     if staged["code"] == 1:
-        git(
-            job["worktree"],
+        worktree_git(
+            job,
             "-c", "user.name=%s (capocantiere)" % job.get("worker", "worker"),
-            "-c", "user.email=capocantiere@localhost",
-            "-c", "commit.gpgsign=false",  # never sign a worker's code with the user's key
+            "-c", "user.email=capocantiere@localhost",  # commit.gpgsign=false: never sign a worker's code
             "commit", "-q", "--no-verify", "-m", "%s: %s" % (job.get("worker", "worker"), job["title"]),
             "-m", "job " + job["id"],
         )
+    elif staged["code"] != 0:
+        raise RuntimeError("git diff --cached failed: " + staged["stderr"].strip())
+    admin, _ = worktree_git_dirs(job)
+    if os.path.isdir(INDEX_DIR):  # the index now matches the branch's new commit
+        shutil.copyfile(os.path.join(admin, "index"), os.path.join(INDEX_DIR, job["id"]))
     stat = git(job["repo"], "diff", "--stat", job["base"], job["branch"])
     names = git(job["repo"], "diff", "--name-status", job["base"], job["branch"]).strip()
     # keep the patch as raw bytes so non-UTF-8 files survive intact
@@ -754,8 +837,13 @@ def collect_changes(job):
 def remove_worktree(job):
     with GIT_LOCK:
         if os.path.exists(job["worktree"]):
-            run("git", ["worktree", "remove", "--force", job["worktree"]], cwd=job["repo"])
+            # not `git worktree remove`: it would go by the worktree's .git file, which the worker could rewrite
+            shutil.rmtree(job["worktree"], ignore_errors=True)
         run("git", ["worktree", "prune"], cwd=job["repo"])
+        try:
+            os.unlink(os.path.join(INDEX_DIR, job["id"]))
+        except OSError:
+            pass
         run("git", ["branch", "-D", job["branch"]], cwd=job["repo"])
 
 
