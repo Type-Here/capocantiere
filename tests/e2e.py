@@ -114,7 +114,7 @@ class E2E(unittest.TestCase):
         self.vibe_config('outside_workdir = "deny"\n')
         self.env = {k: v for k, v in os.environ.items()
                     if not k.startswith(("CAPOCANTIERE_", "GEMINI_DELEGATE_", "COPILOT_", "GH_TOKEN", "GITHUB_TOKEN", "VIBE_", "MISTRAL_",
-                             "GEMINI_API_KEY", "AGY_"))}
+                             "GEMINI_API_KEY", "AGY_", "CODEX_", "OPENAI_API_KEY"))}
         self.env.update({
             "CAPOCANTIERE_RUNTIME": RUNTIME,
             "XDG_STATE_HOME": os.path.join(self.tmp, "state"),
@@ -149,6 +149,7 @@ class E2E(unittest.TestCase):
             "copilot": {"bin": os.path.join(FAKES, "copilot")},
             "vibe": {"bin": os.path.join(FAKES, "vibe")},
             "agy": {"enabled": False, "bin": os.path.join(self.tmp, "no-agy")},
+            "codex": {"enabled": False, "bin": os.path.join(FAKES, "codex")},
         }}
         cfg.update(glob or {})
         for wid, s in workers.items():
@@ -775,8 +776,148 @@ class E2E(unittest.TestCase):
         self.assertIn("copilot skipped: %s is readable by other users" % path, text)
         self.write_config(copilot={"credentials": "private-home"})
         jid, text = self.delegate("add a file")
-        self.assertIn('copilot skipped: credentials "private-home" is not available yet', text)
+        self.assertIn('copilot skipped: credentials "private-home" is not supported by copilot', text)
         self.assertEqual(self.calls("copilot"), [])
+
+    # ------------------------------------------------------------ codex (Python server only)
+
+    def codex_home(self):
+        return os.path.join(self.tmp, "state", "capocantiere", "homes", "codex")
+
+    def codex_login(self, mode=0o600):
+        """What `codex login` leaves in the private home (the server creates the folder and config.toml)."""
+        os.makedirs(self.codex_home(), exist_ok=True)
+        path = os.path.join(self.codex_home(), "auth.json")
+        with open(path, "w") as f:
+            json.dump({"auth_mode": "chatgpt", "tokens": {"access_token": "x"}}, f)
+        os.chmod(path, mode)
+        return path
+
+    def skip_on_node(self):
+        if RUNTIME == "node":
+            self.skipTest("codex is Python-only")
+
+    def codex_host_login(self, store="file"):
+        """The user's own ~/.codex (CODEX_HOME), logged in."""
+        home = os.path.join(self.tmp, "user-codex")
+        os.makedirs(home, exist_ok=True)
+        with open(os.path.join(home, "config.toml"), "w") as f:
+            f.write('cli_auth_credentials_store = "%s"\n' % store)
+        if store == "file":
+            with open(os.path.join(home, "auth.json"), "w") as f:
+                json.dump({"auth_mode": "chatgpt"}, f)
+        self.env["CODEX_HOME"] = home
+        return home
+
+    def test_codex_host_file_login_needs_no_dbus(self):
+        self.skip_on_node()
+        self.use_sandbox_fakes()
+        home = self.codex_host_login()
+        self.write_config(codex={"enabled": True, "isolation": "bwrap", "isolation_env": ["FAKE_LOG"]})
+        self.assertIn("authenticated: yes (logged in, per %s/auth.json)" % home, self.server.ok("workers"))
+        jid, text = self.delegate("add a file", worker="codex", fallback=False)
+        self.assertIn("status: done", text)
+        joined = " ".join(self.calls("bwrap")[0]["argv"])
+        real = os.path.realpath(home)
+        self.assertIn("--bind %s %s" % (real, real), joined)  # writable: Codex refreshes its token in auth.json
+        self.assertNotIn("dbus", joined.lower())
+        env = self.calls("codex")[0]["env"]
+        self.assertEqual(env.get("CODEX_HOME"), home)
+        self.assertNotIn("DBUS_SESSION_BUS_ADDRESS", env)
+        self.assertNotIn("cli_auth_credentials_store", " ".join(self.calls("codex")[0]["argv"]))
+
+    def test_codex_host_keyring_login_warns(self):
+        self.skip_on_node()
+        self.use_sandbox_fakes()
+        self.codex_host_login(store="auto")
+        self.write_config(codex={"enabled": True, "isolation": "bwrap"})
+        self.assertIn("the codex login is in the keyring", self.server.ok("workers"))
+
+    def test_codex_private_home_login_required(self):
+        self.skip_on_node()
+        text = self.server.ok("workers")
+        self.assertIn("codex — OpenAI Codex CLI [DISABLED]", text)
+        self.assertFalse(os.path.exists(self.codex_home()))  # nothing is created for a disabled worker
+        self.write_config(codex={"enabled": True, "credentials": "private-home"})
+        jid, text = self.delegate("add a file", worker="codex")
+        self.assertIn("codex skipped: not logged in: run `CODEX_HOME=%s" % self.codex_home(), text)
+        self.assertIn("cli_auth_credentials_store=\"file\"' login`", text)
+        self.assertIn("worker: copilot", text)
+        with open(os.path.join(self.codex_home(), "config.toml")) as f:
+            self.assertIn('cli_auth_credentials_store = "file"', f.read())
+        self.assertEqual(os.stat(self.codex_home()).st_mode & 0o777, 0o700)
+        path = self.codex_login(mode=0o644)
+        jid, text = self.delegate("add a file", worker="codex")
+        self.assertIn("codex skipped: %s is readable by other users" % path, text)
+        with open(os.path.join(self.codex_home(), "config.toml"), "w") as f:
+            f.write('cli_auth_credentials_store = "keyring"\n')
+        os.chmod(path, 0o600)
+        jid, text = self.delegate("add a file", worker="codex")
+        self.assertIn('config.toml must set cli_auth_credentials_store = "file"', text)
+        self.assertEqual(self.calls("codex"), [])
+
+    def test_codex_job(self):
+        self.skip_on_node()
+        self.write_config(codex={"enabled": True, "credentials": "private-home"})
+        self.codex_login()
+        self.assertIn("authenticated: yes (ChatGPT login in private home %s)" % self.codex_home(), self.server.ok("workers"))
+        jid, text = self.delegate("add a file", worker="codex", fallback=False, effort="max")
+        self.assertIn("status: done", text)
+        self.assertIn("fake-codex.txt | 1 +", text)
+        self.assertIn("SUMMARY: wrote fake-codex.txt", text)  # the last message (-o), not "working on it"
+        call = self.calls("codex")[0]
+        a = call["argv"]
+        self.assertEqual(a[:2], ["exec", "--json"])
+        self.assertEqual(a[-1], "-")  # the prompt comes from stdin
+        self.assertEqual(a[a.index("--sandbox") + 1], "workspace-write")
+        self.assertIn("sandbox_workspace_write.network_access=false", a)
+        self.assertIn('model_reasoning_effort="xhigh"', a)
+        self.assertIn("--ephemeral", a)
+        self.assertEqual(call["env"].get("CODEX_HOME"), self.codex_home())
+
+    def test_codex_analysis_is_read_only(self):
+        self.skip_on_node()
+        self.write_config(codex={"enabled": True})
+        self.codex_host_login()
+        text = self.server.ok("analyze", {"question": "what is here?", "worker": "codex", "fallback": False}, timeout=60)
+        self.assertIn("I could not edit files", text)
+        a = self.calls("codex")[0]["argv"]
+        self.assertEqual(a[a.index("--sandbox") + 1], "read-only")
+        self.assertFalse(os.path.exists(os.path.join(self.repo, "fake-codex.txt")))
+
+    def test_codex_quota_falls_back(self):
+        self.skip_on_node()
+        self.write_config(glob={"order": ["codex", "copilot", "vibe"]}, codex={"enabled": True})
+        self.codex_host_login()
+        jid, text = self.delegate("FAKE:quota-codex add a file")
+        self.assertIn("worker: copilot", text)
+        self.assertIn("usage limit", text)
+
+    def test_codex_without_own_sandbox_needs_isolation(self):
+        self.skip_on_node()
+        self.write_config(codex={"enabled": True, "sandbox": False})
+        self.codex_host_login()
+        jid, text = self.delegate("add a file", worker="codex")
+        self.assertIn('codex skipped: "sandbox": false needs the server\'s isolation', text)
+        self.assertEqual(self.calls("codex"), [])
+
+    def test_codex_bwrap_private_home(self):
+        self.skip_on_node()
+        self.use_sandbox_fakes()
+        self.env["CODEX_HOME"] = os.path.join(self.tmp, "user-codex")  # the user's own: never used nor mounted
+        self.write_config(codex={"enabled": True, "credentials": "private-home", "isolation": "bwrap",
+                                 "isolation_env": ["FAKE_LOG"]})
+        self.codex_login()
+        jid, text = self.delegate("add a file", worker="codex", fallback=False)
+        self.assertIn("status: done", text)
+        joined = " ".join(self.calls("bwrap")[0]["argv"])
+        home = os.path.realpath(self.codex_home())
+        self.assertIn("--bind %s %s" % (home, home), joined)
+        self.assertNotIn("user-codex", joined)
+        self.assertNotIn("dbus", joined.lower())  # no keyring: the login is a file
+        env = self.calls("codex")[0]["env"]
+        self.assertEqual(env.get("CODEX_HOME"), self.codex_home())
+        self.assertNotIn("DBUS_SESSION_BUS_ADDRESS", env)
 
     def test_bwrap_with_token_credentials(self):
         self.use_sandbox_fakes()

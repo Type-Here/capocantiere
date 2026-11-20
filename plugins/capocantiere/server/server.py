@@ -1122,7 +1122,7 @@ def doctor_report():
         auth, note = w.auth_status() if installed else (None, "")
         lines.append("  credentials: %s — %s" % (w.credentials, {True: "ok", False: "PROBLEM", None: "not checkable"}[auth]
                                                  + (": " + note if note else "")))
-        problem = isolation.problem(setting, w.credentials)
+        problem = isolation.problem(setting, w.sandbox_credentials())
         lines.append("  isolation: " + ("%s — %s" % (setting, problem) if problem else w.isolation_notes()))
         tips = []
         if not w.enabled:
@@ -1133,7 +1133,7 @@ def doctor_report():
             isolated = isolation.resolve(setting) is not None
         except ValueError:
             isolated = False
-        if w.enabled and isolated and w.credentials == "host" and w.TOKEN_ENV:
+        if w.enabled and isolated and w.uses_keyring() and w.TOKEN_ENV:
             tips.append('with "host" credentials this worker can read your keyring. A minimal token avoids that: %s '
                         'Save it in %s (chmod 600) and set "credentials": "token".' % (w.TOKEN_HINT, w.token_file()))
         lines += ["  → " + t for t in tips]

@@ -327,7 +327,9 @@ function loadConfig() {
   }
   const userWorkers = userWorkersRaw && typeof userWorkersRaw === "object" ? userWorkersRaw : {};
   for (const wid of Object.keys(userWorkers)) {
-    if (!ADAPTERS[wid] && !wid.startsWith("_"))
+    if (PYTHON_ONLY_WORKERS.has(wid)) {
+      if (userWorkers[wid]?.enabled) errors.push(`Worker "${wid}" is only supported by the Python server; the Node server ignores it.`);
+    } else if (!ADAPTERS[wid] && !wid.startsWith("_"))
       errors.push(`Unknown worker "${wid}" in ${CONFIG_FILE} (known: ${Object.keys(ADAPTERS).join(", ")}).`);
   }
   const workers = {};
@@ -1044,6 +1046,8 @@ class VibeWorker extends Worker {
 
 // Registry. The preference order comes from the config ("order").
 const ADAPTERS = { copilot: CopilotWorker, vibe: VibeWorker, agy: AgyWorker };
+// Workers implemented in the Python server only (the Node server is frozen for new features).
+const PYTHON_ONLY_WORKERS = new Set(["codex"]);
 
 // ================================================================ server (server.py)
 
@@ -1575,7 +1579,7 @@ async function removeWorktree(job) {
 // told to go ahead (unreviewed_ok), and names the ordinary files it applied unseen.
 
 const SENSITIVE_PREFIXES = [".github/", ".gitlab/", ".circleci/", ".buildkite/", ".githooks/", ".husky/", ".devcontainer/",
-  ".vscode/", ".idea/", ".claude/", ".cursor/", ".vibe/", ".copilot/", ".gemini/"];
+  ".vscode/", ".idea/", ".claude/", ".cursor/", ".vibe/", ".copilot/", ".gemini/", ".codex/"];
 const SENSITIVE_NAMES = new Set([
   ".gitlab-ci.yml", ".travis.yml", "azure-pipelines.yml", "Jenkinsfile", "bitbucket-pipelines.yml",
   ".gitattributes", ".gitmodules", ".gitignore", ".pre-commit-config.yaml", ".mcp.json", "AGENTS.md", "CLAUDE.md",

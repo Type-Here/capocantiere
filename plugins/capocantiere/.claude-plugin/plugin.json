@@ -11,6 +11,7 @@
     "workers",
     "copilot",
     "mistral-vibe",
+    "codex",
     "worktree"
   ],
   "license": "MIT"

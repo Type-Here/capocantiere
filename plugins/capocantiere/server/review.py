@@ -12,7 +12,7 @@ import re
 
 # Paths where a change decides what gets run: by CI, by git, by the build, by an editor or agent.
 SENSITIVE_PREFIXES = (".github/", ".gitlab/", ".circleci/", ".buildkite/", ".githooks/", ".husky/", ".devcontainer/",
-                      ".vscode/", ".idea/", ".claude/", ".cursor/", ".vibe/", ".copilot/", ".gemini/")
+                      ".vscode/", ".idea/", ".claude/", ".cursor/", ".vibe/", ".copilot/", ".gemini/", ".codex/")
 SENSITIVE_NAMES = {
     ".gitlab-ci.yml", ".travis.yml", "azure-pipelines.yml", "Jenkinsfile", "bitbucket-pipelines.yml",
     ".gitattributes", ".gitmodules", ".gitignore", ".pre-commit-config.yaml", ".mcp.json", "AGENTS.md", "CLAUDE.md",

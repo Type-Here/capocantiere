@@ -8,6 +8,7 @@ Supported workers:
 |---|---|---|---|
 | `copilot` | [GitHub Copilot CLI](https://docs.github.com/copilot/how-tos/copilot-cli) | `copilot login` (e.g. a Student account) | enabled, first choice |
 | `vibe` | [Mistral Vibe](https://github.com/mistralai/mistral-vibe) | your Mistral account (the Free plan works) or `MISTRAL_API_KEY` | enabled, second choice |
+| `codex` | [OpenAI Codex CLI](https://developers.openai.com/codex/cli) | `codex login` (a ChatGPT account, any plan, Free included) or an OpenAI API key | **disabled** until you enable it — see [codex](#codex-openai-codex-cli) |
 | `agy` | [Antigravity CLI](https://antigravity.google/docs/cli) | Gemini API key, or Google Cloud ADC | **disabled** — see [the warning](#agy-antigravity-cli) |
 
 ## What's inside
@@ -85,6 +86,22 @@ How it is run: `vibe --prompt-file <tmp> --output json --output-dir <tmp> --work
 - The answer is the last assistant message of the JSON output; outcome, usage and cost come from `export.json`.
 - `--trust` is **not** passed by default: with it vibe would read the repo's `AGENTS.md` and project config, which come from the repo (or from an earlier worker in the same worktree) rather than from you. Set `"trust": true` for repos you trust, so that vibe follows their `AGENTS.md`.
 
+### codex (OpenAI Codex CLI)
+
+1. Install it (`npm i -g @openai/codex`, your distribution's package, …) and log in as usual: `codex login` (a ChatGPT account, any plan, Free included, or `--with-api-key`). The worker uses that same login (`"credentials": "host"`).
+2. **Keep the login in a file:** put `cli_auth_credentials_store = "file"` in `~/.codex/config.toml` (before logging in, or log in again after adding it). The login is then `~/.codex/auth.json`, and an isolated run needs no D-Bus: the sandbox mounts `~/.codex` read-write (Codex refreshes its token there) and nothing of the keyring. With the login in the keyring it still works, through the keyring proxy like the other workers, and `workers` warns.
+3. Enable it: `{ "workers": { "codex": { "enabled": true } } }`. `/capocantiere:status` should show `codex … authenticated: yes (logged in, per ~/.codex/auth.json)`.
+
+How it is run: `codex exec --json -o <tmp> --sandbox <mode> --cd <dir> --ephemeral -` with the prompt on stdin. The answer is the last message (`-o`), token usage comes from the `turn.completed` events. `--ephemeral` keeps these runs out of your session history.
+
+- **Codex's own sandbox stays on, inside capocantiere's isolation** (checked with bwrap on Linux). The two cover different things: Codex's limits what the commands it runs may **write** (the worktree and `/tmp`; not `~/.codex`, not `.git`) and turns their **network** off, but lets them read the whole disk; capocantiere's hides your home folder, `/run` and the main repo's objects from reads. Jobs run `workspace-write` (`"network_access": true` gives the commands network), `analyze` runs `read-only`. `exec` never asks for approval: what its sandbox blocks simply fails.
+- Where the kernel forbids nested user namespaces, Codex's sandbox cannot start inside ours: `"sandbox": false` then runs it with `danger-full-access`, which the server allows **only** with `isolation` on.
+- `max_parallel` is 1 by default, as a precaution: runs share your login's token refreshes. Raise it if you like.
+- Usage limits of the ChatGPT plan ("You've hit your usage limit", HTTP 429) count as quota errors and move the job to the next worker. On the Free plan they come quickly: keep `daily_budget` low.
+- `effort` becomes `model_reasoning_effort` (`max` → `xhigh`). Codex does not report which model it used: the arm is the `model` you set (in the worker config or in Codex's `config.toml`), otherwise `codex:default`.
+- A project's own `.codex/config.toml` is only read for projects you trusted in Codex, and capocantiere never passes `--trust`. Codex does read the repo's `AGENTS.md`.
+- Other credentials: `"token"` gives it `CODEX_API_KEY` (an OpenAI API key, from `~/.local/state/capocantiere/credentials/codex`); `"private-home"` gives it a `CODEX_HOME` of its own, `~/.local/state/capocantiere/homes/codex`, with a separate login (`CODEX_HOME=<that folder> codex -c 'cli_auth_credentials_store="file"' login`), so your `~/.codex` is never mounted.
+
 ### agy (Antigravity CLI)
 
 > ⚠️ **Disabled by default.** According to the official Antigravity FAQ, running `agy -p` inside third-party agents is **not supported on consumer plans and can get the account suspended**. Use this worker only with a Gemini API key or Google Cloud credentials, never with the login of a consumer subscription (Google AI Pro, student plan, …).
@@ -157,7 +174,7 @@ Global settings:
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `order` | `["copilot", "vibe", "agy"]` | preference order when no worker is requested |
+| `order` | `["copilot", "vibe", "codex", "agy"]` | preference order when no worker is requested |
 | `selection` | `"scores"` | `scores`: choose by trust score (the order only breaks ties while there is no history); `order`: always the preference order. See [Trust scores](#trust-scores-and-tiers) |
 | `half_life_days` | `30` | trust score events lose half their weight every N days |
 | `fallback` | `true` | on quota/rate-limit errors or exhausted budget, move on to the next worker |
@@ -179,12 +196,12 @@ Settings of every worker:
 | `extra_args` | extra command-line arguments |
 | `env` | extra environment variables for the CLI (e.g. an API key) |
 | `strengths` | tags Claude uses to choose a worker: `tests`, `boilerplate`, `docs`, `refactor`, `analysis`, … |
-| `credentials` | `host` (default) or `token`: see [Isolation and credentials](#isolation-and-credentials) |
+| `credentials` | `host` (default), `token`, or `private-home` (codex only): see [Isolation and credentials](#isolation-and-credentials) |
 | `isolation` | overrides the global setting for this worker (empty = global) |
 | `tiers` | models per capability tier, e.g. `{"fast": "<model>", "strong": ["<model>", "<model>"]}` (empty = every tier uses `model`) |
 | `isolation_rw`, `isolation_ro`, `isolation_env` | extra paths an isolated worker may write / read, extra environment variables it keeps |
 
-Worker-specific settings: `copilot` — `deny_tools`, `disable_builtin_mcps`, `sandbox`, `max_ai_credits`, `secret_env_vars`; `vibe` — `max_turns`, `max_price`, `max_tokens`, `analyze_max_tokens`, `trust`, `analyze_tools`, `disabled_tools`; `agy` — `auth`, `sandbox`, `skip_permissions`.
+Worker-specific settings: `copilot` — `deny_tools`, `disable_builtin_mcps`, `sandbox`, `max_ai_credits`, `secret_env_vars`; `vibe` — `max_turns`, `max_price`, `max_tokens`, `analyze_max_tokens`, `trust`, `analyze_tools`, `disabled_tools`; `codex` — `sandbox`, `network_access`; `agy` — `auth`, `sandbox`, `skip_permissions`.
 
 **Environment variables** override the file, e.g. in `~/.claude/settings.json` under `"env"`: `CAPOCANTIERE_<WORKER>_<SETTING>` (`CAPOCANTIERE_VIBE_MAX_PRICE=1`, `CAPOCANTIERE_COPILOT_ENABLED=0`; lists are comma-separated), `CAPOCANTIERE_ORDER`, `CAPOCANTIERE_FALLBACK`, `CAPOCANTIERE_MAX_PARALLEL`, `CAPOCANTIERE_SELECTION`, `CAPOCANTIERE_HALF_LIFE_DAYS`, plus `CAPOCANTIERE_RUNTIME` (`python`, `node` or `auto`). The old `GEMINI_DELEGATE_*` variables still apply to `agy`.
 
@@ -192,7 +209,7 @@ Worker-specific settings: `copilot` — `deny_tools`, `disable_builtin_mcps`, `s
 
 ## Isolation and credentials
 
-By default (`"isolation": "none"`) a worker runs with all your permissions: its own safety rules (Copilot's deny rules, Vibe's `outside_workdir`) are all that keep it inside the job's worktree. With isolation on, the server starts every run of that worker inside a sandbox. **Isolation and `token` credentials are implemented in the Python server only**; the Node server refuses those settings and skips the workers that use them.
+By default (`"isolation": "none"`) a worker runs with all your permissions: its own safety rules (Copilot's deny rules, Vibe's `outside_workdir`) are all that keep it inside the job's worktree. With isolation on, the server starts every run of that worker inside a sandbox. **Isolation, `token` / `private-home` credentials and the `codex` worker are implemented in the Python server only**; the Node server refuses those settings and skips the workers that use them.
 
 ```json
 { "isolation": "auto" }
@@ -204,7 +221,7 @@ What an isolated run sees:
 
 - the system, read-only; your home folder, other users' homes, `/mnt`, `/media`, `/run` and the rest of `/tmp` are hidden. Hiding `/run` keeps the worker away from the sockets of local services (Docker, the system D-Bus, systemd); only the folder of `/etc/resolv.conf` stays, when systemd-resolved keeps it there;
 - the job's worktree, read-write (for an analysis, the repo read-only), except its `.git` file. Of the main repo's `.git`, only what git needs: everything read-only, except this worktree's own admin folder. Branches, refs and the repo's objects can't be changed: the worker's git writes new objects to a throwaway store of its own, deleted after the run;
-- the worker CLI's own folders (`~/.copilot` and `~/.cache/copilot`, `~/.vibe`, `~/.gemini`) read-write, its install folder read-only, plus `isolation_rw` / `isolation_ro`;
+- the worker CLI's own folders (`~/.copilot` and `~/.cache/copilot`, `~/.vibe`, `~/.codex`, `~/.gemini`; with `private-home`, only that private folder) read-write, its install folder read-only, plus `isolation_rw` / `isolation_ro`;
 - the network, which the model APIs need;
 - an environment rebuilt from scratch: locale, proxy and certificate variables, the CLI's own variables, `isolation_env`. Other workers' keys, your tokens and everything else are left out.
 
@@ -220,9 +237,9 @@ Each worker has `"credentials"`:
 
 - **`host`** (default): the login you already made in the CLI (`copilot login`, your Mistral account in Vibe). Both CLIs keep it in the system keyring. Nothing to configure.
 - **`token`**: a minimal credential the server injects into **that worker only**: Copilot gets `COPILOT_GITHUB_TOKEN` (a [fine-grained personal access token](https://github.com/settings/personal-access-tokens/new) with only the **Copilot Requests** permission), Vibe gets `MISTRAL_API_KEY` and agy gets `GEMINI_API_KEY`. The server reads it from `~/.local/state/capocantiere/credentials/<worker>` (must be `chmod 600`; otherwise the worker is skipped) or from `CAPOCANTIERE_<WORKER>_TOKEN`, never from the config file. Your `host` login is not touched; the two coexist. `CAPOCANTIERE_*_TOKEN` variables are never passed to any child process as they are.
-- `private-home` is reserved for a later version.
+- **`private-home`** (codex only): a config/auth folder of the CLI's own, `~/.local/state/capocantiere/homes/<worker>`, with a login you make there once. Only that folder is mounted in the sandbox, and the login is a file, so there is no D-Bus either. See [codex](#codex-openai-codex-cli).
 
-With `host` credentials on Linux the CLI must reach the keyring through the session D-Bus. The sandbox never gets the full session bus, because that would allow escaping the sandbox (for example through `systemd --user`). `xdg-dbus-proxy` lets through only the keyring services in `keyring_dbus_names`: `org.freedesktop.secrets` (GNOME Keyring, KeePassXC, KDE Wallet 6) and `org.kde.kwalletd6` / `kwalletd5`. Copilot and Vibe both use `org.freedesktop.secrets`. With `token` credentials, the sandbox has no D-Bus at all.
+With `host` credentials on Linux the CLI must reach the keyring through the session D-Bus. The sandbox never gets the full session bus, because that would allow escaping the sandbox (for example through `systemd --user`). `xdg-dbus-proxy` lets through only the keyring services in `keyring_dbus_names`: `org.freedesktop.secrets` (GNOME Keyring, KeePassXC, KDE Wallet 6) and `org.kde.kwalletd6` / `kwalletd5`. Copilot and Vibe both use `org.freedesktop.secrets`. With `token` or `private-home` credentials, or codex with its login in a file, the sandbox has no D-Bus at all.
 
 On macOS, the Keychain checks access item by item, so a CLI reads its own login. Items created by the same program may also be readable: for Vibe, that means other tools run by the same Python.
 
@@ -316,7 +333,7 @@ python3 tests/e2e.py -k fallback  # only some tests
 python3 tests/e2e.py --runtime node
 ```
 
-End-to-end tests over MCP stdio, against fake `copilot`, `vibe` and `agy` binaries in [`tests/fakes`](tests/fakes) (a marker in the task picks the scenario: success with edits, no changes, quota error, generic error, timeout). Every test uses its own temporary repo and state folders; no real worker CLI is ever started.
+End-to-end tests over MCP stdio, against fake `copilot`, `vibe`, `codex` and `agy` binaries in [`tests/fakes`](tests/fakes) (a marker in the task picks the scenario: success with edits, no changes, quota error, generic error, timeout). Every test uses its own temporary repo and state folders; no real worker CLI is ever started.
 
 Isolation is tested in two ways. Fake `bwrap`, `xdg-dbus-proxy` and `sandbox-exec` (in `tests/fakes/sandbox`) check the command lines, the profile and where tokens go. The real `bwrap`, where it works, runs a fake worker and checks that it can't read files outside its sandbox.
 
@@ -338,12 +355,12 @@ Upgrading from the Gemini-only version (`gemini-delegate`): the old state in `~/
 - Build artifacts (`__pycache__`, `*.pyc`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `node_modules`, `.DS_Store`) are never included in a job's diff. Workers are also asked to delete the temporary files they create.
 - A job's base is a snapshot of your working tree, built in a temporary copy of the git index: untracked files are included unless `.gitignore` excludes them or they are over 5 MB (the job's notes list those). An untracked file that is not ignored (say, a stray `.env`) is therefore visible to the worker.
 - Budgets count runs, not the model's internal requests or tokens (each run makes several). Keep them conservative; the per-run caps (`max_price`, `max_ai_credits`) limit the cost of a single run.
-- Authentication checks don't call any model: Copilot is "authenticated" when its config records a logged-in user (or a token variable is set), Vibe when its cache records a signed-in account or `MISTRAL_API_KEY` is set. An expired login only shows up on the first run.
+- Authentication checks don't call any model: Copilot is "authenticated" when its config records a logged-in user (or a token variable is set), Vibe when its cache records a signed-in account or `MISTRAL_API_KEY` is set, Codex when its `auth.json` exists. An expired login only shows up on the first run.
 - Without isolation, Copilot's shell commands are not limited to the worktree by path checks (only file tools are). The deny rules and, optionally, `sandbox` cover the dangerous ones. Turn on [isolation](#isolation-and-credentials) to contain them.
 - When Vibe runs on its default model, it does not report which model that is (`active_model` is empty in its `export.json`), so all its votes go to the arm `vibe:default` and a change of Vibe's default model is not noticed. Setting `model` for the vibe worker gives each model its own score. Copilot reports the model it used, so it does not have this problem.
 - After the server is updated and reconnected with `/mcp`, Claude Code may keep the old definitions of the tools it already knew (new tools do appear). New parameters still reach the server, but Claude may not know about them until a new session.
 - After a fallback, the next worker uses its own default model (a model name rarely means the same on another CLI).
-- The CLI flags were checked against GitHub Copilot CLI 1.0.114, Mistral Vibe 3.1.3 (help, config schema and source) and Antigravity CLI 1.5.10. If a CLI changes its output, the server still shows the raw output.
+- The CLI flags were checked against GitHub Copilot CLI 1.0.114, Mistral Vibe 3.1.3 (help, config schema and source), OpenAI Codex CLI 0.171.0 and Antigravity CLI 1.5.10. If a CLI changes its output, the server still shows the raw output.
 
 ## Why "Capocantiere"
 
