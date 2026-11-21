@@ -599,7 +599,7 @@ class AgyWorker(Worker):
             if auth != "api_key":
                 return 'credentials "token" needs "auth": "api_key"'
         elif auth == "api_key" and not (env.get("GEMINI_API_KEY") or super().env().get("GEMINI_API_KEY")):
-            return 'auth is "api_key" but GEMINI_API_KEY is not set (export it, put it under "env" in the config, or use "token" credentials)'
+            return 'auth is "api_key" but GEMINI_API_KEY is not set (set agy_token in the plugin options, or export it, or put it under "env" in the config)'
         return None
 
     def host_auth_status(self):
