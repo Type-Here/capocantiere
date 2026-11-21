@@ -48,10 +48,12 @@ COMMON_DEFAULTS = {
     "strengths": [],
     "isolation": "",  # empty = the global setting
     # How the CLI authenticates: "host" = its own login (e.g. `copilot login`, the keyring), "token" = a minimal
-    # credential the server injects into this worker only, read from <state>/credentials/<worker> (mode 600) or
-    # from CAPOCANTIERE_<WORKER>_TOKEN, "private-home" = a config/auth folder of the CLI's own kept for capocantiere
-    # only (<state>/homes/<worker>), with a login made there (workers that support it: codex).
-    "credentials": "host",
+    # credential the server injects into this worker only, from the plugin options (userConfig <worker>_token,
+    # stored by Claude Code in the system's secure storage) or from <state>/credentials/<worker> (mode 600),
+    # "private-home" = a config/auth folder of the CLI's own kept for capocantiere only (<state>/homes/<worker>),
+    # with a login made there (workers that support it: codex). Empty = "token" if the plugin options hold a token
+    # for this worker, otherwise "host".
+    "credentials": "",
     "isolation_rw": [],  # extra paths the worker may write when isolated
     "isolation_ro": [],  # extra paths the worker may read when isolated
     "isolation_env": [],  # extra environment variables kept when isolated (names, or prefixes ending in "_")
@@ -245,24 +247,44 @@ class Worker:
 
     @property
     def credentials(self):
-        return self.s.get("credentials") or "host"
+        c = self.s.get("credentials")
+        if c:
+            return c
+        return "token" if self.TOKEN_ENV and self.option_token() else "host"
 
     def token_file(self):
         return os.path.join(CREDENTIALS_DIR, self.id)
 
+    def option_key(self):
+        """The plugin option (userConfig key in plugin.json) that holds this worker's token."""
+        return "%s_token" % self.id
+
     def token_var(self):
+        """Where the MCP server receives the plugin option: .mcp.json sets it from ${user_config.<key>}, which
+        also shadows any variable of the same name in the user's shell."""
         return "CAPOCANTIERE_%s_TOKEN" % self.id.upper()
+
+    def option_token(self):
+        """The token from the plugin options, or None. The MCP server gets it as token_var(); hooks get it from
+        Claude Code as CLAUDE_PLUGIN_OPTION_<KEY> (the hook drops token_var() inherited from the shell)."""
+        for var in (self.token_var(), "CLAUDE_PLUGIN_OPTION_" + self.option_key().upper(),
+                    "CLAUDE_PLUGIN_OPTION_" + self.option_key()):
+            v = (env.get(var) or "").strip()
+            if v and not v.startswith("${"):  # an unexpanded placeholder is not a token
+                return v
+        return None
 
     def token(self):
         """(token, where it was read) or (None, why not)."""
-        v = (env.get(self.token_var()) or "").strip()
+        v = self.option_token()
         if v:
-            return v, self.token_var()
+            return v, "the plugin options (%s)" % self.option_key()
         path = self.token_file()
         try:
             st = os.stat(path)
         except OSError:
-            return None, "no token: put it in %s (chmod 600) or in %s. %s" % (path, self.token_var(), self.TOKEN_HINT)
+            return None, ("no token: set %s in the plugin options (/plugin, capocantiere, Configure options) or put it "
+                          "in %s (chmod 600). %s" % (self.option_key(), path, self.TOKEN_HINT))
         if os.name == "posix" and st.st_mode & 0o077:
             return None, "%s is readable by other users: run chmod 600 on it" % path
         try:
@@ -1163,7 +1185,7 @@ class CodexWorker(Worker):
         "bin": "codex",
         "daily_budget": 30,
         "max_parallel": 1,  # conservative: one run at a time per ChatGPT login (raise it if you like)
-        "credentials": "host",
+        "credentials": "",
         "sandbox": True,  # Codex's own sandbox (read-only for analyses, workspace-write for jobs)
         "network_access": False,  # network for the commands Codex runs in a job (workspace-write)
         "strengths": ["refactor", "tests", "analysis"],

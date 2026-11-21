@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """End-to-end tests of the capocantiere MCP server, against the fake worker CLIs in tests/fakes.
 
-    python3 tests/e2e.py                    # Python server
-    python3 tests/e2e.py --runtime node     # Node server
+    python3 tests/e2e.py
     python3 tests/e2e.py -k fallback        # only tests whose name contains "fallback"
 
 Every test gets its own temporary git repo, state/cache/config folders and server process.
@@ -23,16 +22,16 @@ import time
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-RUN_SH = os.path.join(ROOT, "plugins", "capocantiere", "server", "run.sh")
+SERVER_DIR = os.path.join(ROOT, "server")
+SERVER = os.path.join(SERVER_DIR, "server.py")
 FAKES = os.path.join(ROOT, "tests", "fakes")
-RUNTIME = "python"
 
 
 class Server:
     """A capocantiere server process spoken to over MCP stdio."""
 
     def __init__(self, env):
-        self.p = subprocess.Popen(["sh", RUN_SH], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        self.p = subprocess.Popen([sys.executable, SERVER], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE, env=env)
         self.next_id = 0
         self.waiting = {}
@@ -114,9 +113,8 @@ class E2E(unittest.TestCase):
         self.vibe_config('outside_workdir = "deny"\n')
         self.env = {k: v for k, v in os.environ.items()
                     if not k.startswith(("CAPOCANTIERE_", "GEMINI_DELEGATE_", "COPILOT_", "GH_TOKEN", "GITHUB_TOKEN", "VIBE_", "MISTRAL_",
-                             "GEMINI_API_KEY", "AGY_", "CODEX_", "OPENAI_API_KEY"))}
+                             "GEMINI_API_KEY", "AGY_", "CODEX_", "OPENAI_API_KEY", "CLAUDE_PLUGIN_OPTION_"))}
         self.env.update({
-            "CAPOCANTIERE_RUNTIME": RUNTIME,
             "XDG_STATE_HOME": os.path.join(self.tmp, "state"),
             "XDG_CACHE_HOME": os.path.join(self.tmp, "cache"),
             "XDG_CONFIG_HOME": os.path.join(self.tmp, "config"),
@@ -183,9 +181,6 @@ class E2E(unittest.TestCase):
     def test_tools_list(self):
         names = [t["name"] for t in self.server.request("tools/list", {})["tools"]]
         expected = ["delegate", "analyze", "jobs", "apply", "discard", "rate", "blame", "workers", "mode", "models"]
-        if RUNTIME == "node":
-            expected.remove("rate")
-            expected.remove("blame")  # the Node server is frozen: Python-only tools are not listed
         self.assertEqual(names, expected)
 
     def test_workers_report(self):
@@ -451,8 +446,6 @@ class E2E(unittest.TestCase):
         return jid
 
     def blame(self, path, **kw):
-        if RUNTIME == "node":
-            self.skipTest("blame is Python-only")
         return self.server.ok("blame", dict(path=path, **kw))
 
     def test_effective_model(self):
@@ -462,8 +455,6 @@ class E2E(unittest.TestCase):
         self.assertIn("ran as devstral-fake-2512", text)  # vibe's export.json: config.active_model -> models
 
     def test_apply_records_an_agent_trace(self):
-        if RUNTIME == "node":
-            self.skipTest("attribution is Python-only")
         jid = self.apply_job({"src/app.js": self.APP})
         recs = self.records()
         self.assertEqual(len(recs), 1)
@@ -565,8 +556,6 @@ class E2E(unittest.TestCase):
         self.assertIn("base: HEAD (", text)
 
     def test_ranges_follow_edits_made_before_apply(self):
-        if RUNTIME == "node":
-            self.skipTest("attribution is Python-only")
         body = ["const v%d = %d;" % (i, i) for i in range(1, 9)]
         self.write_file("lib.js", "\n".join(body) + "\n")
         self.commit()
@@ -579,10 +568,8 @@ class E2E(unittest.TestCase):
         self.assertEqual([(x["start_line"], x["end_line"]) for x in conv["ranges"]], [(7, 7)])
 
     def test_survival(self):
-        if RUNTIME == "node":
-            self.skipTest("attribution is Python-only")
         jid = self.apply_job({"src/app.js": self.APP})
-        sys.path.insert(0, os.path.dirname(RUN_SH))
+        sys.path.insert(0, SERVER_DIR)
         try:
             import attribution
         finally:
@@ -593,7 +580,7 @@ class E2E(unittest.TestCase):
         self.assertIsNone(attribution.survival(self.repo, "j-none"))
 
     def test_trivial_lines(self):
-        sys.path.insert(0, os.path.dirname(RUN_SH))
+        sys.path.insert(0, SERVER_DIR)
         try:
             import attribution
         finally:
@@ -641,12 +628,12 @@ class E2E(unittest.TestCase):
     def test_agy_login_keeps_the_warning(self):
         self.agy_config(auth="login")
         self.assertIn("can get the account suspended", self.server.ok("workers"))
-        out = subprocess.run(["sh", RUN_SH, "--session-summary"], env=self.env, capture_output=True, text=True).stdout
+        out = subprocess.run([sys.executable, SERVER, "--session-summary"], env=self.env, capture_output=True, text=True).stdout
         self.assertIn("agy: According to the official Antigravity FAQ", out)
 
     def test_example_config_loads_cleanly(self):
         d = os.path.join(self.tmp, "config", "capocantiere")
-        shutil.copy(os.path.join(ROOT, "plugins", "capocantiere", "workers.example.json"), os.path.join(d, "workers.json"))
+        shutil.copy(os.path.join(ROOT, "workers.example.json"), os.path.join(d, "workers.json"))
         text = self.server.ok("workers")
         self.assertNotIn("CONFIG ERROR", text)
         self.assertIn("agy — Antigravity CLI (Gemini) [DISABLED]", text)
@@ -750,7 +737,7 @@ class E2E(unittest.TestCase):
     def test_token_is_injected_only_into_its_worker(self):
         self.write_config(copilot={"credentials": "token"})
         self.env["CAPOCANTIERE_COPILOT_TOKEN"] = "gh-fine-grained"
-        self.assertIn("authenticated: yes (COPILOT_GITHUB_TOKEN token from CAPOCANTIERE_COPILOT_TOKEN)", self.server.ok("workers"))
+        self.assertIn("authenticated: yes (COPILOT_GITHUB_TOKEN token from the plugin options (copilot_token))", self.server.ok("workers"))
         self.delegate("add a file", worker="copilot", fallback=False)
         self.delegate("add a file", worker="vibe", fallback=False)
         copilot, vibe = self.calls("copilot")[0]["env"], self.calls("vibe")[0]["env"]
@@ -758,6 +745,29 @@ class E2E(unittest.TestCase):
         self.assertNotIn("CAPOCANTIERE_COPILOT_TOKEN", copilot)
         self.assertNotIn("COPILOT_GITHUB_TOKEN", vibe)
         self.assertNotIn("CAPOCANTIERE_COPILOT_TOKEN", vibe)
+
+    def test_plugin_option_token_selects_token_credentials(self):
+        self.write_config()  # credentials not set: "token" when the plugin options hold one
+        self.env["CAPOCANTIERE_COPILOT_TOKEN"] = "gh-from-options"
+        self.assertIn("credentials: token", self.server.ok("workers"))
+        self.delegate("add a file", worker="copilot", fallback=False)
+        self.assertEqual(self.calls("copilot")[0]["env"].get("COPILOT_GITHUB_TOKEN"), "gh-from-options")
+        self.assertIn("credentials: host", self.server.ok("workers").split("vibe —")[1])  # no option for vibe
+
+    def test_unexpanded_option_is_not_a_token(self):
+        self.write_config()
+        self.env["CAPOCANTIERE_COPILOT_TOKEN"] = "${user_config.copilot_token}"
+        self.assertIn("credentials: host", self.server.ok("workers"))
+
+    def test_session_summary_ignores_shell_tokens(self):
+        self.write_config(copilot={"credentials": "token"})
+        self.env["CAPOCANTIERE_COPILOT_TOKEN"] = "exported-in-the-shell"
+        out = subprocess.run([sys.executable, SERVER, "--session-summary"], env=self.env, capture_output=True, text=True).stdout
+        self.assertIn("copilot unusable: no token", out)
+        self.env["CLAUDE_PLUGIN_OPTION_COPILOT_TOKEN"] = "from-the-plugin-options"
+        out = subprocess.run([sys.executable, SERVER, "--session-summary"], env=self.env, capture_output=True, text=True).stdout
+        self.assertNotIn("copilot unusable", out)
+        self.assertIn("copilot (", out)
 
     def test_token_file(self):
         self.write_config(vibe={"credentials": "token"})
@@ -768,7 +778,7 @@ class E2E(unittest.TestCase):
     def test_token_problems_skip_the_worker(self):
         self.write_config(copilot={"credentials": "token"})
         jid, text = self.delegate("add a file")
-        self.assertIn("copilot skipped: no token: put it in", text)
+        self.assertIn("copilot skipped: no token: set copilot_token in the plugin options", text)
         self.assertIn('only the "Copilot Requests" permission', text)
         self.assertIn("worker: vibe", text)
         path = self.token_file("copilot", "x", mode=0o644)
@@ -793,9 +803,6 @@ class E2E(unittest.TestCase):
         os.chmod(path, mode)
         return path
 
-    def skip_on_node(self):
-        if RUNTIME == "node":
-            self.skipTest("codex is Python-only")
 
     def codex_host_login(self, store="file"):
         """The user's own ~/.codex (CODEX_HOME), logged in."""
@@ -810,7 +817,6 @@ class E2E(unittest.TestCase):
         return home
 
     def test_codex_host_file_login_needs_no_dbus(self):
-        self.skip_on_node()
         self.use_sandbox_fakes()
         home = self.codex_host_login()
         self.write_config(codex={"enabled": True, "isolation": "bwrap", "isolation_env": ["FAKE_LOG"]})
@@ -827,14 +833,12 @@ class E2E(unittest.TestCase):
         self.assertNotIn("cli_auth_credentials_store", " ".join(self.calls("codex")[0]["argv"]))
 
     def test_codex_host_keyring_login_warns(self):
-        self.skip_on_node()
         self.use_sandbox_fakes()
         self.codex_host_login(store="auto")
         self.write_config(codex={"enabled": True, "isolation": "bwrap"})
         self.assertIn("the codex login is in the keyring", self.server.ok("workers"))
 
     def test_codex_private_home_login_required(self):
-        self.skip_on_node()
         text = self.server.ok("workers")
         self.assertIn("codex — OpenAI Codex CLI [DISABLED]", text)
         self.assertFalse(os.path.exists(self.codex_home()))  # nothing is created for a disabled worker
@@ -857,7 +861,6 @@ class E2E(unittest.TestCase):
         self.assertEqual(self.calls("codex"), [])
 
     def test_codex_job(self):
-        self.skip_on_node()
         self.write_config(codex={"enabled": True, "credentials": "private-home"})
         self.codex_login()
         self.assertIn("authenticated: yes (ChatGPT login in private home %s)" % self.codex_home(), self.server.ok("workers"))
@@ -876,7 +879,6 @@ class E2E(unittest.TestCase):
         self.assertEqual(call["env"].get("CODEX_HOME"), self.codex_home())
 
     def test_codex_analysis_is_read_only(self):
-        self.skip_on_node()
         self.write_config(codex={"enabled": True})
         self.codex_host_login()
         text = self.server.ok("analyze", {"question": "what is here?", "worker": "codex", "fallback": False}, timeout=60)
@@ -886,7 +888,6 @@ class E2E(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.repo, "fake-codex.txt")))
 
     def test_codex_quota_falls_back(self):
-        self.skip_on_node()
         self.write_config(glob={"order": ["codex", "copilot", "vibe"]}, codex={"enabled": True})
         self.codex_host_login()
         jid, text = self.delegate("FAKE:quota-codex add a file")
@@ -894,7 +895,6 @@ class E2E(unittest.TestCase):
         self.assertIn("usage limit", text)
 
     def test_codex_without_own_sandbox_needs_isolation(self):
-        self.skip_on_node()
         self.write_config(codex={"enabled": True, "sandbox": False})
         self.codex_host_login()
         jid, text = self.delegate("add a file", worker="codex")
@@ -902,7 +902,6 @@ class E2E(unittest.TestCase):
         self.assertEqual(self.calls("codex"), [])
 
     def test_codex_bwrap_private_home(self):
-        self.skip_on_node()
         self.use_sandbox_fakes()
         self.env["CODEX_HOME"] = os.path.join(self.tmp, "user-codex")  # the user's own: never used nor mounted
         self.write_config(codex={"enabled": True, "credentials": "private-home", "isolation": "bwrap",
@@ -1113,7 +1112,7 @@ class E2E(unittest.TestCase):
         self.assertEqual(self.calls(), [])
 
     def test_session_summary(self):
-        out = subprocess.run(["sh", RUN_SH, "--session-summary"], env=self.env, capture_output=True, text=True).stdout
+        out = subprocess.run([sys.executable, SERVER, "--session-summary"], env=self.env, capture_output=True, text=True).stdout
         self.assertIn("copilot (40/40 runs left", out)
         self.assertIn("vibe (60/60 runs left", out)
         self.assertNotIn("agy (", out)
@@ -1168,12 +1167,8 @@ class E2E(unittest.TestCase):
         self.assertTrue(m, "no analysis id in:\n" + text)
         return m.group(1)
 
-    def skip_on_node(self):
-        if RUNTIME == "node":
-            self.skipTest("the Node server is frozen: no trust scores")
 
     def test_score_apply(self):
-        self.skip_on_node()
         self.assertTrue(self.server.ok("workers", {"scores": True}).startswith("No trust scores yet"))
         jid, _ = self.delegate("add a file", worker="copilot")
         self.assertIn("Applied", self.server.ok("apply", {"job_id": jid}))  # default quality: good
@@ -1186,7 +1181,6 @@ class E2E(unittest.TestCase):
         self.assertEqual((e["event"], e["reward"]), ("apply:minor_fixes", 0.6))
 
     def test_score_discard(self):
-        self.skip_on_node()
         jid, _ = self.delegate("add a file", worker="copilot")
         self.assertIn("discarded", self.server.ok("discard", {"job_id": jid}))  # no reason = bad
         e = self.last_score(jid)
@@ -1198,7 +1192,6 @@ class E2E(unittest.TestCase):
         self.assertIsNone(e["reward"])  # obsolete: the job is withdrawn, no vote either way
 
     def test_score_quota_is_no_vote(self):
-        self.skip_on_node()
         jid, text = self.delegate("FAKE:quota-copilot add a file", worker="copilot")
         self.assertIn("worker: vibe", text)
         evs = [e for e in self.score_events() if e["worker"] == "copilot"]
@@ -1208,7 +1201,6 @@ class E2E(unittest.TestCase):
         self.assertIsNone(v[-1]["reward"])
 
     def test_score_no_changes_then_rate(self):
-        self.skip_on_node()
         jid, text = self.delegate("FAKE:noop look around", worker="copilot")
         self.assertIn("status: no_changes", text)
         e = self.last_score(jid)
@@ -1219,7 +1211,6 @@ class E2E(unittest.TestCase):
         self.assertIsNone(e["reward"])
 
     def test_score_analysis_rate(self):
-        self.skip_on_node()
         out = self.server.ok("analyze", {"question": "FAKE:noop what is in main.txt?", "worker": "copilot"})
         aid = self.analyze_id(out)
         e = self.last_score(aid)
@@ -1229,7 +1220,6 @@ class E2E(unittest.TestCase):
         self.assertEqual((e["event"], e["reward"], e["kind"]), ("rate:good", 1.0, "analysis"))
 
     def test_score_requested_worker_wins(self):
-        self.skip_on_node()
         self.write_history()
         self.write_config(glob={"selection": "scores"})
         jid, text = self.delegate("add a file", worker="copilot")
@@ -1237,7 +1227,6 @@ class E2E(unittest.TestCase):
         self.assertIn("worker requested", text)  # an explicit request ignores the scores
 
     def test_score_order_ignores_scores(self):
-        self.skip_on_node()
         self.write_history()
         self.write_config(glob={"selection": "order"})
         jid, text = self.delegate("add a file")
@@ -1245,7 +1234,6 @@ class E2E(unittest.TestCase):
         self.assertIn("worker configured order", text)
 
     def test_score_selection_avoids_bad_history(self):
-        self.skip_on_node()
         # CAPOCANTIERE_SEED must be set before the server starts: scores.py seeds its sampler at import time
         self.env["CAPOCANTIERE_SEED"] = "1"
         self.write_history()
@@ -1256,7 +1244,6 @@ class E2E(unittest.TestCase):
         self.assertIn("chosen by trust score", workers[-1])
 
     def test_tier_selection(self):
-        self.skip_on_node()
         self.write_config(glob={"selection": "order"}, copilot={"tiers": {"fast": "m-fast"}})
         jid, text = self.delegate("add a file", tier="fast")
         self.assertIn("worker: copilot", text)
@@ -1273,7 +1260,7 @@ class Scores(unittest.TestCase):
     """Unit tests of the score computation itself, imported directly and without a server."""
 
     def test_decay(self):
-        sys.path.insert(0, os.path.join(ROOT, "plugins", "capocantiere", "server"))
+        sys.path.insert(0, SERVER_DIR)
         try:
             import scores
         finally:
@@ -1296,7 +1283,7 @@ class Review(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        sys.path.insert(0, os.path.join(ROOT, "plugins", "capocantiere", "server"))
+        sys.path.insert(0, SERVER_DIR)
         try:
             import review
         finally:
@@ -1342,10 +1329,8 @@ class Review(unittest.TestCase):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--runtime", default="python", choices=["python", "node"])
     ap.add_argument("-k", default=None, help="only run tests whose name contains this")
     args, rest = ap.parse_known_args()
-    RUNTIME = args.runtime
     loader = unittest.TestLoader()
     if args.k:
         loader.testNamePatterns = ["*%s*" % args.k]

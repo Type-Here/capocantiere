@@ -1,5 +1,5 @@
 {
-  "_comment": "Delegation modes. 'instruction' is what Claude is told at session start; only 'off' is enforced by the server (delegate and analyze refuse). Shared by server.py and server.mjs.",
+  "_comment": "Delegation modes. 'instruction' is what Claude is told at session start; only 'off' is enforced by the server (delegate and analyze refuse).",
   "default": "auto",
   "modes": {
     "off": {

@@ -1,5 +1,5 @@
 {
-  "_comment": "Classifies the slugs returned by `agy models` into capability groups. Groups are checked in order and the first matching pattern wins (case-insensitive regex). Inside a group, models matching an earlier pattern are preferred, then the newest version (read from the display name). Slugs that match nothing go to 'other' and are never chosen automatically. 'defaults' lists, per role, the groups to try in order when nothing is configured. Shared by server.py and server.mjs.",
+  "_comment": "Classifies the slugs returned by `agy models` into capability groups. Groups are checked in order and the first matching pattern wins (case-insensitive regex). Inside a group, models matching an earlier pattern are preferred, then the newest version (read from the display name). Slugs that match nothing go to 'other' and are never chosen automatically. 'defaults' lists, per role, the groups to try in order when nothing is configured.",
   "groups": [
     {
       "id": "fast",
