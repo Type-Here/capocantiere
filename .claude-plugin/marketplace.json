@@ -1,14 +1,15 @@
 {
-  "name": "capocantiere-local",
-  "description": "Local marketplace: a plugin that turns Claude Code into the manager of external coding-agent workers.",
+  "name": "capocantiere",
+  "description": "Marketplace of the capocantiere plugin: Claude Code as the manager of external coding-agent workers.",
   "owner": {
-    "name": "Type-Here"
+    "name": "Type-Here",
+    "url": "https://github.com/Type-Here"
   },
   "plugins": [
     {
       "name": "capocantiere",
-      "source": "./plugins/capocantiere",
-      "description": "Claude as manager, external coding-agent CLIs (Copilot CLI, Mistral Vibe, ...) as workers."
+      "source": "./",
+      "description": "Claude as manager, external coding-agent CLIs (Copilot CLI, Mistral Vibe, Codex CLI, ...) as workers."
     }
   ]
 }

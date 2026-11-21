@@ -5,7 +5,7 @@
 # changes) are always shown whole; the others whole, while they fit; the rest is listed as not shown. The job
 # remembers which files the manager was shown: apply refuses a patch with a sensitive file it never saw, unless
 # told to go ahead (unreviewed_ok), and names the ordinary files it applied unseen.
-# Standard library only. server.mjs has the same logic.
+# Standard library only.
 
 import os
 import re

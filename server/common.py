@@ -114,7 +114,7 @@ def iso_now():
 
 
 def js(v):
-    """Format a value the way the Node version prints it in text output."""
+    """Format a value for text output (JavaScript-style: true/false/null)."""
     if v is True:
         return "true"
     if v is False:

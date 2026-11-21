@@ -5,7 +5,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/server/run.sh\" --session-summary",
+            "command": "python3",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/server/server.py", "--session-summary"],
             "timeout": 15
           }
         ]

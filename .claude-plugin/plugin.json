@@ -1,0 +1,76 @@
+{
+  "name": "capocantiere",
+  "displayName": "Capocantiere",
+  "version": "3.0.0",
+  "description": "Claude acts as manager and delegates implementation and analysis tasks to configurable workers: external coding-agent CLIs such as GitHub Copilot CLI, Mistral Vibe and OpenAI Codex CLI. Isolated git worktrees, parallel jobs, per-worker budgets with automatic fallback, controlled review and apply.",
+  "author": {
+    "name": "Type-Here",
+    "url": "https://github.com/Type-Here"
+  },
+  "homepage": "https://github.com/Type-Here/capocantiere",
+  "repository": "https://github.com/Type-Here/capocantiere",
+  "license": "MIT",
+  "keywords": [
+    "delegation",
+    "multi-agent",
+    "workers",
+    "copilot",
+    "mistral-vibe",
+    "codex",
+    "worktree"
+  ],
+  "network": {
+    "hosts": [
+      "*.githubcopilot.com",
+      "api.github.com",
+      "api.mistral.ai",
+      "api.openai.com",
+      "chatgpt.com",
+      "*.googleapis.com"
+    ]
+  },
+  "userConfig": {
+    "copilot_token": {
+      "type": "string",
+      "title": "GitHub token for the copilot worker (optional)",
+      "description": "A fine-grained personal access token with only the \"Copilot Requests\" permission. Given only to the Copilot CLI, as COPILOT_GITHUB_TOKEN. Leave empty to use the CLI's own login (copilot login).",
+      "sensitive": true,
+      "default": ""
+    },
+    "vibe_token": {
+      "type": "string",
+      "title": "Mistral API key for the vibe worker (optional)",
+      "description": "Given only to Mistral Vibe, as MISTRAL_API_KEY. Leave empty to use the CLI's own sign-in.",
+      "sensitive": true,
+      "default": ""
+    },
+    "codex_token": {
+      "type": "string",
+      "title": "OpenAI API key for the codex worker (optional)",
+      "description": "Given only to the Codex CLI, as CODEX_API_KEY. Leave empty to use the CLI's own login (codex login).",
+      "sensitive": true,
+      "default": ""
+    },
+    "agy_token": {
+      "type": "string",
+      "title": "Gemini API key for the agy worker (optional)",
+      "description": "A Gemini API key from Google AI Studio, given only to the Antigravity CLI, as GEMINI_API_KEY. The agy worker stays disabled until you enable it in workers.json.",
+      "sensitive": true,
+      "default": ""
+    }
+  },
+  "mcpServers": {
+    "capocantiere": {
+      "command": "python3",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/server/server.py"
+      ],
+      "env": {
+        "CAPOCANTIERE_COPILOT_TOKEN": "${user_config.copilot_token}",
+        "CAPOCANTIERE_VIBE_TOKEN": "${user_config.vibe_token}",
+        "CAPOCANTIERE_CODEX_TOKEN": "${user_config.codex_token}",
+        "CAPOCANTIERE_AGY_TOKEN": "${user_config.agy_token}"
+      }
+    }
+  }
+}

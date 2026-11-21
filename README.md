@@ -15,7 +15,7 @@ Supported workers:
 
 | Component | Purpose |
 |---|---|
-| **MCP server `capocantiere`** (Python or Node, zero dependencies) | The tools `delegate`, `analyze`, `jobs`, `apply`, `discard`, `rate`, `blame`, `workers`, `mode`, `models` |
+| **MCP server `capocantiere`** (Python, standard library only) | The tools `delegate`, `analyze`, `jobs`, `apply`, `discard`, `rate`, `blame`, `workers`, `mode`, `models` |
 | **Skill `worker-delegation`** | Teaches Claude *when* to delegate, which worker to pick, how to write a task, how to handle fallbacks and how to review the result. Claude loads it on its own when needed |
 | **Agent `worker-reviewer`** (Sonnet) | First-pass review of large diffs, to save the manager's context |
 | **SessionStart hook** | At the start of each session, tells Claude which workers are available, how much budget each has left and whether there are open jobs from previous sessions |
@@ -39,7 +39,7 @@ Each worker has a daily budget (runs per 24h, counted per worker). A worker over
 
 - Claude Code
 - git
-- **Python ≥ 3.8 or Node.js ≥ 18** (only one of them: see [Python or Node](#python-or-node))
+- **Python ≥ 3.8**, as `python3` on the `PATH` (standard library only, nothing to install)
 - At least one worker CLI, installed and authenticated
 
 ## Installation
@@ -47,11 +47,24 @@ Each worker has a daily budget (runs per 24h, counted per worker). A worker over
 **1. Install the plugin**
 
 ```bash
-claude plugin marketplace add /path/to/capocantiere
-claude plugin install capocantiere@capocantiere-local
+claude plugin marketplace add Type-Here/capocantiere
+claude plugin install capocantiere@capocantiere
 ```
 
-(or, inside Claude Code: `/plugin marketplace add /path/to/capocantiere` followed by `/plugin install capocantiere@capocantiere-local`). Restart Claude Code.
+(or, inside Claude Code: `/plugin marketplace add Type-Here/capocantiere` followed by `/plugin install capocantiere@capocantiere`; a local clone works too: `/plugin marketplace add /path/to/capocantiere`). Restart Claude Code.
+
+When the plugin is enabled, Claude Code asks for its options: an optional token or API key per worker (see [Credentials](#credentials)). Leave them empty to use each CLI's own login. You can change them later in `/plugin`, Installed, capocantiere, *Configure options*.
+
+**Upgrading from `capocantiere@capocantiere-local`** (versions up to 2.0.0, when the plugin lived in `plugins/capocantiere` and the marketplace was called `capocantiere-local`): marketplaces can't be renamed in place, so remove the old one and add the new one. Your jobs, settings and scores are kept (they live in `~/.local/state`, `~/.config` and `~/.cache`, not in the plugin).
+
+```bash
+claude plugin uninstall capocantiere@capocantiere-local
+claude plugin marketplace remove capocantiere-local
+claude plugin marketplace add Type-Here/capocantiere
+claude plugin install capocantiere@capocantiere
+```
+
+Version 3.0.0 also drops the Node server: the plugin now needs `python3`. The last version with `server.mjs` is the `v2.0.0` tag (branch `node-runtime`).
 
 **2. Set up the workers you want** (sections below), then check them with `/capocantiere:status` in a session inside a git repo. Nothing needs configuring if the defaults suit you.
 
@@ -100,7 +113,7 @@ How it is run: `codex exec --json -o <tmp> --sandbox <mode> --cd <dir> --ephemer
 - Usage limits of the ChatGPT plan ("You've hit your usage limit", HTTP 429) count as quota errors and move the job to the next worker. On the Free plan they come quickly: keep `daily_budget` low.
 - `effort` becomes `model_reasoning_effort` (`max` → `xhigh`). Codex does not report which model it used: the arm is the `model` you set (in the worker config or in Codex's `config.toml`), otherwise `codex:default`.
 - A project's own `.codex/config.toml` is only read for projects you trusted in Codex, and capocantiere never passes `--trust`. Codex does read the repo's `AGENTS.md`.
-- Other credentials: `"token"` gives it `CODEX_API_KEY` (an OpenAI API key, from `~/.local/state/capocantiere/credentials/codex`); `"private-home"` gives it a `CODEX_HOME` of its own, `~/.local/state/capocantiere/homes/codex`, with a separate login (`CODEX_HOME=<that folder> codex -c 'cli_auth_credentials_store="file"' login`), so your `~/.codex` is never mounted.
+- Other credentials: `"token"` gives it `CODEX_API_KEY` (an OpenAI API key, from the plugin option `codex_token` or `~/.local/state/capocantiere/credentials/codex`); `"private-home"` gives it a `CODEX_HOME` of its own, `~/.local/state/capocantiere/homes/codex`, with a separate login (`CODEX_HOME=<that folder> codex -c 'cli_auth_credentials_store="file"' login`), so your `~/.codex` is never mounted.
 
 ### agy (Antigravity CLI)
 
@@ -158,7 +171,7 @@ The mode is given to Claude at the start of every session. Explicit instructions
 
 Everything is optional. The config file is `~/.config/capocantiere/workers.json` (`$XDG_CONFIG_HOME` is honored; `CAPOCANTIERE_CONFIG` points elsewhere). It's re-read when it changes, so edits apply without restarting Claude Code. Write only what you change: missing keys use the defaults.
 
-[`plugins/capocantiere/workers.example.json`](plugins/capocantiere/workers.example.json) lists every setting with its default. Keys starting with `_` are comments. A typical file:
+[`workers.example.json`](workers.example.json) lists every setting with its default. Keys starting with `_` are comments. A typical file:
 
 ```json
 {
@@ -196,20 +209,47 @@ Settings of every worker:
 | `extra_args` | extra command-line arguments |
 | `env` | extra environment variables for the CLI (e.g. an API key) |
 | `strengths` | tags Claude uses to choose a worker: `tests`, `boilerplate`, `docs`, `refactor`, `analysis`, … |
-| `credentials` | `host` (default), `token`, or `private-home` (codex only): see [Isolation and credentials](#isolation-and-credentials) |
+| `credentials` | `host`, `token`, or `private-home` (codex only); empty (default) = `token` if the plugin options hold a token for this worker, else `host`: see [Isolation and credentials](#isolation-and-credentials) |
 | `isolation` | overrides the global setting for this worker (empty = global) |
 | `tiers` | models per capability tier, e.g. `{"fast": "<model>", "strong": ["<model>", "<model>"]}` (empty = every tier uses `model`) |
 | `isolation_rw`, `isolation_ro`, `isolation_env` | extra paths an isolated worker may write / read, extra environment variables it keeps |
 
 Worker-specific settings: `copilot` — `deny_tools`, `disable_builtin_mcps`, `sandbox`, `max_ai_credits`, `secret_env_vars`; `vibe` — `max_turns`, `max_price`, `max_tokens`, `analyze_max_tokens`, `trust`, `analyze_tools`, `disabled_tools`; `codex` — `sandbox`, `network_access`; `agy` — `auth`, `sandbox`, `skip_permissions`.
 
-**Environment variables** override the file, e.g. in `~/.claude/settings.json` under `"env"`: `CAPOCANTIERE_<WORKER>_<SETTING>` (`CAPOCANTIERE_VIBE_MAX_PRICE=1`, `CAPOCANTIERE_COPILOT_ENABLED=0`; lists are comma-separated), `CAPOCANTIERE_ORDER`, `CAPOCANTIERE_FALLBACK`, `CAPOCANTIERE_MAX_PARALLEL`, `CAPOCANTIERE_SELECTION`, `CAPOCANTIERE_HALF_LIFE_DAYS`, plus `CAPOCANTIERE_RUNTIME` (`python`, `node` or `auto`). The old `GEMINI_DELEGATE_*` variables still apply to `agy`.
+**Environment variables** override the file, e.g. in `~/.claude/settings.json` under `"env"`: `CAPOCANTIERE_<WORKER>_<SETTING>` (`CAPOCANTIERE_VIBE_MAX_PRICE=1`, `CAPOCANTIERE_COPILOT_ENABLED=0`; lists are comma-separated), `CAPOCANTIERE_ORDER`, `CAPOCANTIERE_FALLBACK`, `CAPOCANTIERE_MAX_PARALLEL`, `CAPOCANTIERE_SELECTION`, `CAPOCANTIERE_HALF_LIFE_DAYS`. The old `GEMINI_DELEGATE_*` variables still apply to `agy`.
 
 `MCP_TOOL_TIMEOUT` (in ms) is only needed if long analyses get cut off by Claude Code; jobs are asynchronous and aren't affected.
 
+## Data and execution
+
+What the plugin runs, what it sends where, and what it writes. Nothing here happens behind Claude's back: every run starts from a tool call that Claude makes and that you can see (and deny) like any other.
+
+**Programs it runs.** The MCP server is `python3 server/server.py` (standard library only, no packages downloaded or installed, no network access of its own). It starts, as child processes:
+
+- the worker CLIs you have installed and enabled: `copilot` (GitHub Copilot CLI), `vibe` (Mistral Vibe), `codex` (OpenAI Codex CLI), `agy` (Antigravity CLI; disabled by default). Each one only for a `delegate` or `analyze` call, or to check its version and models (`copilot --version`, `vibe --version`, `agy models`, ...);
+- `git`, on your repo and on the job worktrees;
+- with isolation on, `bwrap` and `xdg-dbus-proxy` (Linux) or `sandbox-exec` (macOS) around the worker.
+
+**Data sent to external services.** The server itself sends nothing anywhere. The worker CLIs do: a worker runs on the account you logged it in with, and sends to its provider the task Claude wrote for it, and the code it reads in the job's worktree (or in the repo, for `analyze`) — which is a snapshot of your working tree, including untracked files that `.gitignore` doesn't exclude. Depending on the worker:
+
+| Worker | Service that receives your prompts and code |
+|---|---|
+| `copilot` | GitHub Copilot (GitHub, Microsoft), and the model providers Copilot routes to |
+| `vibe` | Mistral AI |
+| `codex` | OpenAI (ChatGPT or the OpenAI API) |
+| `agy` | Google (Gemini API / Google Cloud) |
+
+Each provider's own terms and data policies apply. A worker that is not installed, not enabled, or out of budget receives nothing. With `/capocantiere:mode off` no worker is ever started.
+
+**Files it writes.** Outside your repo: state, jobs, patches, logs and scores in `~/.local/state/capocantiere/` (or `$XDG_STATE_HOME`), job worktrees in `~/.cache/capocantiere/worktrees/` (or `$XDG_CACHE_HOME`; removed after `apply`/`discard`), both mode `700`; your settings in `~/.config/capocantiere/workers.json`, which you write (the server only reads it). Inside your repo: a `capocantiere/<id>` branch per job (deleted with the job), the job's changes in your working tree only when Claude calls `apply` (never committed), and attribution records in `.git/capocantiere/attribution.jsonl`. See [Where files go](#where-files-go).
+
+**SessionStart hook.** At the start of each session Claude Code runs `python3 server/server.py --session-summary`. It reads the local config and state, checks which worker CLIs are installed (running each one's `--version`) and prints a short summary for Claude: workers available, budget left, open jobs, the delegation mode. It sends nothing over the network, starts no job and changes nothing.
+
+**Credentials.** The plugin never asks for, stores or sends your passwords, and never reads credentials out of your shell environment to send them anywhere. By default each worker uses the login you made in its own CLI (the CLI reads it itself, from the keyring or its config folder). Optionally you give a narrow token per worker in the plugin options (`sensitive`: kept by Claude Code in the system's secure storage) or in a `chmod 600` file; the server passes each one only to its own worker, under the CLI's variable. Without isolation a worker runs with your environment and permissions, as if you had started the CLI yourself; with isolation, it gets an environment rebuilt from scratch with only its own credential. Details in [Credentials](#credentials).
+
 ## Isolation and credentials
 
-By default (`"isolation": "none"`) a worker runs with all your permissions: its own safety rules (Copilot's deny rules, Vibe's `outside_workdir`) are all that keep it inside the job's worktree. With isolation on, the server starts every run of that worker inside a sandbox. **Isolation, `token` / `private-home` credentials and the `codex` worker are implemented in the Python server only**; the Node server refuses those settings and skips the workers that use them.
+By default (`"isolation": "none"`) a worker runs with all your permissions: its own safety rules (Copilot's deny rules, Vibe's `outside_workdir`) are all that keep it inside the job's worktree. With isolation on, the server starts every run of that worker inside a sandbox.
 
 ```json
 { "isolation": "auto" }
@@ -235,8 +275,12 @@ What an isolated run sees:
 
 Each worker has `"credentials"`:
 
-- **`host`** (default): the login you already made in the CLI (`copilot login`, your Mistral account in Vibe). Both CLIs keep it in the system keyring. Nothing to configure.
-- **`token`**: a minimal credential the server injects into **that worker only**: Copilot gets `COPILOT_GITHUB_TOKEN` (a [fine-grained personal access token](https://github.com/settings/personal-access-tokens/new) with only the **Copilot Requests** permission), Vibe gets `MISTRAL_API_KEY` and agy gets `GEMINI_API_KEY`. The server reads it from `~/.local/state/capocantiere/credentials/<worker>` (must be `chmod 600`; otherwise the worker is skipped) or from `CAPOCANTIERE_<WORKER>_TOKEN`, never from the config file. Your `host` login is not touched; the two coexist. `CAPOCANTIERE_*_TOKEN` variables are never passed to any child process as they are.
+- **`host`** (the default when the plugin options hold no token for the worker): the login you already made in the CLI (`copilot login`, your Mistral account in Vibe, `codex login`). The CLIs keep it in the system keyring or in their own config folder. Nothing to configure.
+- **`token`** (the default when the plugin options hold a token for the worker): a minimal credential the server injects into **that worker only**: Copilot gets `COPILOT_GITHUB_TOKEN` (a [fine-grained personal access token](https://github.com/settings/personal-access-tokens/new) with only the **Copilot Requests** permission), Vibe gets `MISTRAL_API_KEY`, Codex gets `CODEX_API_KEY` and agy gets `GEMINI_API_KEY`. Where the server reads it from:
+  1. the **plugin options** `copilot_token`, `vibe_token`, `codex_token`, `agy_token` (asked when the plugin is enabled; `sensitive`, so Claude Code keeps them in the system's secure storage, not in `settings.json`). Claude Code hands them to the MCP server only, through the `mcpServers` entry of `plugin.json`;
+  2. otherwise `~/.local/state/capocantiere/credentials/<worker>` (must be `chmod 600`; otherwise the worker is skipped).
+
+  Never from the config file, and never from variables you exported in your shell: the plugin's MCP config always sets the server's `CAPOCANTIERE_<WORKER>_TOKEN` from the plugin options (empty when unset), and the SessionStart hook drops those variables. Your `host` login is not touched; the two coexist. The token variables are never passed to any child process as they are.
 - **`private-home`** (codex only): a config/auth folder of the CLI's own, `~/.local/state/capocantiere/homes/<worker>`, with a login you make there once. Only that folder is mounted in the sandbox, and the login is a file, so there is no D-Bus either. See [codex](#codex-openai-codex-cli).
 
 With `host` credentials on Linux the CLI must reach the keyring through the session D-Bus. The sandbox never gets the full session bus, because that would allow escaping the sandbox (for example through `systemd --user`). `xdg-dbus-proxy` lets through only the keyring services in `keyring_dbus_names`: `org.freedesktop.secrets` (GNOME Keyring, KeePassXC, KDE Wallet 6) and `org.kde.kwalletd6` / `kwalletd5`. Copilot and Vibe both use `org.freedesktop.secrets`. With `token` or `private-home` credentials, or codex with its login in a file, the sandbox has no D-Bus at all.
@@ -315,22 +359,12 @@ Every `apply` records which worker and model produced the code, so you can later
 
 `blame` is a tool Claude can call on its own (for example when a bug lands in code a worker wrote) and the `/capocantiere:blame <file>[:start-end]` command.
 
-## Python or Node
-
-The MCP server exists in two versions in `plugins/capocantiere/server/`: `server.py` (with `common.py` and `workers.py`, standard library only) and `server.mjs` (no npm packages). They have the same tools and behavior, share `tools.json`, `modes.json` and `model-groups.json`, and use the same state files, so you can switch between them at any time without losing jobs.
-
-`run.sh` starts the right one: `python3` if it's on your `PATH`, otherwise `node`. To force a choice, set `CAPOCANTIERE_RUNTIME` to `python` or `node`.
-
-The Python version is the reference: it is the one covered by the test suite. The Node version is a port, not tested directly, and it doesn't support isolation or `token` credentials (it refuses those settings rather than ignoring them).
-
-**The Node server is frozen:** it keeps working for those who use it, but new features are implemented in the Python server only. Changes to the core behavior (how jobs are created, run and applied) still go into both, so a job behaves the same on either. Attribution (`blame`, and the records written at `apply`) is the first of them: the Node server does not list the tool and records nothing. Trust scores and tiers are the second: the Node server always follows `order`, does not list `rate` nor the `kind`, `tier`, `quality`, `reason` and `scores` parameters, and reports `selection`, `half_life_days` and `tiers` in its config as unsupported (in `workers`).
-
 ## Tests
 
 ```bash
-python3 tests/e2e.py              # Python server
+python3 tests/e2e.py              # every test
 python3 tests/e2e.py -k fallback  # only some tests
-python3 tests/e2e.py --runtime node
+claude plugin validate --strict . # the plugin and marketplace manifests
 ```
 
 End-to-end tests over MCP stdio, against fake `copilot`, `vibe`, `codex` and `agy` binaries in [`tests/fakes`](tests/fakes) (a marker in the task picks the scenario: success with edits, no changes, quota error, generic error, timeout). Every test uses its own temporary repo and state folders; no real worker CLI is ever started.
@@ -351,16 +385,28 @@ Upgrading from the Gemini-only version (`gemini-delegate`): the old state in `~/
 
 ## Known limitations
 
-- The plugin starts the server through `sh run.sh`, so `sh` must be on the `PATH`. It always is on Linux and macOS; on Windows it has only been designed for, not tested.
+- The plugin starts the server as `python3 server/server.py`, so `python3` must be on the `PATH`. On Windows (where Python is often only `python` or `py`) it has only been designed for, not tested: WSL2 is the supported way.
 - Build artifacts (`__pycache__`, `*.pyc`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `node_modules`, `.DS_Store`) are never included in a job's diff. Workers are also asked to delete the temporary files they create.
 - A job's base is a snapshot of your working tree, built in a temporary copy of the git index: untracked files are included unless `.gitignore` excludes them or they are over 5 MB (the job's notes list those). An untracked file that is not ignored (say, a stray `.env`) is therefore visible to the worker.
 - Budgets count runs, not the model's internal requests or tokens (each run makes several). Keep them conservative; the per-run caps (`max_price`, `max_ai_credits`) limit the cost of a single run.
-- Authentication checks don't call any model: Copilot is "authenticated" when its config records a logged-in user (or a token variable is set), Vibe when its cache records a signed-in account or `MISTRAL_API_KEY` is set, Codex when its `auth.json` exists. An expired login only shows up on the first run.
+- Authentication checks don't call any model: Copilot is "authenticated" when its config records a logged-in user (or a token is configured), Vibe when its cache records a signed-in account or `MISTRAL_API_KEY` is set, Codex when its `auth.json` exists. An expired login only shows up on the first run.
 - Without isolation, Copilot's shell commands are not limited to the worktree by path checks (only file tools are). The deny rules and, optionally, `sandbox` cover the dangerous ones. Turn on [isolation](#isolation-and-credentials) to contain them.
 - When Vibe runs on its default model, it does not report which model that is (`active_model` is empty in its `export.json`), so all its votes go to the arm `vibe:default` and a change of Vibe's default model is not noticed. Setting `model` for the vibe worker gives each model its own score. Copilot reports the model it used, so it does not have this problem.
 - After the server is updated and reconnected with `/mcp`, Claude Code may keep the old definitions of the tools it already knew (new tools do appear). New parameters still reach the server, but Claude may not know about them until a new session.
 - After a fallback, the next worker uses its own default model (a model name rarely means the same on another CLI).
 - The CLI flags were checked against GitHub Copilot CLI 1.0.114, Mistral Vibe 3.1.3 (help, config schema and source), OpenAI Codex CLI 0.171.0 and Antigravity CLI 1.5.10. If a CLI changes its output, the server still shows the raw output.
+
+## Disclaimer
+
+Capocantiere is provided **"as is", without warranty of any kind**, under the terms of the [MIT License](LICENSE): the authors are not liable for any damage arising from its use.
+
+In particular, you are responsible for:
+
+- **the code the workers write.** Review every diff before applying it; a worker can be wrong, and without [isolation](#isolation-and-credentials) it runs with your permissions;
+- **what you send to the workers' providers** (GitHub, Mistral, OpenAI, Google): your prompts and the code in your repo, under their terms and data policies. See [Data and execution](#data-and-execution);
+- **your accounts with those providers:** usage, costs and quotas, and compliance with their terms of service (for example the warning about [agy](#agy-antigravity-cli) on consumer plans). Budgets and per-run caps are guards, not guarantees.
+
+Capocantiere is an independent project, not affiliated with or endorsed by Anthropic, GitHub, Microsoft, Mistral AI, OpenAI or Google. Product names belong to their owners.
 
 ## Why "Capocantiere"
 

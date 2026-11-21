@@ -2,9 +2,6 @@
 # capocantiere: MCP server that lets Claude Code (the "manager") delegate work to external
 # coding-agent CLIs ("workers": GitHub Copilot CLI, Mistral Vibe, Antigravity CLI).
 #
-# Python port of server.mjs, with the same behavior and the same state files,
-# so you can switch between the two runtimes without losing jobs.
-#
 # - Every code-writing task runs in an isolated git worktree, on a dedicated branch.
 #   The main repo is never touched until Claude calls `apply`.
 # - Jobs are asynchronous and can run in parallel (with a queue, and a limit per worker).
@@ -1157,7 +1154,7 @@ def set_session_default(value):
 
 # ---------------------------------------------------------------- tools
 
-# Tool definitions are shared with server.mjs.
+# Tool definitions live in tools.json.
 with open(os.path.join(HERE, "tools.json"), encoding="utf-8") as _f:
     TOOLS = json.load(_f)
 
@@ -1474,6 +1471,10 @@ def main():
         return
     load_jobs()
     if "--session-summary" in sys.argv:
+        # The SessionStart hook runs with the user's shell environment: workers' tokens come only from the plugin
+        # options (CLAUDE_PLUGIN_OPTION_*) or the credentials files, never from variables exported in the shell.
+        for k in [k for k in os.environ if common.TOKEN_VAR_RE.match(k)]:
+            del os.environ[k]
         try:
             s = session_summary()
             if s:

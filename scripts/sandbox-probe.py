@@ -5,7 +5,7 @@
     python3 scripts/sandbox-probe.py --prompt         # also one tiny prompt per worker and variant, after confirmation
     python3 scripts/sandbox-probe.py --workers vibe   # only some workers
 
-It builds the sandboxes with the server's own code (plugins/capocantiere/server/isolation.py), so what it checks is
+It builds the sandboxes with the server's own code (server/isolation.py), so what it checks is
 what the server runs. Variants:
 
   Linux
@@ -34,7 +34,7 @@ import tempfile
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(ROOT, "plugins", "capocantiere", "server"))
+sys.path.insert(0, os.path.join(ROOT, "server"))
 import isolation  # noqa: E402
 import workers as W  # noqa: E402
 
