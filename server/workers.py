@@ -260,7 +260,7 @@ class Worker:
         return "%s_token" % self.id
 
     def token_var(self):
-        """Where the MCP server receives the plugin option: .mcp.json sets it from ${user_config.<key>}, which
+        """Where the MCP server receives the plugin option: plugin.json (mcpServers) sets it from ${user_config.<key>}, which
         also shadows any variable of the same name in the user's shell."""
         return "CAPOCANTIERE_%s_TOKEN" % self.id.upper()
 

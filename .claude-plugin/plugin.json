@@ -58,5 +58,19 @@
       "sensitive": true,
       "default": ""
     }
+  },
+  "mcpServers": {
+    "capocantiere": {
+      "command": "python3",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/server/server.py"
+      ],
+      "env": {
+        "CAPOCANTIERE_COPILOT_TOKEN": "${user_config.copilot_token}",
+        "CAPOCANTIERE_VIBE_TOKEN": "${user_config.vibe_token}",
+        "CAPOCANTIERE_CODEX_TOKEN": "${user_config.codex_token}",
+        "CAPOCANTIERE_AGY_TOKEN": "${user_config.agy_token}"
+      }
+    }
   }
 }
